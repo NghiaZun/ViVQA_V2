@@ -214,9 +214,9 @@ results = []
 
 # RESUME từ checkpoint nếu có
 processed_ids = set()
-if os.path.exists(OUT_JSONL):
+if os.path.exists("/kaggle/input/teacher-2-12/teacher_outputs_gt_guided_reverse.jsonl"):
     print(f"[INFO] 🔄 Found existing checkpoint: {OUT_JSONL}")
-    with open(OUT_JSONL, "r", encoding="utf-8") as f:
+    with open("/kaggle/input/teacher-2-12/teacher_outputs_gt_guided_reverse.jsonl", "r", encoding="utf-8") as f:
         for line in f:
             try:
                 r = json.loads(line)
