@@ -212,19 +212,38 @@ Bây giờ trả lời:"""
 df = pd.read_csv(CSV_PATH)
 results = []
 
-# RESUME từ checkpoint nếu có
+# RESUME từ checkpoint hoặc output file
 processed_ids = set()
-if os.path.exists("/kaggle/input/teacher-2-12/teacher_outputs_gt_guided_reverse.jsonl"):
-    print(f"[INFO] 🔄 Found existing checkpoint: {OUT_JSONL}")
-    with open("/kaggle/input/teacher-2-12/teacher_outputs_gt_guided_reverse.jsonl", "r", encoding="utf-8") as f:
+# Option 1: Checkpoint riêng (có thể set qua env var)
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH_REVERSE", "/kaggle/input/teacher-2-12/teacher_outputs_gt_guided_reverse.jsonl")
+
+resume_from = None
+if os.path.exists(CHECKPOINT_PATH):
+    resume_from = CHECKPOINT_PATH
+    print(f"[INFO] 🔄 Found checkpoint: {CHECKPOINT_PATH}")
+elif os.path.exists(OUT_JSONL):
+    resume_from = OUT_JSONL
+    print(f"[INFO] 🔄 Found existing output: {OUT_JSONL}")
+
+if resume_from:
+    with open(resume_from, "r", encoding="utf-8") as f:
         for line in f:
             try:
                 r = json.loads(line)
                 results.append(r)
-                processed_ids.add(r["img_id"])
-            except:
+                img_id = str(r.get("img_id", "")).strip()
+                if img_id:
+                    processed_ids.add(img_id)
+            except Exception as e:
                 continue
-    print(f"[INFO] ✅ Resumed with {len(results)} existing samples")
+    print(f"[INFO] ✅ Resumed with {len(results)} existing samples (unique IDs: {len(processed_ids)})")
+    
+    # Nếu resume từ checkpoint khác với output file, cần merge
+    if resume_from != OUT_JSONL and os.path.exists(OUT_JSONL):
+        print(f"[WARN] ⚠️  Both checkpoint and output file exist!")
+        print(f"[WARN] Consider running merge_teacher_outputs.py first to avoid duplicates")
+else:
+    print(f"[INFO] Starting fresh - no existing data found")
 
 # Periodic save để tránh mất dữ liệu
 SAVE_INTERVAL = 50  # Save thường xuyên hơn (mỗi 50 samples)
