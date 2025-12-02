@@ -215,7 +215,7 @@ results = []
 # RESUME từ checkpoint hoặc output file
 processed_ids = set()
 # Option 1: Checkpoint riêng (có thể set qua env var)
-CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH_REVERSE", "/kaggle/input/teacher-2-12/teacher_outputs_gt_guided_reverse.jsonl")
+CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH_REVERSE", "/kaggle/input/dtn212/teacher_outputs_gt_guided_reverse.jsonl")
 
 resume_from = None
 if os.path.exists(CHECKPOINT_PATH):
