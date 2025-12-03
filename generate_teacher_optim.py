@@ -58,29 +58,13 @@ def infer_reasoning_type(question: str) -> str:
 device = "cuda:0"  # Chỉ dùng GPU đầu tiên cho ổn định
 print(f"[INFO] Using device: {device}")
 
-# Load Hugging Face token from Kaggle Secrets
-try:
-    from kaggle_secrets import UserSecretsClient
-    user_secrets = UserSecretsClient()
-    hf_token = user_secrets.get_secret("HF_TOKEN")
-    print("[INFO] ✅ Loaded HF_TOKEN from Kaggle Secrets")
-except Exception as e:
-    hf_token = None
-    print(f"[WARN] ⚠️  No HF_TOKEN found: {e}")
-    print("[INFO] Trying without authentication (may fail for gated models)...")
-
-processor = AutoProcessor.from_pretrained(
-    MODEL_NAME, 
-    trust_remote_code=True,
-    token=hf_token
-)
+processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
 model = AutoModelForVision2Seq.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.float16,
     device_map="auto",  # Để tự động chọn, nhưng sẽ ưu tiên GPU 0
     trust_remote_code=True,
-    low_cpu_mem_usage=True,
-    token=hf_token
+    low_cpu_mem_usage=True
 )
 model.eval()
 
