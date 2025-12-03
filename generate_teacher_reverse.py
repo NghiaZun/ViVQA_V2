@@ -214,13 +214,33 @@ results = []
 
 # RESUME từ checkpoint hoặc output file
 processed_ids = set()
-# Option 1: Checkpoint riêng (có thể set qua env var)
-CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH_REVERSE", "/kaggle/input/dtn212/teacher_outputs_gt_guided_reverse.jsonl")
 
+# Tự động tìm file teacher_outputs_merged_reverse trong /kaggle/input
+def find_teacher_merged_reverse_file():
+    """Đào sâu tìm file teacher_outputs_merged_reverse* trong /kaggle/input"""
+    kaggle_input = "/kaggle/input"
+    if not os.path.exists(kaggle_input):
+        return None
+    
+    print(f"[INFO] 🔍 Searching for teacher_outputs_merged_reverse* in {kaggle_input}...")
+    
+    for root, dirs, files in os.walk(kaggle_input):
+        for file in files:
+            if file.startswith("teacher_outputs_merged_reverse") and file.endswith(".jsonl"):
+                found_path = os.path.join(root, file)
+                print(f"[INFO] ✅ Found merged reverse file: {found_path}")
+                return found_path
+    
+    print(f"[INFO] ⚠️  No teacher_outputs_merged_reverse*.jsonl found in {kaggle_input}")
+    return None
+
+# Tìm file merged reverse hoặc fallback về output file hiện tại
 resume_from = None
-if os.path.exists(CHECKPOINT_PATH):
-    resume_from = CHECKPOINT_PATH
-    print(f"[INFO] 🔄 Found checkpoint: {CHECKPOINT_PATH}")
+merged_reverse_file = find_teacher_merged_reverse_file()
+
+if merged_reverse_file:
+    resume_from = merged_reverse_file
+    print(f"[INFO] 🔄 Resuming from merged reverse checkpoint: {merged_reverse_file}")
 elif os.path.exists(OUT_JSONL):
     resume_from = OUT_JSONL
     print(f"[INFO] 🔄 Found existing output: {OUT_JSONL}")
