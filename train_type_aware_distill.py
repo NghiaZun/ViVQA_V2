@@ -406,15 +406,16 @@ class TypeAwareDataset(Dataset):
         teacher_raw = teacher_data.get("teacher_raw", "")
         
         # GT-GUIDED VALIDATION: Verify teacher_answer matches gt_answer
+        # If mismatch detected, use GT-only (no teacher reasoning)
         if teacher_answer and teacher_answer.strip().lower() != gt_answer.strip().lower():
             if not hasattr(self, '_gt_mismatch_warned'):
-                print(f"[WARN] ⚠️  GT-guided mismatch detected!")
-                print(f"  Image: {img_id}")
+                print(f"[WARN] ⚠️  GT-guided mismatch detected - using GT only for these samples")
+                print(f"  Example - Image: {img_id}")
                 print(f"  GT: '{gt_answer}' vs Teacher: '{teacher_answer}'")
-                print(f"  This should NOT happen in GT-guided mode!")
                 self._gt_mismatch_warned = True
-            # Force teacher_answer = gt_answer to maintain GT-guided guarantee
+            # Use GT only (no teacher reasoning for mismatched samples)
             teacher_answer = gt_answer
+            teacher_reasoning = ""  # Clear reasoning to signal quality issue
         
         # LIGHTWEIGHT QUALITY CHECK for GT-guided teacher
         # Accept fallback entries (they have _fallback flag)
@@ -467,8 +468,9 @@ class TypeAwareDataset(Dataset):
         )
         
         return {
-            "image": image,
-            "question": question,
+            # Remove PIL Image and raw string - cannot be collated by DataLoader
+            # "image": image,  # ❌ PIL Image cannot be batched
+            # "question": question,  # ❌ Raw string not needed in training loop
             "student_pixel_values": student_pixel_values,
             "student_input_ids": student_q_enc.input_ids[0],
             "student_attention_mask": student_q_enc.attention_mask[0],
@@ -838,16 +840,9 @@ def train():
         loop = tqdm(train_loader, desc="Train", leave=False)
         
         for step, batch in enumerate(loop):
-            # Get teacher embeddings
-            images = batch["image"]
-            questions = batch["question"]
-            
-            try:
-                teacher_emb = get_teacher_embeddings(images, questions, teacher, teacher_processor)
-            except Exception as e:
-                if step == 0:  # Log only first failure to avoid spam
-                    print(f"[WARN] Teacher embedding extraction failed: {e}")
-                teacher_emb = None
+            # Skip teacher embeddings extraction - not needed for GT-guided training
+            # We only use teacher labels (text), not teacher embeddings
+            teacher_emb = None
             
             # Forward pass with AMP
             with autocast(dtype=torch.float16, enabled=cfg.use_amp):
