@@ -71,7 +71,7 @@ class TrainConfig:
     image_dir: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
     teacher_jsonl: str = "/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl"
     teacher_model: str = "Qwen/Qwen2-VL-7B-Instruct"
-    checkpoint_dir: str = "/kaggle/input/checkpoints/transformers/default/1/checkpoints"
+    checkpoint_dir: str = "/kaggle/input/student/transformers/default/1/checkpoints"
     save_dir: str = "/kaggle/working"
     
     # Training hyperparameters
