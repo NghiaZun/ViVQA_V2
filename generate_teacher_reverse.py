@@ -108,11 +108,21 @@ def parse_structured_output(text: str, question: str = ""):
     return answer, reasoning, reasoning_type
 
 # ===========================
-# TEACHER GENERATION - GT-GUIDED + OPTIMIZED
+# TEACHER GENERATION - GT-GUIDED + OPTIMIZED + RETRY
 # ===========================
 @torch.no_grad()
-def call_teacher_qwen(image_path: str, question: str, ground_truth: str):
-    """GT-guided: Teacher explains WHY answer is ground_truth"""
+def call_teacher_qwen(image_path: str, question: str, ground_truth: str, max_retries=3):
+    """GT-guided: Teacher explains WHY answer is ground_truth
+    
+    Args:
+        image_path: Path to image
+        question: Question text
+        ground_truth: Ground truth answer
+        max_retries: Number of retry attempts with same prompt (default: 3)
+    
+    Returns:
+        Dict with answer, reasoning, type, raw, weight or None
+    """
     try:
         image = Image.open(image_path).convert("RGB")
     except Exception as e:
@@ -182,12 +192,57 @@ Bây giờ trả lời:"""
 
         answer, reasoning, reasoning_type = parse_structured_output(gen, question)
 
-        # QUALITY CHECK: Đảm bảo reasoning hợp lệ
-        if not reasoning or len(reasoning) < 10:
-            # Retry với prompt đơn giản hơn nếu lần đầu fail
-            return None
+        # QUALITY CHECK: Nếu parse fail → RETRY với CÙNG prompt chuẩn (max 3 lần)
+        retry_count = 0
+        while (not reasoning or len(reasoning) < 5 or not reasoning_type) and retry_count < max_retries:
+            retry_count += 1
+            
+            try:
+                print(f"[RETRY {retry_count}/{max_retries}] Retrying generation for same prompt...")
+                
+                # RETRY với CÙNG prompt và inputs (model có thể generate khác)
+                with torch.amp.autocast('cuda'):
+                    retry_output = model.generate(
+                        **inputs,
+                        max_new_tokens=100,
+                        min_new_tokens=30,
+                        do_sample=False,  # Giữ deterministic
+                        temperature=1.0,
+                        use_cache=True,
+                        repetition_penalty=1.1,
+                        pad_token_id=processor.tokenizer.pad_token_id
+                    )
+                
+                retry_gen = processor.batch_decode(
+                    retry_output[:, inputs.input_ids.shape[1]:],
+                    skip_special_tokens=True
+                )[0].strip()
+                
+                answer_retry, reasoning_retry, type_retry = parse_structured_output(retry_gen, question)
+                
+                # Nếu retry thành công → dùng kết quả retry
+                if reasoning_retry and len(reasoning_retry) >= 5 and type_retry:
+                    answer, reasoning, reasoning_type = answer_retry, reasoning_retry, type_retry
+                    print(f"[SUCCESS] Retry {retry_count} succeeded!")
+                    break  # Thoát khỏi retry loop
+                else:
+                    print(f"[RETRY {retry_count}] Still invalid, trying again...")
+                    
+            except Exception as retry_error:
+                print(f"[ERROR] Retry {retry_count} failed: {retry_error}")
+                continue  # Thử retry tiếp
         
-        # Clean raw output: loại bỏ phần hướng dẫn thừa
+        # FINAL FALLBACK: Nếu vẫn không có reasoning hợp lệ
+        if not reasoning or len(reasoning) < 5:
+            reasoning = f"Dựa vào hình ảnh, câu trả lời là {ground_truth}."
+            if not reasoning_type:
+                reasoning_type = infer_reasoning_type(question)
+        
+        # Validate answer không empty
+        if not answer or not answer.strip():
+            answer = ground_truth  # Force answer = GT
+        
+        # Clean raw output
         clean_raw = "\n".join([
             f"Answer: {answer}",
             f"Type: {reasoning_type}",
@@ -198,12 +253,12 @@ Bây giờ trả lời:"""
             "answer": answer,
             "reasoning": reasoning,
             "reasoning_type": reasoning_type,
-            "raw": clean_raw,  # Lưu clean version thay vì raw
+            "raw": clean_raw,
             "reasoning_weight": REASONING_WEIGHTS.get(reasoning_type, 1.0)
         }
 
     except Exception as e:
-        print(f"[ERROR] Generation failed for {image_path}: {e}")
+        print(f"[ERROR] Generation completely failed: {e}")
         return None
 
 # ===========================
@@ -292,7 +347,9 @@ try:
 
         res = call_teacher_qwen(image_path, q, gt_answer)
 
-        if res and res["answer"] and res["reasoning"]:  # STRICTER: Phải có cả answer VÀ reasoning
+        # ALWAYS save - even with fallback reasoning (GT-guided guarantee!)
+        if res:
+            # Teacher generated successfully (có fallback nếu reasoning ngắn)
             new_entry = {
                 "img_id": image_id,
                 "image_path": image_path,
@@ -310,9 +367,30 @@ try:
             with open(OUT_JSONL, "a", encoding="utf-8") as f:
                 f.write(json.dumps(new_entry, ensure_ascii=False) + "\n")
         else:
+            # Teacher generation hoàn toàn failed - tạo minimal fallback
             failed_samples += 1
             if failed_samples <= 5:  # Log first 5 failures
-                print(f"\n[SKIP] Failed sample: {image_id} | Q: {q[:40]}...")
+                print(f"\n[WARN] Teacher failed for {image_id}, creating fallback...")
+            
+            # Create minimal fallback entry (GT-guided: answer = GT)
+            reasoning_type = infer_reasoning_type(q)
+            fallback_entry = {
+                "img_id": image_id,
+                "image_path": image_path,
+                "question": q,
+                "reasoning_type": reasoning_type,
+                "teacher_answer": gt_answer,  # GT-guided
+                "teacher_reasoning": f"Dựa vào hình ảnh, câu trả lời là {gt_answer}.",
+                "teacher_raw": f"Answer: {gt_answer}\nType: {reasoning_type}\nReasoning: Dựa vào hình ảnh, câu trả lời là {gt_answer}.",
+                "reasoning_weight": REASONING_WEIGHTS.get(reasoning_type, 1.0),
+                "_fallback": True  # Flag to track fallback entries
+            }
+            results.append(fallback_entry)
+            processed_ids.add(image_id)
+            
+            # Save fallback entry
+            with open(OUT_JSONL, "a", encoding="utf-8") as f:
+                f.write(json.dumps(fallback_entry, ensure_ascii=False) + "\n")
         
         # Progress report định kỳ
         if len(results) % SAVE_INTERVAL == 0 and len(results) > 0:
@@ -331,7 +409,13 @@ finally:
     # Final report (file đã được save liên tục rồi, không cần save lại)
     print(f"\n[INFO] ✅ Completed! Total saved: {len(results)}/{len(df)} teacher samples → {OUT_JSONL}")
     if len(results) > 0:
-        print(f"[INFO] Success rate: {len(results)/len(df)*100:.1f}% | Failed: {failed_samples}")
+        # Count fallback entries
+        fallback_count = sum(1 for r in results if r.get('_fallback', False))
+        teacher_generated = len(results) - fallback_count
+        
+        print(f"[INFO] Coverage: {len(results)/len(df)*100:.1f}%")
+        print(f"[INFO] Teacher-generated: {teacher_generated} ({teacher_generated/len(results)*100:.1f}%)")
+        print(f"[INFO] Fallback entries: {fallback_count} ({fallback_count/len(results)*100:.1f}%)")
         print(f"[INFO] Average reasoning length: {sum(len(r['teacher_reasoning']) for r in results)/len(results):.1f} chars")
     else:
         print(f"[WARN] No valid samples generated!")

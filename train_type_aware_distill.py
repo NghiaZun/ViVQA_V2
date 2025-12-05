@@ -69,7 +69,7 @@ class TrainConfig:
     # Paths
     train_csv: str = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
     image_dir: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
-    teacher_jsonl: str = "/kaggle/input/teacher/teacher_outputs.jsonl"
+    teacher_jsonl: str = "/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl"
     teacher_model: str = "Qwen/Qwen2-VL-7B-Instruct"
     checkpoint_dir: str = "/kaggle/input/checkpoints/transformers/default/1/checkpoints"
     save_dir: str = "/kaggle/working"
@@ -113,44 +113,46 @@ class TrainConfig:
     temperature: float = 2.5
     max_output_len: int = 128
 
-# Loss weights - DYNAMIC per stage
-def get_loss_weights(stage: int, temperature: float = 1.0):
+# Loss weights - DYNAMIC per stage - GT-GUIDED (NO separate GT loss!)
+def get_loss_weights(stage: int, temperature: float = 2.0):
     """Get loss weights based on training stage with temperature scaling for embeddings
+    
+    GT-GUIDED STRATEGY (teacher answer = GT + reasoning):
+    - Teacher loss = main optimization target (contains GT answer + reasoning)
+    - Embedding alignment = match teacher's representations
+    - Type classification = structured reasoning awareness
     
     Args:
         stage: Training stage (1, 2, or 3)
         temperature: Temperature for scaling embedding alignment losses (higher = softer alignment)
         
     Returns:
-        Dictionary with loss weights and temperature
+        Dictionary with loss weights and temperature (NO 'gt' key - not used!)
     """
     if stage == 1:
-        # Stage 1: Learn from teacher + type classification
+        # Stage 1: Learn reasoning patterns + type classification
         return {
-            'gt': 0.1,
-            'teacher': 0.6,
-            'vision': 0.15,
-            'text': 0.05,
-            'type': 0.1,
+            'teacher': 0.7,     # HIGH - teacher = GT + reasoning
+            'vision': 0.15,     # Vision-teacher alignment
+            'text': 0.05,       # Text-teacher alignment
+            'type': 0.1,        # Type classification
             'temperature': temperature
         }
     elif stage == 2:
-        # Stage 2: Balance all
+        # Stage 2: REASONING MASTERY - Strong teacher guidance
         return {
-            'gt': 0.2,
-            'teacher': 0.5,
-            'vision': 0.15,
-            'text': 0.05,
+            'teacher': 0.75,    # VERY HIGH - master reasoning generation
+            'vision': 0.12,     # Slightly reduce embeddings
+            'text': 0.03,
             'type': 0.1,
             'temperature': temperature
         }
     else:
-        # Stage 3: Trust ground truth more, reduce teacher influence
+        # Stage 3: POLISH - Focus on teacher output quality
         return {
-            'gt': 0.3,
-            'teacher': 0.4,
-            'vision': 0.15,
-            'text': 0.05,
+            'teacher': 0.8,     # DOMINANT - full output quality
+            'vision': 0.08,     # Lower embeddings
+            'text': 0.02,
             'type': 0.1,
             'temperature': temperature
         }
@@ -397,17 +399,50 @@ class TypeAwareDataset(Dataset):
         question = str(row["question"])
         gt_answer = str(row["answer"])
         
-        # Get teacher output
+        # Get teacher output - GT-GUIDED (answer = GT, adds reasoning)
         teacher_data = self.teacher_outputs.get(img_id, {})
         teacher_answer = teacher_data.get("teacher_answer", gt_answer)
         teacher_reasoning = teacher_data.get("teacher_reasoning", "")
         teacher_raw = teacher_data.get("teacher_raw", "")
         
+        # GT-GUIDED VALIDATION: Verify teacher_answer matches gt_answer
+        if teacher_answer and teacher_answer.strip().lower() != gt_answer.strip().lower():
+            if not hasattr(self, '_gt_mismatch_warned'):
+                print(f"[WARN] ⚠️  GT-guided mismatch detected!")
+                print(f"  Image: {img_id}")
+                print(f"  GT: '{gt_answer}' vs Teacher: '{teacher_answer}'")
+                print(f"  This should NOT happen in GT-guided mode!")
+                self._gt_mismatch_warned = True
+            # Force teacher_answer = gt_answer to maintain GT-guided guarantee
+            teacher_answer = gt_answer
+        
+        # LIGHTWEIGHT QUALITY CHECK for GT-guided teacher
+        # Accept fallback entries (they have _fallback flag)
+        is_fallback = teacher_data.get('_fallback', False)
+        use_teacher = True
+        
+        if not is_fallback and teacher_reasoning:
+            # Only check for obvious failures in teacher-generated (not fallback)
+            bad_patterns = [
+                len(teacher_reasoning) < 5,   # Too short (likely parsing error)
+                len(teacher_reasoning) > 250,  # Suspiciously long
+                "..." in teacher_reasoning and len(teacher_reasoning) < 20,  # Incomplete
+            ]
+            
+            if any(bad_patterns):
+                use_teacher = False
+                if not hasattr(self, '_quality_warning_shown'):
+                    print(f"[INFO] ⚠️  Filtering {sum(bad_patterns)} low-quality teacher outputs")
+                    self._quality_warning_shown = True
+        # Fallback entries are ALWAYS accepted (simple but valid)
+        
         # Construct full teacher output: Answer: X\nReasoning: Y
-        if teacher_reasoning:
+        # Note: teacher_answer should equal gt_answer (GT-guided)
+        if use_teacher and teacher_reasoning:
             teacher_full = f"Answer: {teacher_answer}\nReasoning: {teacher_reasoning}"
         else:
-            teacher_full = f"Answer: {teacher_answer}"
+            # Fallback to GT if teacher reasoning is broken
+            teacher_full = f"Answer: {gt_answer}"
         
         # Extract reasoning type
         reasoning_type_idx = self._parse_reasoning_type(teacher_raw if teacher_raw else teacher_reasoning)
@@ -487,12 +522,13 @@ def get_teacher_embeddings(images, questions, teacher, teacher_processor):
 # =====================
 def compute_type_aware_loss(student, batch, device, teacher_embeddings=None, loss_weights=None):
     """
-    Multi-task loss with dynamic weights:
-    1. CE with ground truth
-    2. CE with teacher output
-    3. Vision embedding alignment
-    4. Text embedding alignment
-    5. Reasoning type classification
+    Multi-task loss - OPTIMIZED for GT-guided teacher:
+    1. CE with teacher output (teacher = GT + reasoning)
+    2. Vision embedding alignment
+    3. Text embedding alignment
+    4. Reasoning type classification
+    
+    NOTE: GT loss NOT computed (weight=0, redundant with teacher)
     
     Args:
         student: Student model (TypeAwareVQAModel)
@@ -519,24 +555,34 @@ def compute_type_aware_loss(student, batch, device, teacher_embeddings=None, los
         pixel_values=pixel_values,
         input_ids=input_ids,
         attention_mask=attention_mask,
-        labels=teacher_labels  # Use teacher labels for main task
+        labels=teacher_labels  # Use teacher labels (GT + reasoning)
     )
     
     student_logits = outputs.logits
     
-    # Loss 1: CE with teacher output (HIGH weight)
+    # Loss 1: CE with teacher output (MAIN loss - teacher = GT + reasoning)
     loss_teacher = F.cross_entropy(
         student_logits.view(-1, student_logits.size(-1)),
         teacher_labels.view(-1),
         ignore_index=-100
     )
     
-    # Loss 2: CE with ground truth (LOW weight)
-    loss_gt = F.cross_entropy(
-        student_logits.view(-1, student_logits.size(-1)),
-        gt_labels.view(-1),
-        ignore_index=-100
-    )
+    # Loss 2: GT loss - ONLY for logging (not used in optimization)
+    # GT-GUIDED: Teacher already contains GT answer, so GT loss is for monitoring only
+    # Must compute in no_grad with SEPARATE forward pass to avoid gradient contamination
+    with torch.no_grad():
+        # Separate forward pass with GT labels for fair comparison
+        gt_outputs, _ = student(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=gt_labels  # Use GT labels for this pass
+        )
+        loss_gt = F.cross_entropy(
+            gt_outputs.logits.view(-1, gt_outputs.logits.size(-1)),
+            gt_labels.view(-1),
+            ignore_index=-100
+        ).item()
     
     # Loss 3: Reasoning type classification
     loss_type = F.cross_entropy(type_logits, reasoning_type)
@@ -561,16 +607,16 @@ def compute_type_aware_loss(student, batch, device, teacher_embeddings=None, los
         loss_vision = F.mse_loss(student_vision_emb, teacher_emb_norm) / temperature
         loss_text = F.mse_loss(student_text_emb, teacher_emb_norm) / temperature
     
-    # Combined loss with dynamic weights
+    # Combined loss - OPTIMIZED: No GT loss (weight=0, already in teacher)
     total_loss = (
-        loss_weights['gt'] * loss_gt +
+        # loss_weights['gt'] * loss_gt  # REMOVED - redundant
         loss_weights['teacher'] * loss_teacher +
         loss_weights['vision'] * loss_vision +
         loss_weights['text'] * loss_text +
         loss_weights['type'] * loss_type
     )
     
-    return total_loss, loss_gt.item(), loss_teacher.item(), loss_type.item(), loss_vision.item(), loss_text.item()
+    return total_loss, loss_gt, loss_teacher.item(), loss_type.item(), loss_vision.item(), loss_text.item()
 
 # =====================
 # PLOT TRAINING CURVES
@@ -722,12 +768,20 @@ def train():
         clear_memory()
     
     print(f"\n{'='*70}")
-    print("TYPE-AWARE HYBRID DISTILLATION - PROGRESSIVE TRAINING")
+    print("TYPE-AWARE HYBRID DISTILLATION - GT-GUIDED TEACHER")
     print(f"{'='*70}")
-    print(f"[STRATEGY]")
-    print(f"  Stage 1 (Epochs 1-{cfg.stage1_epochs}): Focus on Teacher + Type (weights: teacher=0.6)")
-    print(f"  Stage 2 (Epochs {cfg.stage1_epochs+1}-{cfg.stage1_epochs+cfg.stage2_epochs}): Balance all losses")
-    print(f"  Stage 3 (Epochs {cfg.stage1_epochs+cfg.stage2_epochs+1}-{cfg.num_epochs}): Trust GT more (weights: gt=0.3)")
+    print(f"[TEACHER STRATEGY] GT-Guided: Answer = Ground Truth + Reasoning")
+    print(f"  ✅ Answer: 100% correct (forced to GT)")
+    print(f"  🧠 Reasoning: Generated by Qwen-7B")
+    print(f"  📊 NO separate GT loss (redundant - teacher already contains GT!)")
+    print(f"\n[LOSS COMPOSITION]")
+    print(f"  🎯 Teacher loss (0.7-0.8): Learn answer + reasoning together")
+    print(f"  👁️  Vision/Text alignment (0.15-0.1): Match teacher embeddings")
+    print(f"  🏷️  Type classification (0.1): Structured reasoning awareness")
+    print(f"\n[TRAINING STRATEGY]")
+    print(f"  Stage 1 (Epochs 1-{cfg.stage1_epochs}): Learn reasoning patterns (teacher=0.7)")
+    print(f"  Stage 2 (Epochs {cfg.stage1_epochs+1}-{cfg.stage1_epochs+cfg.stage2_epochs}): Master reasoning (teacher=0.75)")
+    print(f"  Stage 3 (Epochs {cfg.stage1_epochs+cfg.stage2_epochs+1}-{cfg.num_epochs}): Polish (teacher=0.8)")
     print(f"{'='*70}\n")
     
     for epoch in range(start_epoch, cfg.num_epochs):
@@ -765,7 +819,8 @@ def train():
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{cfg.num_epochs} - Stage {current_stage}")
         print(f"Trainable params: {trainable_params/1e6:.2f}M | LR: {current_lr:.2e}")
-        print(f"Loss weights: GT={loss_weights['gt']}, Teacher={loss_weights['teacher']}, Type={loss_weights['type']}")
+        print(f"Loss weights: Teacher={loss_weights['teacher']}, Vision={loss_weights['vision']}, "
+              f"Text={loss_weights['text']}, Type={loss_weights['type']}")
         print_gpu_memory()
         print(f"{'='*70}")
         
@@ -849,13 +904,18 @@ def train():
         clear_memory()
         avg_val_loss = val_loss / max(val_steps, 1)
         
-        # Logging
+        # Logging - SIMPLIFIED (no GT loss since teacher=GT+reasoning)
         print(f"\nTrain Loss: {avg_train_loss:.4f}")
-        print(f"  - GT: {total_gt/len(train_loader):.4f}")
-        print(f"  - Teacher: {total_teacher/len(train_loader):.4f}")
-        print(f"  - Type: {total_type/len(train_loader):.4f}")
-        print(f"  - Vision: {total_vision/len(train_loader):.4f}")
-        print(f"  - Text: {total_text/len(train_loader):.4f}")
+        print(f"  🎯 Teacher: {total_teacher/len(train_loader):.4f} (answer+reasoning)")
+        print(f"  🏷️  Type: {total_type/len(train_loader):.4f}")
+        print(f"  👁️  Vision: {total_vision/len(train_loader):.4f}")
+        print(f"  📝 Text: {total_text/len(train_loader):.4f}")
+        print(f"  [GT loss: {total_gt/len(train_loader):.4f} - NOT USED (weight=0)]")
+        
+        # QUALITY INDICATOR: Check if teacher loss is reasonable
+        if total_teacher/len(train_loader) > 10.0:
+            print(f"  ⚠️  WARNING: Teacher loss very high - check data quality!")
+        
         print(f"Val Loss: {avg_val_loss:.4f}")
         
         # Early stopping
