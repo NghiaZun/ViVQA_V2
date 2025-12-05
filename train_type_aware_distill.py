@@ -132,28 +132,28 @@ def get_loss_weights(stage: int, temperature: float = 2.0):
     if stage == 1:
         # Stage 1: Learn reasoning patterns + type classification
         return {
-            'teacher': 0.9,     # DOMINANT - teacher = GT + reasoning
+            'teacher': 1.0,     # FULL - teacher = GT + reasoning
             'vision': 0.0,      # DISABLED - no teacher model
             'text': 0.0,        # DISABLED - no teacher model
-            'type': 0.1,        # Type classification
+            'type': 0.0,        # TEMPORARY DISABLED - parsing issue
             'temperature': temperature
         }
     elif stage == 2:
         # Stage 2: REASONING MASTERY - Strong teacher guidance
         return {
-            'teacher': 0.9,     # DOMINANT - master reasoning generation
+            'teacher': 1.0,     # FULL - master reasoning generation
             'vision': 0.0,      # DISABLED
             'text': 0.0,        # DISABLED
-            'type': 0.1,
+            'type': 0.0,        # TEMPORARY DISABLED - parsing issue
             'temperature': temperature
         }
     else:
         # Stage 3: POLISH - Focus on teacher output quality
         return {
-            'teacher': 0.9,     # DOMINANT - full output quality
+            'teacher': 1.0,     # FULL - full output quality
             'vision': 0.0,      # DISABLED
             'text': 0.0,        # DISABLED
-            'type': 0.1,
+            'type': 0.0,        # TEMPORARY DISABLED - parsing issue
             'temperature': temperature
         }
 
@@ -315,8 +315,35 @@ class TypeAwareDataset(Dataset):
                     img_id = data.get('img_id', data.get('image_id'))
                     self.teacher_outputs[str(img_id)] = data
             print(f"[INFO] Loaded {len(self.teacher_outputs)} teacher outputs from {teacher_file}")
+            
+            # DEBUG: Analyze type distribution
+            self._debug_type_distribution()
         else:
             print(f"[WARN] No teacher outputs found. Training with GT only.")
+    
+    def _debug_type_distribution(self):
+        """Debug: Check reasoning type distribution in teacher outputs"""
+        from collections import Counter
+        type_counts = Counter()
+        sample_texts = []
+        
+        for img_id, data in list(self.teacher_outputs.items())[:100]:  # First 100 samples
+            raw = data.get('teacher_raw', '')
+            rtype = self._parse_reasoning_type(raw, log_failures=False)
+            type_counts[REASONING_TYPES[rtype]] += 1
+            
+            if len(sample_texts) < 3:
+                sample_texts.append((img_id, raw[:200], REASONING_TYPES[rtype]))
+        
+        print(f"\n[DEBUG] 🔍 Type Distribution (first 100 samples):")
+        for rtype, count in type_counts.most_common():
+            print(f"  {rtype:20s}: {count:3d} ({count/sum(type_counts.values())*100:.1f}%)")
+        
+        print(f"\n[DEBUG] 📝 Sample parsing:")
+        for img_id, text, parsed_type in sample_texts:
+            print(f"  ID {img_id}: {parsed_type}")
+            print(f"    Raw: {text}...")
+            print()
     
     def _find_teacher_file(self, default_path):
         """Tìm file teacher_outputs_merged trong /kaggle/input"""
@@ -445,8 +472,16 @@ class TypeAwareDataset(Dataset):
             # Fallback to GT if teacher reasoning is broken
             teacher_full = f"Answer: {gt_answer}"
         
-        # Extract reasoning type
-        reasoning_type_idx = self._parse_reasoning_type(teacher_raw if teacher_raw else teacher_reasoning)
+        # Extract reasoning type - try multiple sources
+        # Priority: teacher_raw > teacher_reasoning > fallback to DESCRIPTIVE
+        reasoning_type_idx = TYPE_TO_IDX["DESCRIPTIVE"]  # Default
+        
+        if teacher_raw:
+            reasoning_type_idx = self._parse_reasoning_type(teacher_raw, log_failures=False)
+        
+        # If still default and we have reasoning, try parsing from reasoning text
+        if reasoning_type_idx == TYPE_TO_IDX["DESCRIPTIVE"] and teacher_reasoning:
+            reasoning_type_idx = self._parse_reasoning_type(teacher_reasoning, log_failures=False)
         
         # Student inputs
         student_pixel_values = self.student_processor(image, return_tensors="pt").pixel_values[0]
