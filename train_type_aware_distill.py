@@ -132,28 +132,28 @@ def get_loss_weights(stage: int, temperature: float = 2.0):
     if stage == 1:
         # Stage 1: Learn reasoning patterns + type classification
         return {
-            'teacher': 1.0,     # FULL - teacher = GT + reasoning
+            'teacher': 0.95,    # Slightly reduce to make room for type
             'vision': 0.0,      # DISABLED - no teacher model
             'text': 0.0,        # DISABLED - no teacher model
-            'type': 0.0,        # TEMPORARY DISABLED - parsing issue
+            'type': 0.05,       # RE-ENABLED - parsing works (93% SPATIAL, 6% OBJECT, 1% COUNTING)
             'temperature': temperature
         }
     elif stage == 2:
         # Stage 2: REASONING MASTERY - Strong teacher guidance
         return {
-            'teacher': 1.0,     # FULL - master reasoning generation
+            'teacher': 0.92,    # High but leave room for type
             'vision': 0.0,      # DISABLED
             'text': 0.0,        # DISABLED
-            'type': 0.0,        # TEMPORARY DISABLED - parsing issue
+            'type': 0.08,       # Increase type weight in stage 2
             'temperature': temperature
         }
     else:
         # Stage 3: POLISH - Focus on teacher output quality
         return {
-            'teacher': 1.0,     # FULL - full output quality
+            'teacher': 0.9,     # Balanced
             'vision': 0.0,      # DISABLED
             'text': 0.0,        # DISABLED
-            'type': 0.0,        # TEMPORARY DISABLED - parsing issue
+            'type': 0.1,        # Full type weight for structured reasoning
             'temperature': temperature
         }
 
@@ -315,35 +315,8 @@ class TypeAwareDataset(Dataset):
                     img_id = data.get('img_id', data.get('image_id'))
                     self.teacher_outputs[str(img_id)] = data
             print(f"[INFO] Loaded {len(self.teacher_outputs)} teacher outputs from {teacher_file}")
-            
-            # DEBUG: Analyze type distribution
-            self._debug_type_distribution()
         else:
             print(f"[WARN] No teacher outputs found. Training with GT only.")
-    
-    def _debug_type_distribution(self):
-        """Debug: Check reasoning type distribution in teacher outputs"""
-        from collections import Counter
-        type_counts = Counter()
-        sample_texts = []
-        
-        for img_id, data in list(self.teacher_outputs.items())[:100]:  # First 100 samples
-            raw = data.get('teacher_raw', '')
-            rtype = self._parse_reasoning_type(raw, log_failures=False)
-            type_counts[REASONING_TYPES[rtype]] += 1
-            
-            if len(sample_texts) < 3:
-                sample_texts.append((img_id, raw[:200], REASONING_TYPES[rtype]))
-        
-        print(f"\n[DEBUG] 🔍 Type Distribution (first 100 samples):")
-        for rtype, count in type_counts.most_common():
-            print(f"  {rtype:20s}: {count:3d} ({count/sum(type_counts.values())*100:.1f}%)")
-        
-        print(f"\n[DEBUG] 📝 Sample parsing:")
-        for img_id, text, parsed_type in sample_texts:
-            print(f"  ID {img_id}: {parsed_type}")
-            print(f"    Raw: {text}...")
-            print()
     
     def _find_teacher_file(self, default_path):
         """Tìm file teacher_outputs_merged trong /kaggle/input"""
@@ -405,11 +378,6 @@ class TypeAwareDataset(Dataset):
             if rtype in TYPE_TO_IDX:
                 return TYPE_TO_IDX[rtype]
         
-        # Log failure if requested
-        if log_failures and not hasattr(self, '_logged_parse_warning'):
-            print(f"[WARN] Failed to parse reasoning type from: {text[:100]}...")
-            self._logged_parse_warning = True
-        
         # Default to DESCRIPTIVE
         return TYPE_TO_IDX["DESCRIPTIVE"]
     
@@ -435,11 +403,6 @@ class TypeAwareDataset(Dataset):
         # GT-GUIDED VALIDATION: Verify teacher_answer matches gt_answer
         # If mismatch detected, use GT-only (no teacher reasoning)
         if teacher_answer and teacher_answer.strip().lower() != gt_answer.strip().lower():
-            if not hasattr(self, '_gt_mismatch_warned'):
-                print(f"[WARN] ⚠️  GT-guided mismatch detected - using GT only for these samples")
-                print(f"  Example - Image: {img_id}")
-                print(f"  GT: '{gt_answer}' vs Teacher: '{teacher_answer}'")
-                self._gt_mismatch_warned = True
             # Use GT only (no teacher reasoning for mismatched samples)
             teacher_answer = gt_answer
             teacher_reasoning = ""  # Clear reasoning to signal quality issue
@@ -459,9 +422,6 @@ class TypeAwareDataset(Dataset):
             
             if any(bad_patterns):
                 use_teacher = False
-                if not hasattr(self, '_quality_warning_shown'):
-                    print(f"[INFO] ⚠️  Filtering {sum(bad_patterns)} low-quality teacher outputs")
-                    self._quality_warning_shown = True
         # Fallback entries are ALWAYS accepted (simple but valid)
         
         # Construct full teacher output: Answer: X\nReasoning: Y
@@ -787,18 +747,20 @@ def train():
     start_epoch = cfg.resume_epoch
     es_counter = 0
     
-    # Resume from checkpoint
-    auto_checkpoint = os.path.join(cfg.save_dir, "latest_checkpoint.pt")
-    if cfg.resume_epoch > 0 and os.path.exists(auto_checkpoint):
-        print(f"\n[RESUME] Loading checkpoint from: {auto_checkpoint}")
+    # Resume from checkpoint - AUTO DETECT
+    auto_checkpoint = "/kaggle/input/17-20/transformers/default/1/latest_checkpoint.pt"
+    if os.path.exists(auto_checkpoint):
+        print(f"\n[RESUME] 🔄 Found checkpoint: {auto_checkpoint}")
         checkpoint = torch.load(auto_checkpoint, map_location='cpu')
         student.load_state_dict(checkpoint['model_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         es_counter = checkpoint.get('es_counter', 0)
-        print(f"[RESUME] Continuing from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+        print(f"[RESUME] ✅ Continuing from epoch {start_epoch}, best_val={best_val_loss:.4f}, es_counter={es_counter}")
         del checkpoint
         clear_memory()
+    else:
+        print(f"[INFO] No checkpoint found. Starting from epoch 0.")
     
     print(f"\n{'='*70}")
     print("TYPE-AWARE DISTILLATION - GT-GUIDED (MEMORY OPTIMIZED)")
