@@ -17,6 +17,14 @@ import unicodedata
 from dataset import VQAGenDataset
 from model import VQAGenModel
 
+# Import TypeAwareVQAModel from training script
+import sys
+import importlib.util
+spec = importlib.util.spec_from_file_location("train_module", "train_type_aware_distill.py")
+train_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(train_module)
+TypeAwareVQAModel = train_module.TypeAwareVQAModel
+
 
 # ======================
 # TEXT NORMALIZATION
@@ -123,36 +131,50 @@ def token_f1(prediction, ground_truth):
 # === CONFIG ===
 TEST_CSV_PATH = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv"
 IMAGE_FOLDER = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test"
-MODEL_PATH = "/kaggle/input/29-11-v2/transformers/default/1/vqa_student_best.pt"  # Your trained model
-TOKENIZER_DIR = "/kaggle/input/checkpoints/transformers/default/1/checkpoints"  # Directory with phobert/vit5 tokenizers
+MODEL_PATH = "/kaggle/input/best-model/transformers/default/1/vqa_type_aware_best.pt"  # ✅ Best model (epoch 14)
+TOKENIZER_DIR = "/kaggle/input/student/transformers/default/1/checkpoints"  # Directory with phobert/vit5 tokenizers
 BATCH_SIZE = 8
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # === LOAD MODEL ===
 print(f"[INFO] Device: {DEVICE}")
-print("[INFO] Loading model...")
+print("[INFO] Loading TypeAwareVQAModel (with type classifier)...")
 
-model = VQAGenModel(
+# Load base model
+base_model = VQAGenModel(
     vision_model_name="Salesforce/blip-vqa-base",
     phobert_dir=os.path.join(TOKENIZER_DIR, "phobert_tokenizer"),
     vit5_dir=os.path.join(TOKENIZER_DIR, "vit5_tokenizer")
 )
 
+# Wrap with TypeAwareVQAModel
+model = TypeAwareVQAModel(base_model)
+
 # Load checkpoint
-print("[INFO] Loading checkpoint...")
+print(f"[INFO] Loading checkpoint from: {MODEL_PATH}")
 state_dict = torch.load(MODEL_PATH, map_location='cpu')
-if isinstance(state_dict, dict) and 'model' in state_dict:
+
+# Handle different checkpoint formats
+if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+    # Full checkpoint with optimizer etc.
+    model.load_state_dict(state_dict['model_state_dict'])
+    print(f"[INFO] Loaded from full checkpoint (epoch {state_dict.get('epoch', '?')})")
+elif isinstance(state_dict, dict) and 'model' in state_dict:
+    # Legacy format
     model.load_state_dict(state_dict['model'])
 else:
+    # Direct state dict
     model.load_state_dict(state_dict)
 
 model = model.to(DEVICE)
 model.eval()
 print("[INFO] Model loaded successfully!")
+print(f"[INFO] Total parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
 # === TOKENIZERS ===
-q_tokenizer = model.text_tokenizer
-a_tokenizer = model.decoder_tokenizer
+# Access tokenizers from base_model (wrapped inside TypeAwareVQAModel)
+q_tokenizer = model.base_model.text_tokenizer
+a_tokenizer = model.base_model.decoder_tokenizer
 
 # === DATASET ===
 vision_processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
@@ -256,7 +278,7 @@ print("="*60)
 
 
 # === SAVE CSV ===
-out_csv = "d:/ViVQA/eval_vqa_parsed_results.csv"
+out_csv = "/kaggle/working/eval_vqa_parsed_results.csv"
 df = pd.DataFrame(records)
 df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 print(f"\n[INFO] Results saved to: {out_csv}")
