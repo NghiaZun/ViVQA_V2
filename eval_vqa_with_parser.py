@@ -14,7 +14,6 @@ from rouge_score import rouge_scorer
 import re
 import unicodedata
 
-from dataset import VQAGenDataset
 from model import VQAGenModel
 
 # Import TypeAwareVQAModel from training script
@@ -176,23 +175,38 @@ print(f"[INFO] Total parameters: {sum(p.numel() for p in model.parameters())/1e6
 q_tokenizer = model.base_model.text_tokenizer
 a_tokenizer = model.base_model.decoder_tokenizer
 
-# === DATASET ===
+# === LOAD TEST DATA ===
+print("[INFO] Loading test data...")
+test_df = pd.read_csv(TEST_CSV_PATH)
 vision_processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
-test_dataset = VQAGenDataset(TEST_CSV_PATH, IMAGE_FOLDER, vision_processor)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
 
 # === EVAL LOOP ===
-print(f"[INFO] Running evaluation on {len(test_dataset)} samples...")
+print(f"[INFO] Running evaluation on {len(test_df)} samples...")
 refs, hyps = [], []
 records = []
 format_valid_count = 0
 
+from PIL import Image
+
 with torch.no_grad():
-    for pixel_values, input_ids, attention_mask, labels in tqdm(test_loader, desc="Evaluating"):
-        pixel_values = pixel_values.to(DEVICE)
-        input_ids = input_ids.to(DEVICE)
-        attention_mask = attention_mask.to(DEVICE)
-        labels = labels.to(DEVICE)
+    for idx in tqdm(range(len(test_df)), desc="Evaluating"):
+        row = test_df.iloc[idx]
+        img_id = row['img_id']
+        question = str(row['question'])
+        gt_answer = str(row['answer'])
+        
+        # Load image
+        img_path = os.path.join(IMAGE_FOLDER, f"{img_id}.jpg")
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except:
+            image = Image.new("RGB", (224, 224), (255, 255, 255))
+        
+        # Process inputs
+        pixel_values = vision_processor(image, return_tensors="pt").pixel_values.to(DEVICE)
+        q_enc = q_tokenizer(question, truncation=True, padding="max_length", max_length=64, return_tensors="pt")
+        input_ids = q_enc.input_ids.to(DEVICE)
+        attention_mask = q_enc.attention_mask.to(DEVICE)
 
         # Generate
         output_ids = model.generate(
@@ -204,33 +218,26 @@ with torch.no_grad():
             early_stopping=True
         )
         
-        # Decode predictions
-        preds_raw = [a_tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+        # Decode prediction
+        pred_raw = a_tokenizer.decode(output_ids[0], skip_special_tokens=True)
         
-        # Parse predictions
-        preds_parsed = [parse_answer_reasoning(p) for p in preds_raw]
-
-        # Ground truth (only answer, no reasoning)
-        truths = [
-            a_tokenizer.decode([i for i in lab.tolist() if i != -100], skip_special_tokens=True)
-            for lab in labels
-        ]
+        # Parse prediction
+        parsed = parse_answer_reasoning(pred_raw)
 
         # Store for metrics
-        for gt, parsed in zip(truths, preds_parsed):
-            refs.append(gt)
-            hyps.append(parsed['answer'])  # Use only answer for comparison
-            
-            if parsed['valid_format']:
-                format_valid_count += 1
-            
-            records.append({
-                "ground_truth": gt,
-                "predicted_raw": parsed['raw'],
-                "predicted_answer": parsed['answer'],
-                "predicted_reasoning": parsed['reasoning'],
-                "valid_format": parsed['valid_format']
-            })
+        refs.append(gt_answer)
+        hyps.append(parsed['answer'])  # Use only answer for comparison
+        
+        if parsed['valid_format']:
+            format_valid_count += 1
+        
+        records.append({
+            "ground_truth": gt_answer,
+            "predicted_raw": parsed['raw'],
+            "predicted_answer": parsed['answer'],
+            "predicted_reasoning": parsed['reasoning'],
+            "valid_format": parsed['valid_format']
+        })
 
 
 # === METRICS ===
