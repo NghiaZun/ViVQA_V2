@@ -8,7 +8,7 @@ import os
 
 # Paths (update for local or Kaggle)
 CSV_PATH = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
-TEACHER_JSONL = "/kaggle/working/teacher_outputs_gt_guided.jsonl"
+TEACHER_JSONL = "/kaggle/input/d/dngtrungngha25/teacher-checkpoint-11k/teacher_outputs_gt_guided.jsonl"
 
 print(f"[INFO] Loading CSV: {CSV_PATH}")
 df = pd.read_csv(CSV_PATH)
