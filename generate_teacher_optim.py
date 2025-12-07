@@ -267,7 +267,7 @@ df = pd.read_csv(CSV_PATH)
 results = []
 
 # RESUME từ checkpoint hoặc output file
-processed_ids = set()
+processed_pairs = set()  # ✅ Changed: Store (img_id, question) pairs instead of just img_id
 
 # RESUME: Load existing teacher outputs
 resume_from = None
@@ -297,11 +297,15 @@ if resume_from:
                 r = json.loads(line)
                 results.append(r)
                 img_id = str(r.get("img_id", "")).strip()
-                if img_id:
-                    processed_ids.add(img_id)
+                question = str(r.get("question", "")).strip()
+                if img_id and question:
+                    processed_pairs.add((img_id, question))  # ✅ Store pair
             except Exception as e:
                 continue
-    print(f"[INFO] ✅ Resumed with {len(results)} existing samples (unique IDs: {len(processed_ids)})")
+    unique_images = len(set(pair[0] for pair in processed_pairs))
+    print(f"[INFO] ✅ Resumed with {len(results)} existing samples")
+    print(f"[INFO]    - Unique images: {unique_images}")
+    print(f"[INFO]    - Unique (img_id, question) pairs: {len(processed_pairs)}")
     
     # Nếu resume từ checkpoint khác với output file, cần merge
     if resume_from != OUT_JSONL and os.path.exists(OUT_JSONL):
@@ -314,15 +318,16 @@ else:
 SAVE_INTERVAL = 50  # Save thường xuyên hơn (mỗi 50 samples)
 failed_samples = 0  # Track failed generations
 
-print(f"[INFO] Total samples to process: {len(df)} | Already done: {len(processed_ids)}")
+print(f"[INFO] Total samples to process: {len(df)} | Already done: {len(processed_pairs)}")
 print(f"[INFO] Quality filters enabled: reasoning validation + format check")
 
 try:
     for idx, (_, row) in enumerate(tqdm(df.iterrows(), total=len(df), desc="GT-Guided Teacher")):
         image_id = str(row.get("img_id", row.get("image_id", ""))).strip()
+        q = str(row["question"]).strip()
         
-        # SKIP nếu đã xử lý rồi
-        if image_id in processed_ids:
+        # SKIP nếu đã xử lý (img_id, question) pair này rồi
+        if (image_id, q) in processed_pairs:
             continue
         
         image_path = os.path.join(IMAGE_DIR, f"{image_id}.jpg")
@@ -349,7 +354,7 @@ try:
                 "reasoning_weight": res["reasoning_weight"]
             }
             results.append(new_entry)
-            processed_ids.add(image_id)
+            processed_pairs.add((image_id, q))  # ✅ Store (img_id, question) pair
             
             # APPEND mode: Save ngay lập tức sau mỗi sample thành công
             with open(OUT_JSONL, "a", encoding="utf-8") as f:
