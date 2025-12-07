@@ -196,15 +196,18 @@ class SimpleDistillDataset(Dataset):
         self.student_decoder_tokenizer = student_decoder_tokenizer
         self.max_len = max_len
         
-        # Load teacher outputs
+        # Load teacher outputs - USE (img_id, question) AS KEY
         self.teacher_outputs = {}
         teacher_file = self._find_teacher_file(teacher_jsonl)
         if teacher_file and os.path.exists(teacher_file):
             with open(teacher_file, 'r', encoding='utf-8') as f:
                 for line in f:
                     data = json.loads(line)
-                    img_id = data.get('img_id', data.get('image_id'))
-                    self.teacher_outputs[str(img_id)] = data
+                    img_id = str(data.get('img_id', data.get('image_id')))
+                    question = str(data.get('question', ''))
+                    # Key: (img_id, question) để support multiple questions per image
+                    key = (img_id, question)
+                    self.teacher_outputs[key] = data
             print(f"[INFO] Loaded {len(self.teacher_outputs)} teacher outputs from {teacher_file}")
         else:
             print(f"[WARN] No teacher outputs found. Training with GT only.")
@@ -244,8 +247,9 @@ class SimpleDistillDataset(Dataset):
         question = str(row["question"])
         gt_answer = str(row["answer"])
         
-        # Get teacher output
-        teacher_data = self.teacher_outputs.get(img_id, {})
+        # Get teacher output - LOOKUP BY (img_id, question)
+        key = (img_id, question)
+        teacher_data = self.teacher_outputs.get(key, {})
         teacher_answer = teacher_data.get("teacher_answer", gt_answer)
         teacher_reasoning = teacher_data.get("teacher_reasoning", "")
         
