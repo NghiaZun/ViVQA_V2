@@ -269,35 +269,32 @@ results = []
 # RESUME từ checkpoint hoặc output file
 processed_ids = set()
 
-# Tự động tìm file teacher_outputs_merged trong /kaggle/input
-def find_teacher_merged_file():
-    """Đào sâu tìm file teacher_outputs_merged* trong /kaggle/input"""
-    kaggle_input = "/kaggle/input"
-    if not os.path.exists(kaggle_input):
-        return None
-    
-    print(f"[INFO] 🔍 Searching for teacher_outputs_merged* in {kaggle_input}...")
-    
-    for root, dirs, files in os.walk(kaggle_input):
-        for file in files:
-            if file.startswith("teacher_outputs_merged") and file.endswith(".jsonl"):
-                found_path = os.path.join(root, file)
-                print(f"[INFO] ✅ Found merged file: {found_path}")
-                return found_path
-    
-    print(f"[INFO] ⚠️  No teacher_outputs_merged*.jsonl found in {kaggle_input}")
-    return None
-
-# Tìm file merged hoặc fallback về output file hiện tại
+# RESUME: Tìm file teacher outputs để continue
 resume_from = None
-merged_file = find_teacher_merged_file()
 
-if merged_file:
-    resume_from = merged_file
-    print(f"[INFO] 🔄 Resuming from merged checkpoint: {merged_file}")
+# Priority 1: Check uploaded dataset (8,909 samples existing)
+UPLOADED_TEACHER = "/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl"
+if os.path.exists(UPLOADED_TEACHER):
+    resume_from = UPLOADED_TEACHER
+    print(f"[INFO] 🔄 Resuming from uploaded dataset: {UPLOADED_TEACHER}")
+# Priority 2: Check current output file
 elif os.path.exists(OUT_JSONL):
     resume_from = OUT_JSONL
     print(f"[INFO] 🔄 Found existing output: {OUT_JSONL}")
+# Priority 3: Search for any merged file in /kaggle/input
+else:
+    kaggle_input = "/kaggle/input"
+    if os.path.exists(kaggle_input):
+        print(f"[INFO] 🔍 Searching for teacher_outputs_* in {kaggle_input}...")
+        for root, dirs, files in os.walk(kaggle_input):
+            for file in files:
+                if "teacher_outputs" in file and file.endswith(".jsonl"):
+                    found_path = os.path.join(root, file)
+                    resume_from = found_path
+                    print(f"[INFO] ✅ Found teacher file: {found_path}")
+                    break
+            if resume_from:
+                break
 
 if resume_from:
     with open(resume_from, "r", encoding="utf-8") as f:
