@@ -11,7 +11,7 @@ import argparse
 
 def merge_jsonl_files(input_files, output_file, verbose=True):
     """
-    Merge nhiều JSONL files, loại bỏ duplicates theo img_id
+    Merge nhiều JSONL files, loại bỏ duplicates theo (img_id, question) pair
     Ưu tiên: File đầu tiên trong list có priority cao nhất
     
     Args:
@@ -21,6 +21,7 @@ def merge_jsonl_files(input_files, output_file, verbose=True):
     """
     
     # Dùng OrderedDict để giữ thứ tự và loại duplicate
+    # KEY: (img_id, question) để support multiple questions per image
     merged_data = OrderedDict()
     stats = {
         'total_lines': 0,
@@ -50,6 +51,7 @@ def merge_jsonl_files(input_files, output_file, verbose=True):
                 try:
                     data = json.loads(line.strip())
                     img_id = str(data.get('img_id', '')).strip()
+                    question = str(data.get('question', '')).strip()
                     
                     if not img_id:
                         stats['errors'] += 1
@@ -57,9 +59,18 @@ def merge_jsonl_files(input_files, output_file, verbose=True):
                             print(f"  [WARN] Line {line_num}: Missing img_id")
                         continue
                     
-                    # Nếu img_id chưa tồn tại thì thêm vào
-                    if img_id not in merged_data:
-                        merged_data[img_id] = data
+                    if not question:
+                        stats['errors'] += 1
+                        if verbose:
+                            print(f"  [WARN] Line {line_num}: Missing question")
+                        continue
+                    
+                    # KEY: (img_id, question) pair để support multiple questions per image
+                    key = (img_id, question)
+                    
+                    # Nếu (img_id, question) chưa tồn tại thì thêm vào
+                    if key not in merged_data:
+                        merged_data[key] = data
                         stats['valid_entries'] += 1
                         file_added += 1
                     else:
@@ -89,7 +100,8 @@ def merge_jsonl_files(input_files, output_file, verbose=True):
         os.rename(output_file, backup_file)
     
     with open(output_file, 'w', encoding='utf-8') as f:
-        for img_id, data in merged_data.items():
+        for key, data in merged_data.items():
+            # key is (img_id, question) tuple, data is the full entry
             f.write(json.dumps(data, ensure_ascii=False) + '\n')
     
     # In thống kê
@@ -116,7 +128,8 @@ def verify_jsonl_file(file_path):
     
     total_lines = 0
     unique_ids = set()
-    duplicates = 0
+    unique_pairs = set()
+    duplicate_pairs = 0
     errors = 0
     
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -125,29 +138,36 @@ def verify_jsonl_file(file_path):
             try:
                 data = json.loads(line.strip())
                 img_id = str(data.get('img_id', '')).strip()
+                question = str(data.get('question', '')).strip()
                 
                 if img_id:
-                    if img_id in unique_ids:
-                        duplicates += 1
-                    else:
-                        unique_ids.add(img_id)
+                    unique_ids.add(img_id)
+                    
+                    if question:
+                        pair = (img_id, question)
+                        if pair in unique_pairs:
+                            duplicate_pairs += 1
+                        else:
+                            unique_pairs.add(pair)
                         
             except Exception as e:
                 errors += 1
                 if errors <= 5:  # Chỉ in 5 errors đầu
                     print(f"  [ERROR] Line {line_num}: {e}")
     
-    print(f"  Total lines:      {total_lines:,}")
-    print(f"  Unique IDs:       {len(unique_ids):,}")
-    print(f"  Duplicates:       {duplicates:,}")
-    print(f"  Errors:           {errors:,}")
+    print(f"  Total lines:           {total_lines:,}")
+    print(f"  Unique img_ids:        {len(unique_ids):,}")
+    print(f"  Unique (img_id, q):    {len(unique_pairs):,}")
+    print(f"  Duplicate pairs:       {duplicate_pairs:,}")
+    print(f"  Errors:                {errors:,}")
+    print(f"  Avg questions/image:   {len(unique_pairs)/len(unique_ids) if unique_ids else 0:.2f}")
     
-    if duplicates > 0:
-        print(f"  [WARN] ⚠️  File contains {duplicates} duplicate img_ids!")
+    if duplicate_pairs > 0:
+        print(f"  [WARN] ⚠️  File contains {duplicate_pairs} duplicate (img_id, question) pairs!")
     if errors > 0:
         print(f"  [WARN] ⚠️  File contains {errors} invalid lines!")
     
-    return duplicates == 0 and errors == 0
+    return duplicate_pairs == 0 and errors == 0
 
 def auto_merge_before_resume(checkpoint_path, output_path):
     """
