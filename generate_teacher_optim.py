@@ -110,7 +110,7 @@ def parse_structured_output(text: str, question: str = ""):
 # TEACHER GENERATION - GT-GUIDED + OPTIMIZED + RETRY
 # ===========================
 @torch.no_grad()
-def call_teacher_qwen(image_path: str, question: str, ground_truth: str, max_retries=1):
+def call_teacher_qwen(image_path: str, question: str, ground_truth: str, max_retries=3):
     """GT-guided: Teacher explains WHY answer is ground_truth
     
     Args:
