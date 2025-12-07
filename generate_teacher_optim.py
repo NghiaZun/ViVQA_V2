@@ -110,7 +110,7 @@ def parse_structured_output(text: str, question: str = ""):
 # TEACHER GENERATION - GT-GUIDED + OPTIMIZED + RETRY
 # ===========================
 @torch.no_grad()
-def call_teacher_qwen(image_path: str, question: str, ground_truth: str, max_retries=3):
+def call_teacher_qwen(image_path: str, question: str, ground_truth: str, max_retries=1):
     """GT-guided: Teacher explains WHY answer is ground_truth
     
     Args:
@@ -197,18 +197,19 @@ Bây giờ trả lời:"""
             retry_count += 1
             
             try:
-                print(f"[RETRY {retry_count}/{max_retries}] Retrying generation for same prompt...")
+                print(f"[RETRY {retry_count}/{max_retries}] Retrying with sampling...")
                 
-                # RETRY với CÙNG prompt và inputs (model có thể generate khác)
+                # RETRY với SAMPLING để generate output KHÁC
                 with torch.amp.autocast('cuda'):
                     retry_output = model.generate(
                         **inputs,
                         max_new_tokens=100,
                         min_new_tokens=30,
-                        do_sample=False,  # Giữ deterministic
-                        temperature=1.0,
+                        do_sample=True,              # ✅ Enable sampling
+                        temperature=0.7,             # ✅ Add randomness
+                        top_p=0.9,                   # ✅ Nucleus sampling
                         use_cache=True,
-                        repetition_penalty=1.1,
+                        repetition_penalty=1.2,      # ✅ Stronger penalty
                         pad_token_id=processor.tokenizer.pad_token_id
                     )
                 
@@ -231,13 +232,12 @@ Bây giờ trả lời:"""
                 print(f"[ERROR] Retry {retry_count} failed: {retry_error}")
                 continue  # Thử retry tiếp
         
-        # FINAL FALLBACK: Nếu vẫn không có reasoning hợp lệ
-        if not reasoning or len(reasoning) < 5:
-            reasoning = f"Dựa vào hình ảnh, câu trả lời là {ground_truth}."
-            if not reasoning_type:
-                reasoning_type = infer_reasoning_type(question)
+        # NO FALLBACK: Nếu reasoning không hợp lệ → SKIP sample này
+        if not reasoning or len(reasoning) < 5 or not reasoning_type:
+            print(f"[SKIP] Low quality generation - skipping sample")
+            return None  # Skip sample instead of using fallback
         
-        # Validate answer không empty
+        # Validate answer
         if not answer or not answer.strip():
             answer = ground_truth  # Force answer = GT
         
@@ -257,8 +257,8 @@ Bây giờ trả lời:"""
         }
 
     except Exception as e:
-        print(f"[ERROR] Generation completely failed: {e}")
-        return None
+        print(f"[ERROR] Generation failed: {e}")
+        return None  # Skip on error
 
 # ===========================
 # MAIN LOOP - CẢI THIỆN
@@ -269,14 +269,26 @@ results = []
 # RESUME từ checkpoint hoặc output file
 processed_ids = set()
 
-# RESUME: Tìm file teacher outputs để continue
+# RESUME: Load existing teacher outputs
 resume_from = None
 
-# Priority 1: Check uploaded dataset (8,909 samples existing)
+# FIXED PATH: Teacher outputs with 8909 samples
 UPLOADED_TEACHER = "/kaggle/input/d/dngtrungngha25/teacher-checkpoint-11k/teacher_outputs_train.jsonl"
+
+print(f"[INFO] Checking for existing teacher outputs...")
+print(f"[INFO] Path: {UPLOADED_TEACHER}")
+
 if os.path.exists(UPLOADED_TEACHER):
     resume_from = UPLOADED_TEACHER
-    print(f"[INFO] 🔄 Resuming from uploaded dataset: {UPLOADED_TEACHER}")
+    print(f"[INFO] ✅ Found teacher file!")
+else:
+    print(f"[ERROR] ❌ Teacher file NOT FOUND!")
+    print(f"[ERROR] Expected: {UPLOADED_TEACHER}")
+    print(f"[ERROR] Please check:")
+    print(f"[ERROR]   1. Dataset is added to notebook")
+    print(f"[ERROR]   2. Dataset path is correct")
+    print(f"[ERROR]   3. File exists in dataset")
+    raise FileNotFoundError(f"Teacher outputs not found: {UPLOADED_TEACHER}")
 
 if resume_from:
     with open(resume_from, "r", encoding="utf-8") as f:
@@ -343,34 +355,14 @@ try:
             with open(OUT_JSONL, "a", encoding="utf-8") as f:
                 f.write(json.dumps(new_entry, ensure_ascii=False) + "\n")
         else:
-            # Teacher generation hoàn toàn failed - tạo minimal fallback
+            # Teacher generation failed - SKIP sample (no fallback)
             failed_samples += 1
-            if failed_samples <= 5:  # Log first 5 failures
-                print(f"\n[WARN] Teacher failed for {image_id}, creating fallback...")
-            
-            # Create minimal fallback entry (GT-guided: answer = GT)
-            reasoning_type = infer_reasoning_type(q)
-            fallback_entry = {
-                "img_id": image_id,
-                "image_path": image_path,
-                "question": q,
-                "reasoning_type": reasoning_type,
-                "teacher_answer": gt_answer,  # GT-guided
-                "teacher_reasoning": f"Dựa vào hình ảnh, câu trả lời là {gt_answer}.",
-                "teacher_raw": f"Answer: {gt_answer}\nType: {reasoning_type}\nReasoning: Dựa vào hình ảnh, câu trả lời là {gt_answer}.",
-                "reasoning_weight": REASONING_WEIGHTS.get(reasoning_type, 1.0),
-                "_fallback": True  # Flag to track fallback entries
-            }
-            results.append(fallback_entry)
-            processed_ids.add(image_id)
-            
-            # Save fallback entry
-            with open(OUT_JSONL, "a", encoding="utf-8") as f:
-                f.write(json.dumps(fallback_entry, ensure_ascii=False) + "\n")
+            if failed_samples <= 10:  # Log first 10 failures
+                print(f"\n[SKIP] Teacher failed for {image_id} - skipping (no fallback)")
         
         # Progress report định kỳ
         if len(results) % SAVE_INTERVAL == 0 and len(results) > 0:
-            print(f"\n[INFO] 💾 Progress: {len(results)} samples saved | Failed: {failed_samples}")
+            print(f"\n[INFO] 💾 Progress: {len(results)} samples saved | Skipped: {failed_samples}")
         
         # Memory management mỗi 100 samples
         if idx % 100 == 0:
@@ -383,15 +375,17 @@ except KeyboardInterrupt:
     print(f"[INFO] Saved {len(results)} samples before interruption")
 finally:
     # Final report (file đã được save liên tục rồi, không cần save lại)
-    print(f"\n[INFO] ✅ Completed! Total saved: {len(results)}/{len(df)} teacher samples → {OUT_JSONL}")
+    print(f"\n{'='*70}")
+    print(f"GENERATION COMPLETE")
+    print(f"{'='*70}")
+    print(f"[INFO] Total samples in dataset: {len(df)}")
+    print(f"[INFO] Successfully generated: {len(results)}")
+    print(f"[INFO] Skipped (failed): {failed_samples}")
+    print(f"[INFO] Coverage: {len(results)/(len(df))*100:.1f}%")
     if len(results) > 0:
-        # Count fallback entries
-        fallback_count = sum(1 for r in results if r.get('_fallback', False))
-        teacher_generated = len(results) - fallback_count
-        
-        print(f"[INFO] Coverage: {len(results)/len(df)*100:.1f}%")
-        print(f"[INFO] Teacher-generated: {teacher_generated} ({teacher_generated/len(results)*100:.1f}%)")
-        print(f"[INFO] Fallback entries: {fallback_count} ({fallback_count/len(results)*100:.1f}%)")
         print(f"[INFO] Average reasoning length: {sum(len(r['teacher_reasoning']) for r in results)/len(results):.1f} chars")
-    else:
-        print(f"[WARN] No valid samples generated!")
+    print(f"[INFO] Output: {OUT_JSONL}")
+    print(f"{'='*70}")
+    print(f"\n[STRATEGY] NO FALLBACK - Only high quality teacher outputs saved!")
+    print(f"[QUALITY] All entries have valid answer + type + reasoning (≥5 chars)")
+    print(f"{'='*70}")
