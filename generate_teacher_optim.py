@@ -277,24 +277,6 @@ UPLOADED_TEACHER = "/kaggle/input/d/dngtrungngha25/teacher-checkpoint-11k/teache
 if os.path.exists(UPLOADED_TEACHER):
     resume_from = UPLOADED_TEACHER
     print(f"[INFO] 🔄 Resuming from uploaded dataset: {UPLOADED_TEACHER}")
-# Priority 2: Check current output file
-elif os.path.exists(OUT_JSONL):
-    resume_from = OUT_JSONL
-    print(f"[INFO] 🔄 Found existing output: {OUT_JSONL}")
-# Priority 3: Search for any merged file in /kaggle/input
-else:
-    kaggle_input = "/kaggle/input"
-    if os.path.exists(kaggle_input):
-        print(f"[INFO] 🔍 Searching for teacher_outputs_* in {kaggle_input}...")
-        for root, dirs, files in os.walk(kaggle_input):
-            for file in files:
-                if "teacher_outputs" in file and file.endswith(".jsonl"):
-                    found_path = os.path.join(root, file)
-                    resume_from = found_path
-                    print(f"[INFO] ✅ Found teacher file: {found_path}")
-                    break
-            if resume_from:
-                break
 
 if resume_from:
     with open(resume_from, "r", encoding="utf-8") as f:
