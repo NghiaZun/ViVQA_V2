@@ -273,7 +273,7 @@ processed_ids = set()
 resume_from = None
 
 # Priority 1: Check uploaded dataset (8,909 samples existing)
-UPLOADED_TEACHER = "/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl"
+UPLOADED_TEACHER = "/kaggle/input/d/dngtrungngha25/teacher-checkpoint-11k/teacher_outputs_train.jsonl"
 if os.path.exists(UPLOADED_TEACHER):
     resume_from = UPLOADED_TEACHER
     print(f"[INFO] 🔄 Resuming from uploaded dataset: {UPLOADED_TEACHER}")
