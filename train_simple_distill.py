@@ -94,7 +94,7 @@ class TrainConfig:
     # Schedule
     warmup_ratio: float = 0.1
     use_amp: bool = True
-    resume_epoch: int = 0
+    resume_epoch: int = 20              # ✅ RESUME từ epoch 21
     
     # Progressive Training Strategy
     stage1_epochs: int = 20
@@ -471,6 +471,35 @@ def train():
     best_val_loss = float('inf')
     start_epoch = cfg.resume_epoch
     es_counter = 0
+    
+    # ==================
+    # RESUME FROM CHECKPOINT
+    # ==================
+    checkpoint_path = "/kaggle/input/7-12-20epochs/transformers/default/1/latest_checkpoint_simple.pt"
+    if cfg.resume_epoch > 0 and os.path.exists(checkpoint_path):
+        print(f"\n{'='*70}")
+        print(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
+        print(f"{'='*70}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Load model weights
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✅ Model weights loaded from epoch {checkpoint['epoch']}")
+        
+        # Load training state
+        start_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint['best_val_loss']
+        es_counter = checkpoint['es_counter']
+        
+        print(f"   - Resuming from epoch: {start_epoch + 1}")
+        print(f"   - Best val loss: {best_val_loss:.4f}")
+        print(f"   - Early stop counter: {es_counter}/{cfg.es_patience}")
+        print(f"{'='*70}\n")
+    elif cfg.resume_epoch > 0:
+        print(f"\n⚠️  WARNING: resume_epoch={cfg.resume_epoch} but checkpoint not found!")
+        print(f"   Looking for: {checkpoint_path}")
+        print(f"   Training from scratch instead...\n")
+        start_epoch = 0
     
     print(f"\n{'='*70}")
     print("SIMPLE TEACHER DISTILLATION (NO TYPE CLASSIFICATION)")
