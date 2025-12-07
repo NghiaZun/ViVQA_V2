@@ -41,14 +41,23 @@ print(f"{'='*70}")
 
 if missing_count > 0:
     print(f"\n[INFO] Finding missing sample IDs...")
-    missing_ids = []
+    
+    # Get all IDs from CSV
+    all_csv_ids = set()
     for _, row in df.iterrows():
         img_id = str(row.get('img_id', row.get('image_id', ''))).strip()
-        if img_id not in processed_ids:
-            missing_ids.append(img_id)
+        if img_id:
+            all_csv_ids.add(img_id)
     
+    print(f"[DEBUG] Total unique IDs in CSV: {len(all_csv_ids)}")
+    print(f"[DEBUG] Total unique IDs in teacher outputs: {len(processed_ids)}")
+    
+    # Find missing
+    missing_ids = all_csv_ids - processed_ids
+    
+    print(f"[DEBUG] Missing IDs found: {len(missing_ids)}")
     print(f"\n[INFO] First 20 missing IDs:")
-    for i, img_id in enumerate(missing_ids[:20], 1):
+    for i, img_id in enumerate(sorted(missing_ids)[:20], 1):
         print(f"  {i}. {img_id}")
     
     if len(missing_ids) > 20:
@@ -57,7 +66,15 @@ if missing_count > 0:
     # Save to file
     output_file = "missing_sample_ids.txt"
     with open(output_file, 'w') as f:
-        f.write('\n'.join(missing_ids))
-    print(f"\n[INFO] ✅ All missing IDs saved to: {output_file}")
+        f.write('\n'.join(sorted(missing_ids)))
+    print(f"\n[INFO] ✅ All {len(missing_ids)} missing IDs saved to: {output_file}")
+    
+    # Check if images exist for missing samples
+    print(f"\n[INFO] Checking if images exist for first 10 missing samples...")
+    IMAGE_DIR = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
+    for img_id in sorted(missing_ids)[:10]:
+        img_path = os.path.join(IMAGE_DIR, f"{img_id}.jpg")
+        exists = "✅ EXISTS" if os.path.exists(img_path) else "❌ MISSING"
+        print(f"  {img_id}: {exists}")
 else:
     print(f"\n[INFO] ✅ All samples generated!")
