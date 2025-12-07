@@ -71,8 +71,8 @@ class TrainConfig:
     # Paths
     train_csv: str = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
     image_dir: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
-    teacher_jsonl: str = "/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl"
-    checkpoint_dir: str = "/kaggle/input/student/transformers/default/1/checkpoints"
+    teacher_jsonl: str = "/kaggle/input/8-12-teacher/teacher_outputs_train.jsonl"
+    checkpoint_dir: str = "/kaggle/input/model-base/transformers/default/1/checkpoints"
     save_dir: str = "/kaggle/working"
     
     # Training hyperparameters
@@ -475,7 +475,7 @@ def train():
     # ==================
     # RESUME FROM CHECKPOINT
     # ==================
-    checkpoint_path = "/kaggle/input/7-12-20epochs/transformers/default/1/latest_checkpoint_simple.pt"
+    checkpoint_path = "/kaggle/input/8-12/transformers/default/1/latest_checkpoint_simple.pt"
     if cfg.resume_epoch > 0 and os.path.exists(checkpoint_path):
         print(f"\n{'='*70}")
         print(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
