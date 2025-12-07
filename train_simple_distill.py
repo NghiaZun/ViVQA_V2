@@ -78,7 +78,7 @@ class TrainConfig:
     # Training hyperparameters
     batch_size: int = 2
     accum_steps: int = 16               # Effective batch = 32
-    num_epochs: int = 20
+    num_epochs: int = 60
     val_ratio: float = 0.1
     num_workers: int = 2
     prefetch_factor: int = 2
@@ -98,7 +98,7 @@ class TrainConfig:
     
     # Progressive Training Strategy
     stage1_epochs: int = 20
-    stage2_epochs: int = 10
+    stage2_epochs: int = 20
     
     # Early stopping
     es_patience: int = 6
