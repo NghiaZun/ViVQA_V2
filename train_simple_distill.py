@@ -479,22 +479,24 @@ def train():
     # ==================
     # RESUME FROM CHECKPOINT (EPOCH 60)
     # ==================
-    checkpoint_path = "/kaggle/input/best-model/transformers/default/1/vqa_simple_best.pt"
+    checkpoint_path = "/kaggle/input/60-100/transformers/default/1/latest_checkpoint_simple.pt"
     if cfg.resume_epoch > 0 and os.path.exists(checkpoint_path):
         print(f"\n{'='*70}")
         print(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
         print(f"{'='*70}")
-        # vqa_simple_best.pt chỉ chứa state_dict, không phải full checkpoint
+        # latest_checkpoint_simple.pt chứa full training state
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint)
-        print(f"✅ Model weights loaded from epoch {cfg.resume_epoch}")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✅ Model weights loaded from epoch {checkpoint['epoch']}")
         
-        # Reset training state (không load optimizer/scheduler từ epoch 60)
-        start_epoch = cfg.resume_epoch
-        best_val_loss = float('inf')  # Reset để tìm best mới
-        es_counter = 0
+        # Load training state từ epoch 60
+        start_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint['best_val_loss']
+        es_counter = checkpoint['es_counter']
         
         print(f"   - Resuming from epoch: {start_epoch + 1}")
+        print(f"   - Best val loss từ epoch 60: {best_val_loss:.4f}")
+        print(f"   - Early stop counter: {es_counter}/{cfg.es_patience}")
         print(f"   - Training strategy: STAGE 1 ONLY (Freeze encoders)")
         print(f"   - Learning rate: {cfg.base_lr:.2e} (3x lower)")
         print(f"{'='*70}\n")
@@ -639,7 +641,7 @@ def train():
             'best_val_loss': best_val_loss,
             'es_counter': es_counter,
         }
-        torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_simple_stage1.pt"))
+        torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_simple.pt"))
         
         # Early stopping
         if es_counter >= cfg.es_patience:
