@@ -18,7 +18,7 @@ TypeAwareVQAModel = train_module.TypeAwareVQAModel
 # === CONFIG ===
 TEST_CSV = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv"
 IMAGE_DIR = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test"
-MODEL_PATH = "/kaggle/input/final_/transformers/default/1/vqa_simple_stage1_best.pt"  # ✅ Best model (epoch 14)
+MODEL_PATH = "/kaggle/input/final-/transformers/default/1/vqa_simple_stage1_best.pt"  # ✅ Best model (epoch 14)
 TOKENIZER_DIR = "/kaggle/input/model-base/transformers/default/1/checkpoints"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
