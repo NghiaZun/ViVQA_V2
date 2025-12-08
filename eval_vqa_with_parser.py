@@ -130,7 +130,7 @@ def token_f1(prediction, ground_truth):
 # === CONFIG ===
 TEST_CSV_PATH = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv"
 IMAGE_FOLDER = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test"
-MODEL_PATH = "/kaggle/input/best-model/transformers/default/1/vqa_type_aware_best.pt"  # ✅ Best model (epoch 14)
+MODEL_PATH = "/kaggle/input/best-model/transformers/default/1/vqa_simple_best.pt"  # ✅ Best model (epoch 14)
 TOKENIZER_DIR = "/kaggle/input/student/transformers/default/1/checkpoints"  # Directory with phobert/vit5 tokenizers
 BATCH_SIZE = 8
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
