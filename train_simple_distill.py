@@ -78,35 +78,35 @@ class TrainConfig:
     # Training hyperparameters
     batch_size: int = 2
     accum_steps: int = 16               # Effective batch = 32
-    num_epochs: int = 60
+    num_epochs: int = 100               # ✅ TRAIN TỚI EPOCH 100
     val_ratio: float = 0.1
     num_workers: int = 2
     prefetch_factor: int = 2
     pin_memory: bool = True
     persistent_workers: bool = True
     
-    # Learning rates
-    base_lr: float = 3e-5
+    # Learning rates (LOWER for fine-tuning)
+    base_lr: float = 1e-5               # ✅ 3e-5 → 1e-5 (giảm 3x)
     vision_lr: float = 1e-5
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
     # Schedule
-    warmup_ratio: float = 0.1
+    warmup_ratio: float = 0.05          # ✅ Warmup ngắn hơn
     use_amp: bool = True
-    resume_epoch: int = 20              # ✅ RESUME từ epoch 21
+    resume_epoch: int = 60              # ✅ RESUME từ epoch 60
     
-    # Progressive Training Strategy
-    stage1_epochs: int = 20
-    stage2_epochs: int = 20
+    # Progressive Training Strategy (FORCE STAGE 1 CHO TẤT CẢ)
+    stage1_epochs: int = 100            # ✅ Stage 1 cho tất cả epochs
+    stage2_epochs: int = 200            # ✅ Never reach (force stage 1)
     
-    # Early stopping
-    es_patience: int = 6
+    # Early stopping (MORE PATIENCE for fine-tuning)
+    es_patience: int = 10               # ✅ 6 → 10 (kiên nhẫn hơn)
     es_min_delta: float = 1e-4
     
     # Logging
-    log_csv: str = "train_log_simple.csv"
-    curve_png: str = "training_curve_simple.png"
+    log_csv: str = "train_log_simple_stage1_continue.csv"  # ✅ Log file riêng
+    curve_png: str = "training_curve_simple_stage1_continue.png"
     clear_cache_every_n_steps: int = 20
     
     # Generation
@@ -477,27 +477,26 @@ def train():
     es_counter = 0
     
     # ==================
-    # RESUME FROM CHECKPOINT
+    # RESUME FROM CHECKPOINT (EPOCH 60)
     # ==================
-    checkpoint_path = "/kaggle/input/8-12/transformers/default/1/latest_checkpoint_simple.pt"
+    checkpoint_path = "/kaggle/input/best-model/transformers/default/1/vqa_simple_best.pt"
     if cfg.resume_epoch > 0 and os.path.exists(checkpoint_path):
         print(f"\n{'='*70}")
         print(f"RESUMING FROM CHECKPOINT: {checkpoint_path}")
         print(f"{'='*70}")
+        # vqa_simple_best.pt chỉ chứa state_dict, không phải full checkpoint
         checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint)
+        print(f"✅ Model weights loaded from epoch {cfg.resume_epoch}")
         
-        # Load model weights
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✅ Model weights loaded from epoch {checkpoint['epoch']}")
-        
-        # Load training state
-        start_epoch = checkpoint['epoch']
-        best_val_loss = checkpoint['best_val_loss']
-        es_counter = checkpoint['es_counter']
+        # Reset training state (không load optimizer/scheduler từ epoch 60)
+        start_epoch = cfg.resume_epoch
+        best_val_loss = float('inf')  # Reset để tìm best mới
+        es_counter = 0
         
         print(f"   - Resuming from epoch: {start_epoch + 1}")
-        print(f"   - Best val loss: {best_val_loss:.4f}")
-        print(f"   - Early stop counter: {es_counter}/{cfg.es_patience}")
+        print(f"   - Training strategy: STAGE 1 ONLY (Freeze encoders)")
+        print(f"   - Learning rate: {cfg.base_lr:.2e} (3x lower)")
         print(f"{'='*70}\n")
     elif cfg.resume_epoch > 0:
         print(f"\n⚠️  WARNING: resume_epoch={cfg.resume_epoch} but checkpoint not found!")
@@ -506,16 +505,17 @@ def train():
         start_epoch = 0
     
     print(f"\n{'='*70}")
-    print("SIMPLE TEACHER DISTILLATION (NO TYPE CLASSIFICATION)")
+    print("STAGE 1 CONTINUED TRAINING (EPOCH 60 → 100)")
     print(f"{'='*70}")
-    print(f"[STRATEGY] GT-Guided: Teacher answer = GT + reasoning")
-    print(f"[LOSS] Pure cross-entropy with teacher output")
-    print(f"[NO MULTI-TASK] No type classification head")
-    print(f"[GOAL] Test if removing type improves performance")
+    print(f"[RESUME] From epoch 60 (accuracy: 31.29%)")
+    print(f"[STRATEGY] STAGE 1 ONLY - Train Fusion + Decoder ONLY")
+    print(f"[FROZEN] Vision Encoder + Text Encoder")
+    print(f"[LR] {cfg.base_lr:.2e} (3x lower than original)")
+    print(f"[GOAL] Test if more decoder training improves accuracy")
     print(f"\n[TRAINING STRATEGY]")
-    print(f"  Stage 1 (Epochs 1-{cfg.stage1_epochs}): Fusion + Decoder")
-    print(f"  Stage 2 (Epochs {cfg.stage1_epochs+1}-{cfg.stage1_epochs+cfg.stage2_epochs}): + Text Encoder")
-    print(f"  Stage 3 (Epochs {cfg.stage1_epochs+cfg.stage2_epochs+1}-{cfg.num_epochs}): + Vision (last block)")
+    print(f"  Epochs {cfg.resume_epoch+1}-{cfg.num_epochs}: STAGE 1 (Fusion + Decoder ONLY)")
+    print(f"  Encoders FROZEN throughout entire training")
+    print(f"  Focus: Learn better fusion of pre-trained features")
     print(f"{'='*70}\n")
     
     for epoch in range(start_epoch, cfg.num_epochs):
@@ -613,11 +613,23 @@ def train():
         if avg_val_loss < best_val_loss - cfg.es_min_delta:
             best_val_loss = avg_val_loss
             es_counter = 0
-            torch.save(model.state_dict(), os.path.join(cfg.save_dir, "vqa_simple_best.pt"))
+            torch.save(model.state_dict(), os.path.join(cfg.save_dir, "vqa_simple_stage1_best.pt"))
             print(f"   ✅ Best model saved! Val Loss: {best_val_loss:.4f}")
         else:
             es_counter += 1
             print(f"   ⚠️  No improvement ({es_counter}/{cfg.es_patience})")
+        
+        # Save checkpoint every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path_save = os.path.join(cfg.save_dir, f"checkpoint_epoch_{epoch+1}.pt")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'es_counter': es_counter,
+            }, checkpoint_path_save)
+            print(f"   💾 Checkpoint saved: checkpoint_epoch_{epoch+1}.pt")
         
         # Save latest checkpoint
         checkpoint = {
@@ -627,7 +639,7 @@ def train():
             'best_val_loss': best_val_loss,
             'es_counter': es_counter,
         }
-        torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_simple.pt"))
+        torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_simple_stage1.pt"))
         
         # Early stopping
         if es_counter >= cfg.es_patience:
@@ -637,17 +649,20 @@ def train():
         clear_memory()
     
     # Final save
-    torch.save(model.state_dict(), os.path.join(cfg.save_dir, "vqa_simple_final.pt"))
+    torch.save(model.state_dict(), os.path.join(cfg.save_dir, "vqa_simple_stage1_final.pt"))
     
     # Plot training curves
     plot_curves(log_path, os.path.join(cfg.save_dir, cfg.curve_png))
     
     print(f"\n{'='*70}")
-    print("TRAINING COMPLETE")
+    print("STAGE 1 TRAINING COMPLETE (EPOCH 60 → 100)")
     print(f"{'='*70}")
     print(f"Best Val Loss: {best_val_loss:.4f}")
-    print(f"Total epochs: {epoch+1}/{cfg.num_epochs}")
+    print(f"Total epochs trained: {epoch+1 - cfg.resume_epoch}")
+    print(f"Final epoch: {epoch+1}/{cfg.num_epochs}")
     print(f"Logs saved to: {log_path}")
+    print(f"\n[NEXT STEP] Run evaluation to check if accuracy > 31.29%")
+    print(f"Expected: Small improvement from better fusion learning")
 
 if __name__ == "__main__":
     train()
