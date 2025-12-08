@@ -25,13 +25,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Device: {DEVICE}")
 
 # === LOAD MODEL ===
-print("[INFO] Loading TypeAwareVQAModel...")
-base_model = VQAGenModel(
+print("[INFO] Loading VQAGenModel (Simple Distillation - NO type classifier)...")
+model = VQAGenModel(
     vision_model_name="Salesforce/blip-vqa-base",
     phobert_dir=os.path.join(TOKENIZER_DIR, "phobert_tokenizer"),
     vit5_dir=os.path.join(TOKENIZER_DIR, "vit5_tokenizer")
 )
-model = TypeAwareVQAModel(base_model)
 
 # Load checkpoint
 print(f"[INFO] Loading checkpoint: {MODEL_PATH}")
@@ -49,8 +48,8 @@ print(f"[INFO] Model ready! ({sum(p.numel() for p in model.parameters())/1e6:.1f
 # === LOAD DATA ===
 df = pd.read_csv(TEST_CSV)
 vision_processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
-q_tokenizer = model.base_model.text_tokenizer
-a_tokenizer = model.base_model.decoder_tokenizer
+q_tokenizer = model.text_tokenizer
+a_tokenizer = model.decoder_tokenizer
 
 # === TEST 5 SAMPLES ===
 print("\n" + "="*70)

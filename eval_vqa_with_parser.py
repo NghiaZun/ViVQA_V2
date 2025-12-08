@@ -137,17 +137,14 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # === LOAD MODEL ===
 print(f"[INFO] Device: {DEVICE}")
-print("[INFO] Loading TypeAwareVQAModel (with type classifier)...")
+print("[INFO] Loading VQAGenModel (Simple Distillation - NO type classifier)...")
 
-# Load base model
-base_model = VQAGenModel(
+# Load model directly (NO TypeAware wrapper)
+model = VQAGenModel(
     vision_model_name="Salesforce/blip-vqa-base",
     phobert_dir=os.path.join(TOKENIZER_DIR, "phobert_tokenizer"),
     vit5_dir=os.path.join(TOKENIZER_DIR, "vit5_tokenizer")
 )
-
-# Wrap with TypeAwareVQAModel
-model = TypeAwareVQAModel(base_model)
 
 # Load checkpoint
 print(f"[INFO] Loading checkpoint from: {MODEL_PATH}")
@@ -171,9 +168,9 @@ print("[INFO] Model loaded successfully!")
 print(f"[INFO] Total parameters: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
 # === TOKENIZERS ===
-# Access tokenizers from base_model (wrapped inside TypeAwareVQAModel)
-q_tokenizer = model.base_model.text_tokenizer
-a_tokenizer = model.base_model.decoder_tokenizer
+# Access tokenizers directly from model (NO wrapper)
+q_tokenizer = model.text_tokenizer
+a_tokenizer = model.decoder_tokenizer
 
 # === LOAD TEST DATA ===
 print("[INFO] Loading test data...")
