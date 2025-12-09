@@ -70,9 +70,10 @@ for img_id in tqdm(unique_img_ids, desc="Validating images"):
     
     # Try to open image
     try:
-        img = Image.open(image_path)
-        img.convert("RGB")  # Test conversion
-        img.verify()  # Verify image integrity
+        # Open and test conversion
+        with Image.open(image_path) as img:
+            img.convert("RGB")  # Test conversion
+            img.load()  # Force load to verify integrity
         valid_images.append(img_id_str)
     except Exception as e:
         corrupt_images.append({
@@ -152,8 +153,9 @@ for img_id, question in tqdm(missing_pairs, desc="Analyzing missing"):
     else:
         # Image exists and valid, but not in teacher outputs
         try:
-            img = Image.open(image_path)
-            img.convert("RGB")
+            with Image.open(image_path) as img:
+                img.convert("RGB")
+                img.load()  # Verify can be loaded
             missing_samples_by_reason["valid_image_but_missing"].append({
                 "img_id": img_id,
                 "question": question[:80],
