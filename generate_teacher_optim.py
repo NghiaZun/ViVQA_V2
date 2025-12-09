@@ -110,14 +110,14 @@ def parse_structured_output(text: str, question: str = ""):
 # TEACHER GENERATION - GT-GUIDED + OPTIMIZED + RETRY
 # ===========================
 @torch.no_grad()
-def call_teacher_qwen(image_path: str, question: str, ground_truth: str, max_retries=3):
+def call_teacher_qwen(image_path: str, question: str, ground_truth: str, max_retries=None):
     """GT-guided: Teacher explains WHY answer is ground_truth
     
     Args:
         image_path: Path to image
         question: Question text
         ground_truth: Ground truth answer
-        max_retries: Number of retry attempts with same prompt (default: 3)
+        max_retries: Number of retry attempts (None = unlimited retry until success)
     
     Returns:
         Dict with answer, reasoning, type, raw, weight or None
@@ -191,25 +191,32 @@ Bây giờ trả lời:"""
 
         answer, reasoning, reasoning_type = parse_structured_output(gen, question)
 
-        # QUALITY CHECK: Nếu parse fail → RETRY với CÙNG prompt chuẩn (max 3 lần)
+        # QUALITY CHECK: Nếu parse fail → RETRY VÔ HẠN cho đến khi thành công
         retry_count = 0
-        while (not reasoning or len(reasoning) < 5 or not reasoning_type) and retry_count < max_retries:
+        while not reasoning or len(reasoning) < 5 or not reasoning_type:
             retry_count += 1
             
             try:
-                print(f"[RETRY {retry_count}/{max_retries}] Retrying with sampling...")
+                if retry_count <= 5:
+                    print(f"[RETRY {retry_count}] Retrying with sampling...")
+                elif retry_count % 10 == 0:  # Print every 10 retries sau đó
+                    print(f"[RETRY {retry_count}] Still trying...")
                 
                 # RETRY với SAMPLING để generate output KHÁC
+                # Tăng temperature và top_p dần để tạo diversity
+                temp = min(0.7 + (retry_count * 0.05), 1.5)  # 0.7 → 1.5
+                top_p = min(0.9 + (retry_count * 0.01), 0.99)  # 0.9 → 0.99
+                
                 with torch.amp.autocast('cuda'):
                     retry_output = model.generate(
                         **inputs,
                         max_new_tokens=100,
                         min_new_tokens=30,
                         do_sample=True,              # ✅ Enable sampling
-                        temperature=0.7,             # ✅ Add randomness
-                        top_p=0.9,                   # ✅ Nucleus sampling
+                        temperature=temp,            # ✅ Tăng dần randomness
+                        top_p=top_p,                 # ✅ Nucleus sampling
                         use_cache=True,
-                        repetition_penalty=1.2,      # ✅ Stronger penalty
+                        repetition_penalty=1.2 + (retry_count * 0.05),  # Tăng dần penalty
                         pad_token_id=processor.tokenizer.pad_token_id
                     )
                 
@@ -223,19 +230,16 @@ Bây giờ trả lời:"""
                 # Nếu retry thành công → dùng kết quả retry
                 if reasoning_retry and len(reasoning_retry) >= 5 and type_retry:
                     answer, reasoning, reasoning_type = answer_retry, reasoning_retry, type_retry
-                    print(f"[SUCCESS] Retry {retry_count} succeeded!")
+                    print(f"[SUCCESS] ✅ Retry {retry_count} succeeded!")
                     break  # Thoát khỏi retry loop
-                else:
-                    print(f"[RETRY {retry_count}] Still invalid, trying again...")
                     
             except Exception as retry_error:
                 print(f"[ERROR] Retry {retry_count} failed: {retry_error}")
+                # Clean up memory sau mỗi error
+                torch.cuda.empty_cache()
                 continue  # Thử retry tiếp
         
-        # NO FALLBACK: Nếu reasoning không hợp lệ → SKIP sample này
-        if not reasoning or len(reasoning) < 5 or not reasoning_type:
-            print(f"[SKIP] Low quality generation - skipping sample")
-            return None  # Skip sample instead of using fallback
+        # Sau khi thoát loop → reasoning đã hợp lệ (vì loop chỉ thoát khi valid)
         
         # Validate answer
         if not answer or not answer.strip():
@@ -340,9 +344,9 @@ try:
 
         res = call_teacher_qwen(image_path, q, gt_answer)
 
-        # ALWAYS save - even with fallback reasoning (GT-guided guarantee!)
+        # ALWAYS save - retry đến khi thành công nên res luôn valid
         if res:
-            # Teacher generated successfully (có fallback nếu reasoning ngắn)
+            # Teacher generated successfully (retry unlimited đến khi valid)
             new_entry = {
                 "img_id": image_id,
                 "image_path": image_path,
@@ -360,10 +364,11 @@ try:
             with open(OUT_JSONL, "a", encoding="utf-8") as f:
                 f.write(json.dumps(new_entry, ensure_ascii=False) + "\n")
         else:
-            # Teacher generation failed - SKIP sample (no fallback)
+            # Teacher generation failed (should NOT happen with unlimited retry)
+            # Only possible with image loading error or critical exception
             failed_samples += 1
             if failed_samples <= 10:  # Log first 10 failures
-                print(f"\n[SKIP] Teacher failed for {image_id} - skipping (no fallback)")
+                print(f"\n[ERROR] Critical error for {image_id} - check image file")
         
         # Progress report định kỳ
         if len(results) % SAVE_INTERVAL == 0 and len(results) > 0:
