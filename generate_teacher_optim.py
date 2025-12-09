@@ -273,7 +273,7 @@ processed_pairs = set()  # ✅ Changed: Store (img_id, question) pairs instead o
 resume_from = None
 
 # FIXED PATH: Teacher outputs with 8909 samples
-UPLOADED_TEACHER = "/kaggle/input/d/dngtrungngha25/teacher-checkpoint-11k/teacher_outputs_train.jsonl"
+UPLOADED_TEACHER = "/kaggle/input/8-12-teacher/teacher_outputs_train.jsonl"
 
 print(f"[INFO] Checking for existing teacher outputs...")
 print(f"[INFO] Path: {UPLOADED_TEACHER}")
