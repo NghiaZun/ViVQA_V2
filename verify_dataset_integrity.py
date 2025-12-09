@@ -14,7 +14,7 @@ from tqdm import tqdm
 # ===========================
 CSV_PATH = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
 IMAGE_DIR = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
-TEACHER_JSONL = "/kaggle/working/teacher_outputs_gt_guided.jsonl"
+TEACHER_JSONL = "/kaggle/input/8-12-teacher/teacher_outputs_train.jsonl"
 OUTPUT_REPORT = "/kaggle/working/dataset_integrity_report.json"
 
 print(f"{'='*70}")
