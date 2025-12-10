@@ -270,6 +270,15 @@ Bây giờ trả lời:"""
 df = pd.read_csv(CSV_PATH)
 results = []
 
+# Calculate unique pairs for accurate coverage
+unique_pairs_in_csv = set()
+for idx, row in df.iterrows():
+    img_id = str(row.get("img_id", row.get("image_id", ""))).strip()
+    question = str(row["question"]).strip()
+    unique_pairs_in_csv.add((img_id, question))
+
+print(f"[INFO] CSV loaded: {len(df)} total rows, {len(unique_pairs_in_csv)} unique (img_id, question) pairs")
+
 # RESUME từ checkpoint hoặc output file
 processed_pairs = set()  # ✅ Changed: Store (img_id, question) pairs instead of just img_id
 
@@ -388,14 +397,27 @@ finally:
     print(f"\n{'='*70}")
     print(f"GENERATION COMPLETE")
     print(f"{'='*70}")
-    print(f"[INFO] Total samples in dataset: {len(df)}")
-    print(f"[INFO] Successfully generated: {len(results)}")
-    print(f"[INFO] Skipped (failed): {failed_samples}")
-    print(f"[INFO] Coverage: {len(results)/(len(df))*100:.1f}%")
+    print(f"[INFO] CSV Dataset:")
+    print(f"   - Total rows: {len(df)}")
+    print(f"   - Unique (img_id, question) pairs: {len(unique_pairs_in_csv)}")
+    print(f"   - Duplicate pairs: {len(df) - len(unique_pairs_in_csv)}")
+    print(f"\n[INFO] Teacher Generation:")
+    print(f"   - Successfully generated: {len(results)}")
+    print(f"   - Skipped (failed): {failed_samples}")
+    print(f"   - Coverage: {len(results)}/{len(unique_pairs_in_csv)} ({len(results)/len(unique_pairs_in_csv)*100:.2f}%)")
     if len(results) > 0:
-        print(f"[INFO] Average reasoning length: {sum(len(r['teacher_reasoning']) for r in results)/len(results):.1f} chars")
-    print(f"[INFO] Output: {OUT_JSONL}")
+        print(f"   - Average reasoning length: {sum(len(r['teacher_reasoning']) for r in results)/len(results):.1f} chars")
+    print(f"\n[INFO] Output: {OUT_JSONL}")
     print(f"{'='*70}")
-    print(f"\n[STRATEGY] NO FALLBACK - Only high quality teacher outputs saved!")
+    
+    # Status message
+    if len(results) == len(unique_pairs_in_csv):
+        print(f"\n✅ SUCCESS! Generated ALL {len(unique_pairs_in_csv)} unique pairs (100%)!")
+    elif len(results) >= len(unique_pairs_in_csv) * 0.99:
+        print(f"\n✅ EXCELLENT! Generated {len(results)}/{len(unique_pairs_in_csv)} pairs (99%+)")
+    else:
+        print(f"\n⚠️  Generated {len(results)}/{len(unique_pairs_in_csv)} pairs - {len(unique_pairs_in_csv) - len(results)} missing")
+    
+    print(f"\n[STRATEGY] Unlimited retry until success")
     print(f"[QUALITY] All entries have valid answer + type + reasoning (≥5 chars)")
     print(f"{'='*70}")
