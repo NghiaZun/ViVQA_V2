@@ -238,6 +238,10 @@ class OptimalVQAModel(nn.Module):
         base_clip = CLIPVisionModel.from_pretrained(vision_model_name)
         self.vision_encoder = MultiScaleVisionEncoder(base_clip, hidden_dim)
         self.clip_processor = CLIPProcessor.from_pretrained(vision_model_name)
+        
+        # Project vision sequence features to hidden_dim
+        clip_hidden = base_clip.config.hidden_size
+        self.vision_seq_proj = nn.Linear(clip_hidden, hidden_dim)
 
         # -------------------------------------
         # 2. PhoBERT Text Encoder
@@ -313,6 +317,9 @@ class OptimalVQAModel(nn.Module):
         # 1. Multi-scale vision encoding
         vision_pooled, vision_seq = self.vision_encoder(pixel_values)
         vision_seq = vision_seq.unsqueeze(1) if vision_seq.dim() == 2 else vision_seq
+        
+        # Project vision_seq to hidden_dim (CLIP ViT-Large: 1024 -> 768)
+        vision_seq = self.vision_seq_proj(vision_seq)
 
         # 2. Text encoding
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -374,6 +381,9 @@ class OptimalVQAModel(nn.Module):
         # 1. Encode vision
         vision_pooled, vision_seq = self.vision_encoder(pixel_values)
         vision_seq = vision_seq.unsqueeze(1) if vision_seq.dim() == 2 else vision_seq
+        
+        # Project vision_seq to hidden_dim
+        vision_seq = self.vision_seq_proj(vision_seq)
 
         # 2. Encode text
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
