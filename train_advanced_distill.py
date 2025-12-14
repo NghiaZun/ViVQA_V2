@@ -71,8 +71,8 @@ class TrainConfig:
     # Paths
     train_csv: str = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
     image_dir: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
-    teacher_jsonl: str = "/kaggle/input/8-12-teacher/teacher_outputs_train.jsonl"
-    checkpoint_dir: str = "/kaggle/input/model-base/transformers/default/1/checkpoints"
+    teacher_jsonl: str = "/kaggle/input/teacher-final/teacher_outputs_train.jsonl"
+    checkpoint_dir: str = "/kaggle/input/base-model/transformers/default/1/checkpoints"
     save_dir: str = "/kaggle/working"
     
     # Model architecture
@@ -582,6 +582,31 @@ def train():
     scaler = GradScaler(enabled=cfg.use_amp)
     best_val_loss = float('inf')
     es_counter = 0
+    start_epoch = 0
+    
+    # =====================
+    # RESUME FROM CHECKPOINT
+    # =====================
+    resume_checkpoint = os.path.join(cfg.save_dir, "latest_checkpoint_advanced.pt")
+    if os.path.exists(resume_checkpoint):
+        print(f"\n{'='*70}")
+        print(f"🔄 RESUMING FROM CHECKPOINT: {resume_checkpoint}")
+        print(f"{'='*70}")
+        
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        es_counter = checkpoint.get('es_counter', 0)
+        
+        print(f"✅ Loaded checkpoint from epoch {start_epoch}")
+        print(f"   Best val loss: {best_val_loss:.4f}")
+        print(f"   ES counter: {es_counter}/{cfg.es_patience}")
+        print(f"   Resuming from epoch {start_epoch + 1}")
+        print(f"   Note: Optimizer will be rebuilt for current stage")
+        print(f"{'='*70}\n")
+    else:
+        print(f"\n[INFO] No checkpoint found. Starting from scratch.\n")
     
     print(f"\n{'='*70}")
     print("PROGRESSIVE TRAINING STRATEGY")
@@ -591,7 +616,7 @@ def train():
     print(f"  Stage 3 (Epochs {cfg.stage1_epochs+cfg.stage2_epochs+1}-{cfg.num_epochs}): + Vision Encoder")
     print(f"{'='*70}\n")
     
-    for epoch in range(cfg.num_epochs):
+    for epoch in range(start_epoch, cfg.num_epochs):
         # Determine stage
         if epoch < cfg.stage1_epochs:
             stage = 1

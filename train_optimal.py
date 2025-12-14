@@ -61,8 +61,8 @@ class OptimalTrainConfig:
     # Paths
     train_csv: str = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
     image_dir: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
-    teacher_jsonl: str = "/kaggle/input/8-12-teacher/teacher_outputs_train.jsonl"
-    checkpoint_dir: str = "/kaggle/input/model-base/transformers/default/1/checkpoints"
+    teacher_jsonl: str = "/kaggle/input/teacher-final/teacher_outputs_train.jsonl"
+    checkpoint_dir: str = "/kaggle/input/base-model/transformers/default/1/checkpoints"
     save_dir: str = "/kaggle/working"
     
     # Model (Optimal architecture)
@@ -470,8 +470,33 @@ def train():
     scaler = GradScaler()
     best_val_loss = float('inf')
     es_counter = 0
+    start_epoch = 0
     
-    for epoch in range(cfg.num_epochs):
+    # =====================
+    # RESUME FROM CHECKPOINT
+    # =====================
+    resume_checkpoint = os.path.join(cfg.save_dir, "latest_checkpoint_optimal.pt")
+    if os.path.exists(resume_checkpoint):
+        print(f"\n{'='*70}")
+        print(f"🔄 RESUMING FROM CHECKPOINT: {resume_checkpoint}")
+        print(f"{'='*70}")
+        
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        es_counter = checkpoint.get('es_counter', 0)
+        
+        print(f"✅ Loaded checkpoint from epoch {start_epoch}")
+        print(f"   Best val loss: {best_val_loss:.4f}")
+        print(f"   ES counter: {es_counter}/{cfg.es_patience}")
+        print(f"   Resuming from epoch {start_epoch + 1}")
+        print(f"   Note: Optimizer will be rebuilt for current stage")
+        print(f"{'='*70}\n")
+    else:
+        print(f"\n[INFO] No checkpoint found. Starting from scratch.\n")
+    
+    for epoch in range(start_epoch, cfg.num_epochs):
         # Determine stage
         if epoch < cfg.stage1_epochs:
             stage = 1
@@ -591,6 +616,16 @@ def train():
             }
             torch.save(checkpoint, os.path.join(cfg.save_dir, f"checkpoint_epoch_{epoch+1}.pt"))
             print(f"💾 Checkpoint saved")
+        
+        # Save latest checkpoint (every epoch for resume)
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_val_loss': best_val_loss,
+            'es_counter': es_counter,
+        }
+        torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_optimal.pt"))
         
         # Early stopping
         if es_counter >= cfg.es_patience:
