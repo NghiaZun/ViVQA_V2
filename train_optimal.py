@@ -61,8 +61,8 @@ class OptimalTrainConfig:
     # Paths
     train_csv: str = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
     image_dir: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
-    teacher_jsonl: str = "/kaggle/input/teacher-final/teacher_outputs_train.jsonl"
-    checkpoint_dir: str = "/kaggle/input/base-model/transformers/default/1/checkpoints"
+    teacher_jsonl: str = "/kaggle/input/final/teacher_outputs_train.jsonl"
+    checkpoint_dir: str = "/kaggle/input/model-base/transformers/default/1/checkpoints"
     save_dir: str = "/kaggle/working"
     
     # Model (Optimal architecture)
