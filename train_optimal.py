@@ -464,7 +464,7 @@ def train():
     log_path = os.path.join(cfg.save_dir, cfg.log_csv)
     if not os.path.exists(log_path):
         with open(log_path, 'w') as f:
-            f.write("epoch,stage,train_loss,val_loss,best_val_loss,trainable_params_M\n")
+            f.write("epoch,stage,train_loss,val_loss,best_val_loss,trainable_params_M,val_accuracy\n")
     
     # Training loop
     scaler = GradScaler()
@@ -575,25 +575,80 @@ def train():
         # ==================
         model.eval()
         val_loss = 0
+        val_correct = 0
+        val_total = 0
+        sample_shown = False
         
         with torch.no_grad():
-            # Minimal validation logging
-            for batch in tqdm(val_loader, desc=f"Val E{epoch+1}", 
-                            ncols=100, leave=False, dynamic_ncols=False):
+            for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Val E{epoch+1}", 
+                            ncols=100, leave=False, dynamic_ncols=False)):
+                # Compute loss
                 loss = compute_loss(model, batch, device, focal_loss_fn)
                 val_loss += loss.item()
+                
+                # Compute accuracy (every batch)
+                pixel_values = batch["pixel_values"].to(device)
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                
+                # Generate predictions
+                output_ids = model.generate(
+                    pixel_values=pixel_values,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=96,
+                    num_beams=4,  # Faster than 8 for validation
+                    length_penalty=1.2,
+                    early_stopping=True
+                )
+                
+                # Decode predictions and labels
+                predictions = model.decoder_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+                gt_answers = model.decoder_tokenizer.batch_decode(labels, skip_special_tokens=True)
+                
+                # Calculate accuracy
+                for pred, gt in zip(predictions, gt_answers):
+                    # Extract answer from "Answer: xxx" format
+                    pred_answer = pred.split("Answer:")[-1].split("\n")[0].strip().lower()
+                    gt_answer = gt.split("Answer:")[-1].split("\n")[0].strip().lower()
+                    
+                    # Normalize Vietnamese
+                    pred_answer = ' '.join(pred_answer.split())
+                    gt_answer = ' '.join(gt_answer.split())
+                    
+                    # Check if correct (exact match or contains)
+                    if pred_answer == gt_answer or gt_answer in pred_answer or pred_answer in gt_answer:
+                        val_correct += 1
+                    val_total += 1
+                
+                # Show sample predictions every 10 epochs
+                if (epoch + 1) % 10 == 0 and batch_idx == 0 and not sample_shown:
+                    sample_shown = True
+                    print(f"\n{'='*70}")
+                    print(f"SAMPLE PREDICTIONS (Epoch {epoch+1})")
+                    print(f"{'='*70}")
+                    for i in range(min(3, len(predictions))):  # Show 3 samples
+                        pred_answer = predictions[i].split("Answer:")[-1].split("\n")[0].strip()
+                        gt_answer = gt_answers[i].split("Answer:")[-1].split("\n")[0].strip()
+                        print(f"\nSample {i+1}:")
+                        print(f"  Prediction: {pred_answer}")
+                        print(f"  Ground Truth: {gt_answer}")
+                        print(f"  Match: {'✅' if pred_answer.lower().strip() == gt_answer.lower().strip() else '❌'}")
+                    print(f"{'='*70}\n")
         
         avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = 100.0 * val_correct / val_total if val_total > 0 else 0.0
         
         # ==================
         # LOGGING & CHECKPOINTING
         # ==================
-        print(f"[EPOCH {epoch+1}] Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f} | Best: {best_val_loss:.4f}")
+        print(f"[EPOCH {epoch+1}] Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Best: {best_val_loss:.4f}")
         
         # Log to CSV
         with open(log_path, 'a') as f:
             f.write(f"{epoch+1},{stage},{avg_train_loss:.6f},{avg_val_loss:.6f},"
-                   f"{best_val_loss:.6f},{trainable_params:.2f}\n")
+                   f"{best_val_loss:.6f},{trainable_params:.2f},{val_accuracy:.2f}\n")
         
         # Save best model
         if avg_val_loss < best_val_loss - cfg.es_min_delta:
