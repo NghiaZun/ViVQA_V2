@@ -473,7 +473,7 @@ def train():
     # =====================
     # RESUME FROM CHECKPOINT
     # =====================
-    resume_checkpoint = "/kaggle/input/e70/transformers/default/1/latest_checkpoint_optimal.pt"
+    resume_checkpoint = "/kaggle/input/e88/transformers/default/1/latest_checkpoint_optimal.pt"
     if os.path.exists(resume_checkpoint):
         print(f"\n{'='*70}")
         print(f"🔄 RESUMING FROM CHECKPOINT: {resume_checkpoint}")
@@ -612,8 +612,34 @@ def train():
                 # Calculate accuracy
                 for pred, gt in zip(predictions, gt_answers):
                     # Extract answer from "Answer: xxx" format
-                    pred_answer = pred.split("Answer:")[-1].split("\n")[0].strip().lower()
-                    gt_answer = gt.split("Answer:")[-1].split("\n")[0].strip().lower()
+                    # Handle both:
+                    # Format 1: "Answer: màu xanh\nReasoning: ..."
+                    # Format 2: "màu xanh\nReasoning: ..."
+                    
+                    if "Answer:" in pred:
+                        pred_text = pred.split("Answer:")[-1]
+                    else:
+                        pred_text = pred
+                    
+                    if "Answer:" in gt:
+                        gt_text = gt.split("Answer:")[-1]
+                    else:
+                        gt_text = gt
+                    
+                    # Split by newline or "Reasoning:" to get just the answer
+                    if "\nReasoning:" in pred_text:
+                        pred_answer = pred_text.split("\nReasoning:")[0].strip().lower()
+                    elif "Reasoning:" in pred_text:
+                        pred_answer = pred_text.split("Reasoning:")[0].strip().lower()
+                    else:
+                        pred_answer = pred_text.split("\n")[0].strip().lower()
+                    
+                    if "\nReasoning:" in gt_text:
+                        gt_answer = gt_text.split("\nReasoning:")[0].strip().lower()
+                    elif "Reasoning:" in gt_text:
+                        gt_answer = gt_text.split("Reasoning:")[0].strip().lower()
+                    else:
+                        gt_answer = gt_text.split("\n")[0].strip().lower()
                     
                     # Normalize Vietnamese
                     pred_answer = ' '.join(pred_answer.split())
@@ -631,11 +657,35 @@ def train():
                     print(f"SAMPLE PREDICTIONS (Epoch {epoch+1})")
                     print(f"{'='*70}")
                     for i in range(min(3, len(predictions))):  # Show 3 samples
-                        pred_answer = predictions[i].split("Answer:")[-1].split("\n")[0].strip()
-                        gt_answer = gt_answers[i].split("Answer:")[-1].split("\n")[0].strip()
+                        # Show full prediction and GT first
                         print(f"\nSample {i+1}:")
-                        print(f"  Prediction: {pred_answer}")
-                        print(f"  Ground Truth: {gt_answer}")
+                        print(f"  FULL Prediction: {predictions[i][:300]}...")  # First 300 chars
+                        print(f"  FULL GT: {gt_answers[i][:300]}...")
+                        
+                        # Extract answer (same logic as accuracy calculation)
+                        pred_text = predictions[i].split("Answer:")[-1] if "Answer:" in predictions[i] else predictions[i]
+                        gt_text = gt_answers[i].split("Answer:")[-1] if "Answer:" in gt_answers[i] else gt_answers[i]
+                        
+                        # Remove Reasoning part
+                        if "\nReasoning:" in pred_text:
+                            pred_answer = pred_text.split("\nReasoning:")[0].strip()
+                        elif "Reasoning:" in pred_text:
+                            pred_answer = pred_text.split("Reasoning:")[0].strip()
+                        else:
+                            pred_answer = pred_text.split("\n")[0].strip()
+                        
+                        if "\nReasoning:" in gt_text:
+                            gt_answer = gt_text.split("\nReasoning:")[0].strip()
+                        elif "Reasoning:" in gt_text:
+                            gt_answer = gt_text.split("Reasoning:")[0].strip()
+                        else:
+                            gt_answer = gt_text.split("\n")[0].strip()
+                        
+                        print(f"  Extracted Pred Answer: {pred_answer}")
+                        print(f"  Extracted GT Answer: {gt_answer}")
+                        
+                        print(f"  Extracted Pred Answer: {pred_answer}")
+                        print(f"  Extracted GT Answer: {gt_answer}")
                         print(f"  Match: {'✅' if pred_answer.lower().strip() == gt_answer.lower().strip() else '❌'}")
                     print(f"{'='*70}\n")
         
