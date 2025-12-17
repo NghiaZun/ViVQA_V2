@@ -366,17 +366,15 @@ class OptimalVQAModel(nn.Module):
         input_ids,
         attention_mask,
         max_new_tokens=96,
-        num_beams=8,
-        num_beam_groups=4,
-        diversity_penalty=0.5,
+        num_beams=4,
         length_penalty=1.2,
-        early_stopping=False,
+        early_stopping=True,
         no_repeat_ngram_size=3,
         question_type=None,
         **kwargs
     ):
         """
-        Inference with optimized beam search
+        Inference with beam search
         """
         # 1. Encode vision
         vision_pooled, vision_seq = self.vision_encoder(pixel_values)
@@ -409,13 +407,11 @@ class OptimalVQAModel(nn.Module):
             attention_mask=mask,
         )
 
-        # 7. Generate with diverse beam search
+        # 7. Generate with beam search
         output_ids = self.decoder.generate(
             encoder_outputs=encoder_outputs,
             max_new_tokens=max_new_tokens,
             num_beams=num_beams,
-            num_beam_groups=num_beam_groups,
-            diversity_penalty=diversity_penalty,
             length_penalty=length_penalty,
             early_stopping=early_stopping,
             no_repeat_ngram_size=no_repeat_ngram_size,

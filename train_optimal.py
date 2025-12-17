@@ -116,9 +116,7 @@ class OptimalTrainConfig:
     pseudo_label_confidence: float = 0.9
     
     # Inference
-    num_beams: int = 8
-    num_beam_groups: int = 4
-    diversity_penalty: float = 0.5
+    num_beams: int = 4  # Standard beam search (diverse beam not supported by T5)
     length_penalty: float = 1.2
     
     # Early stopping
