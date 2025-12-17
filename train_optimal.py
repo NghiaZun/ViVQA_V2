@@ -603,9 +603,13 @@ def train():
                     early_stopping=True
                 )
                 
-                # Decode predictions and labels
+                # Decode predictions
                 predictions = model.decoder_tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-                gt_answers = model.decoder_tokenizer.batch_decode(labels, skip_special_tokens=True)
+                
+                # Decode labels (replace -100 with pad_token_id first)
+                labels_for_decode = labels.clone()
+                labels_for_decode[labels_for_decode == -100] = model.decoder_tokenizer.pad_token_id
+                gt_answers = model.decoder_tokenizer.batch_decode(labels_for_decode, skip_special_tokens=True)
                 
                 # Calculate accuracy
                 for pred, gt in zip(predictions, gt_answers):
