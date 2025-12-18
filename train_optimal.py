@@ -473,7 +473,7 @@ def train():
     # =====================
     # RESUME FROM CHECKPOINT
     # =====================
-    resume_checkpoint = "/kaggle/input/e88/transformers/default/1/latest_checkpoint_optimal.pt"
+    resume_checkpoint = "/kaggle/input/e018/transformers/default/1/latest_checkpoint_optimal.pt"
     if os.path.exists(resume_checkpoint):
         print(f"\n{'='*70}")
         print(f"🔄 RESUMING FROM CHECKPOINT: {resume_checkpoint}")
@@ -645,8 +645,8 @@ def train():
                     pred_answer = ' '.join(pred_answer.split())
                     gt_answer = ' '.join(gt_answer.split())
                     
-                    # Check if correct (exact match or contains)
-                    if pred_answer == gt_answer or gt_answer in pred_answer or pred_answer in gt_answer:
+                    # Check if correct (STRICT exact match only)
+                    if pred_answer == gt_answer:
                         val_correct += 1
                     val_total += 1
                 
@@ -680,9 +680,6 @@ def train():
                             gt_answer = gt_text.split("Reasoning:")[0].strip()
                         else:
                             gt_answer = gt_text.split("\n")[0].strip()
-                        
-                        print(f"  Extracted Pred Answer: {pred_answer}")
-                        print(f"  Extracted GT Answer: {gt_answer}")
                         
                         print(f"  Extracted Pred Answer: {pred_answer}")
                         print(f"  Extracted GT Answer: {gt_answer}")
