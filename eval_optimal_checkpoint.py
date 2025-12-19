@@ -86,8 +86,8 @@ def token_f1(prediction, ground_truth):
 # === CONFIG ===
 TEST_CSV_PATH = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv"
 IMAGE_FOLDER = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test"
-CHECKPOINT_PATH = "/kaggle/working/best_optimal_model.pt"  # ← CHANGE THIS to your checkpoint
-CHECKPOINT_DIR = "/kaggle/input/base-model/transformers/default/1/checkpoints"
+CHECKPOINT_PATH = "/kaggle/input/best-model/transformers/default/1/best_optimal_model.pt"  
+CHECKPOINT_DIR = "/kaggle/input/checkpoints/transformers/default/1/checkpoints"
 BATCH_SIZE = 4  # Lower for ViT-Large
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
