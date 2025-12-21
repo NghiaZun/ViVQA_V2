@@ -588,7 +588,7 @@ def train():
     # =====================
     # RESUME FROM CHECKPOINT
     # =====================
-    resume_checkpoint = "/kaggle/input/e018/transformers/default/1/latest_checkpoint_optimal.pt"
+    resume_checkpoint = "/kaggle/input/e120/transformers/default/1/latest_checkpoint_optimal.pt"
     if os.path.exists(resume_checkpoint):
         print(f"\n{'='*70}")
         print(f"🔄 RESUMING FROM CHECKPOINT: {resume_checkpoint}")
