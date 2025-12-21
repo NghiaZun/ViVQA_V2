@@ -77,12 +77,14 @@ class OptimalTrainConfig:
     # Training
     batch_size: int = 2  # Larger model needs smaller batch
     accum_steps: int = 16  # Effective = 32
-    num_epochs: int = 120
+    # Extended total epochs so Stage 4/5 can be longer
+    num_epochs: int = 180  # Extended to 180 for longer Stage 4-5
     val_ratio: float = 0.1
     num_workers: int = 2
     
     # Learning rates
-    base_lr: float = 1e-5
+    # Lower base LR for more stable fine-tuning during long Stage 4/5
+    base_lr: float = 2e-6
     vision_lr: float = 5e-6  # Lower for pretrained CLIP
     fusion_lr: float = 3e-5  # Higher for new layers
     weight_decay: float = 0.01
@@ -92,6 +94,13 @@ class OptimalTrainConfig:
     stage1_epochs: int = 60  # Fusion + Decoder
     stage2_epochs: int = 30  # + Text encoder last 2 layers
     stage3_epochs: int = 30  # + Vision encoder last 2 layers
+    
+    # Stage 4-5: Two-Stage Training (CRITICAL for 70% accuracy!)
+    # Make Stage 4 and 5 longer to give answer-focused and reasoning-focused
+    # fine-tuning more iterations to overcome the "reasoning curse".
+    stage4_epochs: int = 30  # Stage 4: Answer-only (E121-150 -> adjusted by num_epochs)
+    stage5_epochs: int = 30  # Stage 5: Reasoning-only
+    stage4_answer_weight: float = 100.0  # Extreme focus on answer!
     
     # Curriculum learning
     use_curriculum: bool = True
@@ -158,6 +167,92 @@ class FocalLoss(nn.Module):
             return focal_loss[mask].sum()
         else:
             return focal_loss
+
+# =====================
+# TWO-STAGE LOSS (STAGE 4-5)
+# =====================
+class TwoStageLoss(nn.Module):
+    """
+    Two-Stage Loss for Stage 4-5 training
+    
+    Stage 4 (Answer-only): Only compute loss on answer tokens
+    Stage 5 (Reasoning-only): Only compute loss on reasoning tokens
+    
+    This separation ensures:
+    - Stage 4: Model learns CORRECT answers (no reasoning interference)
+    - Stage 5: Model learns reasoning CONDITIONED on correct answer
+    """
+    def __init__(self, stage='answer', answer_weight=100.0, ignore_index=-100):
+        super().__init__()
+        self.stage = stage  # 'answer' or 'reasoning'
+        self.answer_weight = answer_weight
+        self.ignore_index = ignore_index
+        
+    def forward(self, logits, labels, tokenizer):
+        """
+        Args:
+            logits: [B, seq_len, vocab_size]
+            labels: [B, seq_len]
+            tokenizer: Decoder tokenizer
+        """
+        batch_size, seq_len, vocab_size = logits.shape
+        device = logits.device
+        
+        # Find "\nReasoning:" delimiter
+        reasoning_delimiter = "\nReasoning:"
+        reasoning_ids = tokenizer.encode(reasoning_delimiter, add_special_tokens=False)
+        
+        # Create mask for answer vs reasoning tokens
+        if self.stage == 'answer':
+            # Stage 4: Only answer tokens (before \nReasoning:)
+            mask = torch.ones(batch_size, seq_len, device=device) * self.answer_weight
+            
+            for b in range(batch_size):
+                # Find reasoning position
+                for i in range(seq_len - len(reasoning_ids) + 1):
+                    if all(i+j < seq_len and labels[b, i+j] == reasoning_ids[j] 
+                           for j in range(len(reasoning_ids))):
+                        # Zero out reasoning tokens
+                        mask[b, i:] = 0.0
+                        break
+        else:
+            # Stage 5: Only reasoning tokens (after \nReasoning:)
+            mask = torch.zeros(batch_size, seq_len, device=device)
+            
+            for b in range(batch_size):
+                # Find reasoning position
+                for i in range(seq_len - len(reasoning_ids) + 1):
+                    if all(i+j < seq_len and labels[b, i+j] == reasoning_ids[j] 
+                           for j in range(len(reasoning_ids))):
+                        # Only reasoning tokens (keep weight = 1.0)
+                        mask[b, i:] = 1.0
+                        break
+        
+        # Compute weighted loss
+        logits_flat = logits.reshape(-1, vocab_size)
+        labels_flat = labels.reshape(-1)
+        mask_flat = mask.reshape(-1)
+        
+        # Per-token loss
+        loss_per_token = F.cross_entropy(
+            logits_flat, labels_flat,
+            ignore_index=self.ignore_index,
+            reduction='none'
+        )
+        
+        # Apply mask
+        valid_mask = (labels_flat != self.ignore_index)
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=device)
+        
+        # Weighted average (ignore zero-weight tokens)
+        nonzero_mask = valid_mask & (mask_flat > 0)
+        if nonzero_mask.sum() == 0:
+            return torch.tensor(0.0, device=device)
+        
+        weighted_loss = (loss_per_token * mask_flat)[nonzero_mask].sum() / mask_flat[nonzero_mask].sum()
+        
+        return weighted_loss
 
 # =====================
 # IMAGE AUGMENTATION
@@ -366,8 +461,8 @@ def set_training_stage(model, stage: int):
         except:
             pass
 
-def compute_loss(model, batch, device, focal_loss_fn=None):
-    """Compute loss with optional focal loss"""
+def compute_loss(model, batch, device, criterion=None):
+    """Compute loss with custom criterion (focal or two-stage)"""
     pixel_values = batch["pixel_values"].to(device)
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -381,14 +476,27 @@ def compute_loss(model, batch, device, focal_loss_fn=None):
         labels=labels
     )
     
-    if focal_loss_fn is not None:
-        # Use focal loss instead
+    if criterion is not None:
         logits = outputs.logits
-        loss = focal_loss_fn(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1)
-        )
+        
+        # Check if TwoStageLoss (needs tokenizer)
+        if isinstance(criterion, TwoStageLoss):
+            loss = criterion(logits, labels, model.decoder_tokenizer)
+        # Check if FocalLoss
+        elif isinstance(criterion, FocalLoss):
+            loss = criterion(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1)
+            )
+        else:
+            # Standard CE
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-100
+            )
     else:
+        # Use model's built-in loss
         loss = outputs.loss
     
     return loss
@@ -403,7 +511,7 @@ def train():
     os.makedirs(cfg.save_dir, exist_ok=True)
     
     print("="*70)
-    print("OPTIMAL VQA TRAINING FOR 70% ACCURACY")
+    print("OPTIMAL VQA TRAINING - 5 STAGES FOR 70% ACCURACY")
     print("="*70)
     print(f"Device: {device}")
     print(f"Vision: {cfg.vision_model}")
@@ -413,6 +521,13 @@ def train():
     print(f"Curriculum: {cfg.use_curriculum}")
     print(f"Image augmentation: {cfg.use_image_aug}")
     print(f"Focal loss: {cfg.use_focal_loss}")
+    print(f"\n🎯 TRAINING STAGES:")
+    print(f"  Stage 1 (E1-60):   Progressive unfreezing - Fusion+Decoder")
+    print(f"  Stage 2 (E61-90):  + Text encoder (last 2 layers)")
+    print(f"  Stage 3 (E91-120): + Vision encoder (last 2 layers)")
+    print(f"  Stage 4 (E121-135): ANSWER-ONLY (100x weight) 🔥")
+    print(f"  Stage 5 (E136-150): REASONING-ONLY (answer frozen) 🔥")
+    print(f"\n💡 Stage 4-5 fixes 'reasoning curse' → Target: 70%+ accuracy!")
     print("="*70 + "\n")
     
     # Load model
@@ -495,13 +610,17 @@ def train():
         print(f"\n[INFO] No checkpoint found. Starting from scratch.\n")
     
     for epoch in range(start_epoch, cfg.num_epochs):
-        # Determine stage
+        # Determine stage (1-5)
         if epoch < cfg.stage1_epochs:
             stage = 1
         elif epoch < cfg.stage1_epochs + cfg.stage2_epochs:
             stage = 2
-        else:
+        elif epoch < cfg.stage1_epochs + cfg.stage2_epochs + cfg.stage3_epochs:
             stage = 3
+        elif epoch < cfg.stage1_epochs + cfg.stage2_epochs + cfg.stage3_epochs + cfg.stage4_epochs:
+            stage = 4  # Answer-only
+        else:
+            stage = 5  # Reasoning-only
         
         set_training_stage(model, stage)
         
@@ -523,6 +642,24 @@ def train():
         print(f"{'='*70}")
         
         # ==================
+        # SELECT LOSS CRITERION
+        # ==================
+        if stage == 4:
+            # Stage 4: Answer-only loss (100x weight)
+            criterion = TwoStageLoss(stage='answer', answer_weight=cfg.stage4_answer_weight, ignore_index=-100)
+            print(f"🔥 [Stage 4: ANSWER-ONLY] Weight={cfg.stage4_answer_weight}x | Target: Fix low accuracy!")
+        elif stage == 5:
+            # Stage 5: Reasoning-only loss (answer frozen)
+            criterion = TwoStageLoss(stage='reasoning', ignore_index=-100)
+            print(f"🔥 [Stage 5: REASONING-ONLY] Answer frozen | Target: Consistent reasoning!")
+        elif cfg.use_focal_loss:
+            # Stage 1-3: Focal loss
+            criterion = FocalLoss(cfg.focal_alpha, cfg.focal_gamma)
+        else:
+            # Stage 1-3: Standard CE
+            criterion = None
+        
+        # ==================
         # TRAINING
         # ==================
         model.train()
@@ -536,7 +673,7 @@ def train():
         
         for step, batch in enumerate(pbar):
             with autocast():
-                loss = compute_loss(model, batch, device, focal_loss_fn)
+                loss = compute_loss(model, batch, device, criterion)
                 loss = loss / cfg.accum_steps
             
             scaler.scale(loss).backward()
@@ -581,7 +718,7 @@ def train():
             for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Val E{epoch+1}", 
                             ncols=100, leave=False, dynamic_ncols=False)):
                 # Compute loss
-                loss = compute_loss(model, batch, device, focal_loss_fn)
+                loss = compute_loss(model, batch, device, criterion)
                 val_loss += loss.item()
                 
                 # Compute accuracy (every batch)
