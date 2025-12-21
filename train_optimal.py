@@ -78,7 +78,7 @@ class OptimalTrainConfig:
     batch_size: int = 2  # Larger model needs smaller batch
     accum_steps: int = 16  # Effective = 32
     # Extended total epochs so Stage 4/5 can be longer
-    num_epochs: int = 180  # Extended to 180 for longer Stage 4-5
+    num_epochs: int = 200  # ✅ Extended to 200 for longer Stage 4-5 (E1-120: Stage 1-3, E121-200: Stage 4-5)
     val_ratio: float = 0.1
     num_workers: int = 2
     
@@ -98,9 +98,13 @@ class OptimalTrainConfig:
     # Stage 4-5: Two-Stage Training (CRITICAL for 70% accuracy!)
     # Make Stage 4 and 5 longer to give answer-focused and reasoning-focused
     # fine-tuning more iterations to overcome the "reasoning curse".
-    stage4_epochs: int = 30  # Stage 4: Answer-only (E121-150 -> adjusted by num_epochs)
-    stage5_epochs: int = 30  # Stage 5: Reasoning-only
-    stage4_answer_weight: float = 100.0  # Extreme focus on answer!
+    stage4_epochs: int = 50  # ✅ Stage 4: Answer-only (E121-170) - Dài hơn cho progressive weight
+    stage5_epochs: int = 30  # Stage 5: Reasoning-only (E171-200)
+    
+    # ✅ PROGRESSIVE ANSWER WEIGHT: Tăng dần để model làm quen
+    stage4_answer_weight_start: float = 50.0   # Start: 50x (moderate)
+    stage4_answer_weight_end: float = 100.0    # End: 100x (strong focus)
+    # Sẽ tăng từ 50 → 100 theo công thức linear qua 50 epochs
     
     # Curriculum learning
     use_curriculum: bool = True
@@ -207,14 +211,23 @@ class TwoStageLoss(nn.Module):
             # Stage 4: Only answer tokens (before \nReasoning:)
             mask = torch.ones(batch_size, seq_len, device=device) * self.answer_weight
             
+            delimiter_found = 0  # ✅ Count samples with delimiter
             for b in range(batch_size):
                 # Find reasoning position
+                found = False
                 for i in range(seq_len - len(reasoning_ids) + 1):
                     if all(i+j < seq_len and labels[b, i+j] == reasoning_ids[j] 
                            for j in range(len(reasoning_ids))):
                         # Zero out reasoning tokens
                         mask[b, i:] = 0.0
+                        found = True
+                        delimiter_found += 1
                         break
+            
+            # ✅ Warn if delimiter not found in most samples
+            if delimiter_found < batch_size * 0.5:
+                print(f"⚠️  [Stage 4] Delimiter '\\nReasoning:' found in only {delimiter_found}/{batch_size} samples!")
+                
         else:
             # Stage 5: Only reasoning tokens (after \nReasoning:)
             mask = torch.zeros(batch_size, seq_len, device=device)
@@ -609,6 +622,49 @@ def train():
     else:
         print(f"\n[INFO] No checkpoint found. Starting from scratch.\n")
     
+    # =====================
+    # CREATE OPTIMIZER & SCHEDULER (ONCE, OUTSIDE LOOP!)
+    # =====================
+    # ✅ FIX: Tạo optimizer 1 LẦN để giữ momentum qua các epochs
+    print(f"\n{'='*70}")
+    print(f"🔧 CREATING OPTIMIZER & SCHEDULER (PRESERVE MOMENTUM!)")
+    print(f"{'='*70}")
+    
+    # Get all parameters (optimizer will skip frozen params automatically)
+    all_params = list(model.parameters())
+    optimizer = torch.optim.AdamW(all_params, lr=cfg.base_lr, weight_decay=cfg.weight_decay)
+    
+    # Total training steps for LR schedule
+    total_steps = len(train_loader) * (cfg.num_epochs - start_epoch)
+    warmup_steps = int(total_steps * 0.05)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
+    
+    # ✅ Load optimizer state if resuming (CRITICAL for Stage 4!)
+    if os.path.exists(resume_checkpoint):
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"✅ Loaded optimizer state (MOMENTUM PRESERVED!)")
+            except:
+                print(f"⚠️  Could not load optimizer state, starting fresh")
+        
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print(f"✅ Loaded scheduler state")
+            except:
+                print(f"⚠️  Could not load scheduler state, starting fresh")
+    
+    print(f"   Total params: {len(all_params)}")
+    print(f"   LR: {cfg.base_lr:.2e}")
+    print(f"   Total steps: {total_steps}, Warmup: {warmup_steps}")
+    print(f"{'='*70}\n")
+    
     for epoch in range(start_epoch, cfg.num_epochs):
         # Determine stage (1-5)
         if epoch < cfg.stage1_epochs:
@@ -624,18 +680,8 @@ def train():
         
         set_training_stage(model, stage)
         
-        # Optimizer
-        params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(params, lr=cfg.base_lr, weight_decay=cfg.weight_decay)
-        trainable_params = sum(p.numel() for p in params) / 1e6
-        
-        # Scheduler
-        num_training_steps = len(train_loader) * (cfg.num_epochs - epoch)
-        num_warmup_steps = int(num_training_steps * 0.05)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
-        )
+        # ✅ Count trainable params (optimizer đã tạo sẵn)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
         
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{cfg.num_epochs} | Stage {stage} | Trainable: {trainable_params:.1f}M")
@@ -645,9 +691,19 @@ def train():
         # SELECT LOSS CRITERION
         # ==================
         if stage == 4:
-            # Stage 4: Answer-only loss (100x weight)
-            criterion = TwoStageLoss(stage='answer', answer_weight=cfg.stage4_answer_weight, ignore_index=-100)
-            print(f"🔥 [Stage 4: ANSWER-ONLY] Weight={cfg.stage4_answer_weight}x | Target: Fix low accuracy!")
+            # ✅ PROGRESSIVE ANSWER WEIGHT: Tăng dần từ 50 → 100
+            # Tính epoch trong Stage 4 (0-based)
+            stage4_start_epoch = cfg.stage1_epochs + cfg.stage2_epochs + cfg.stage3_epochs
+            epoch_in_stage4 = epoch - stage4_start_epoch
+            
+            # Linear schedule: weight = start + (end - start) * progress
+            progress = epoch_in_stage4 / max(cfg.stage4_epochs - 1, 1)  # 0.0 → 1.0
+            current_answer_weight = cfg.stage4_answer_weight_start + \
+                                   (cfg.stage4_answer_weight_end - cfg.stage4_answer_weight_start) * progress
+            
+            criterion = TwoStageLoss(stage='answer', answer_weight=current_answer_weight, ignore_index=-100)
+            print(f"🔥 [Stage 4: ANSWER-ONLY] Weight={current_answer_weight:.1f}x (E{epoch_in_stage4+1}/{cfg.stage4_epochs}) | Target: Fix low accuracy!")
+            
         elif stage == 5:
             # Stage 5: Reasoning-only loss (answer frozen)
             criterion = TwoStageLoss(stage='reasoning', ignore_index=-100)
