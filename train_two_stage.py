@@ -745,20 +745,49 @@ def train():
                 
                 # Calculate accuracy
                 for i, (pred, gt) in enumerate(zip(predictions, gt_answers)):
-                    # Extract answer
+                    # Extract answer from prediction
+                    # Format: "Reasoning: ...\nAnswer: xxx" or just "Answer: xxx"
                     if "Answer:" in pred:
-                        pred_answer = pred.split("Answer:")[-1].split("\n")[0].strip().lower()
+                        # Split by "Answer:" and take everything after it
+                        pred_answer_text = pred.split("Answer:")[-1].strip()
+                        # Remove any trailing reasoning or newlines
+                        pred_answer = pred_answer_text.split("\n")[0].strip().lower()
+                    elif "Reasoning:" in pred:
+                        # If no "Answer:" but has "Reasoning:", take everything after first newline
+                        parts = pred.split("\n", 1)
+                        if len(parts) > 1:
+                            pred_answer = parts[1].strip().lower()
+                        else:
+                            pred_answer = ""
                     else:
+                        # Fallback: take first line
                         pred_answer = pred.split("\n")[0].strip().lower()
                     
+                    # Extract answer from ground truth
                     if "Answer:" in gt:
-                        gt_answer = gt.split("Answer:")[-1].split("\n")[0].strip().lower()
+                        gt_answer_text = gt.split("Answer:")[-1].strip()
+                        gt_answer = gt_answer_text.split("\n")[0].strip().lower()
+                    elif "Reasoning:" in gt:
+                        parts = gt.split("\n", 1)
+                        if len(parts) > 1:
+                            gt_answer = parts[1].strip().lower()
+                        else:
+                            gt_answer = ""
                     else:
                         gt_answer = gt.split("\n")[0].strip().lower()
                     
                     # Normalize
                     pred_answer = ' '.join(pred_answer.split())
                     gt_answer = ' '.join(gt_answer.split())
+                    
+                    # Debug: print first few samples
+                    if batch_idx == 0 and i < 3 and epoch % 5 == 0:
+                        print(f"\n[DEBUG Sample {i+1}]")
+                        print(f"  Full Pred: {pred[:200]}...")
+                        print(f"  Full GT: {gt[:200]}...")
+                        print(f"  Extracted Pred Answer: '{pred_answer}'")
+                        print(f"  Extracted GT Answer: '{gt_answer}'")
+                        print(f"  Match: {'✅' if pred_answer == gt_answer else '❌'}")
                     
                     if pred_answer == gt_answer:
                         val_correct += 1
@@ -804,7 +833,7 @@ def train():
         # ==================
         # LOGGING
         # ==================
-        print(f"[EPOCH {epoch+1}] Train Loss: {avg_train_loss:.4f} (R: {avg_train_r_loss:.4f}, A: {avg_train_a_loss:.4f}) | "
+        print(f"\n[EPOCH {epoch+1}] Train Loss: {avg_train_loss:.4f} (R: {avg_train_r_loss:.4f}, A: {avg_train_a_loss:.4f}) | "
               f"Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Val Acc (GT reasoning): {val_accuracy_gt:.2f}%")
         
         with open(log_path, 'a') as f:
