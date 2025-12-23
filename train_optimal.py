@@ -900,7 +900,11 @@ def train():
             print(f"✅ Best model saved! Val Loss: {best_val_loss:.4f}")
         else:
             es_counter += 1
-            print(f"⚠️  No improvement ({es_counter}/{cfg.es_patience})")
+            # ✅ SKIP EARLY STOPPING trong Stage 4-5 (loss scale khác, cần thời gian)
+            if stage in [4, 5]:
+                print(f"⚠️  No improvement ({es_counter}/{cfg.es_patience}) - BUT continuing (Stage {stage} needs time!)")
+            else:
+                print(f"⚠️  No improvement ({es_counter}/{cfg.es_patience})")
         
         # Save checkpoint every 10 epochs (less frequent to save time)
         if (epoch + 1) % 10 == 0:
@@ -924,8 +928,12 @@ def train():
         }
         torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_optimal.pt"))
         
-        # Early stopping
-        if es_counter >= cfg.es_patience:
+        # Early stopping (SKIP cho Stage 4-5)
+        if stage in [4, 5]:
+            # ✅ Stage 4-5: Loss scale khác, KHÔNG dùng early stopping!
+            # Chỉ check accuracy thay vì loss
+            pass  # Continue training
+        elif es_counter >= cfg.es_patience:
             print(f"\n⛔ Early stopping at epoch {epoch+1}")
             break
         
