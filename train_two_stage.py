@@ -386,10 +386,11 @@ class TwoStageVQADataset(Dataset):
         teacher_answer = teacher_data.get("teacher_answer", gt_answer)
         teacher_reasoning = teacher_data.get("teacher_reasoning", "")
         
-        # GT-guided: if teacher answer wrong, use GT
+        # GT-guided: if teacher answer wrong, use GT but KEEP reasoning
         if teacher_answer and teacher_answer.strip().lower() != gt_answer.strip().lower():
             teacher_answer = gt_answer
-            teacher_reasoning = ""
+            # ✅ KEEP reasoning even if answer is corrected!
+            # This ensures consistent format: "Reasoning: ... \nAnswer: ..."
         
         # ✅ TWO-STAGE FORMAT: "Reasoning: ... \nAnswer: ..."
         if teacher_reasoning:
