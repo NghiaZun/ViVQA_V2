@@ -9,7 +9,6 @@ Key differences from train_optimal.py:
 
 Expected: 65-70% accuracy on ViVQA
 """
-
 import os
 import gc
 import json
@@ -23,6 +22,12 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.swa_utils import AveragedModel, SWALR
+
+# Clear GPU memory at start (if resuming from failed run)
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    gc.collect()
+    print("🧹 Cleared GPU cache at startup")
 from tqdm import tqdm
 from PIL import Image
 from transformers import (
@@ -670,22 +675,41 @@ def train():
             f.write("epoch,stage,train_loss,train_reasoning_loss,train_answer_loss,val_loss,val_accuracy,val_accuracy_gt_reasoning,best_val_loss\n")
     
     # Training state
-    scaler = GradScaler()
+    try:
+        from torch.amp import GradScaler as NewGradScaler
+        scaler = NewGradScaler('cuda')
+    except:
+        from torch.cuda.amp import GradScaler
+        scaler = GradScaler()
     best_val_loss = float('inf')
     es_counter = 0
     start_epoch = 0
     
     # =====================
     # RESUME FROM CHECKPOINT
-    # =====================
+    # =====================    
+    # If not in working dir, check input dir (from Kaggle dataset)
     resume_checkpoint = "/kaggle/input/e13/transformers/default/1/latest_checkpoint_two_stage.pt"
+    
+    checkpoint_to_load = None
     if os.path.exists(resume_checkpoint):
+        checkpoint_to_load = resume_checkpoint
+        print(f"\n🔄 Found checkpoint in working dir: {resume_checkpoint}")
+    
+    if checkpoint_to_load:
         print(f"\n{'='*70}")
-        print(f"🔄 RESUMING FROM CHECKPOINT: {resume_checkpoint}")
+        print(f"🔄 RESUMING FROM CHECKPOINT: {checkpoint_to_load}")
         print(f"{'='*70}")
         
-        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        # Clear GPU memory before loading checkpoint
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("🧹 Cleared GPU cache before loading checkpoint")
+        
+        # Load checkpoint to CPU first (saves GPU memory)
+        checkpoint = torch.load(checkpoint_to_load, map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)  # Then move to GPU
         start_epoch = checkpoint['epoch']
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         es_counter = checkpoint.get('es_counter', 0)
@@ -719,28 +743,34 @@ def train():
     )
     
     # Load optimizer state if resuming
-    if os.path.exists(resume_checkpoint):
-        checkpoint = torch.load(resume_checkpoint, map_location=device)
+    if checkpoint_to_load and 'checkpoint' in locals():
+        # Reuse checkpoint already loaded (don't load again!)
         if 'optimizer_state_dict' in checkpoint:
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 print(f"✅ Loaded optimizer state (MOMENTUM PRESERVED!)")
-            except:
-                print(f"⚠️  Could not load optimizer state")
+            except Exception as e:
+                print(f"⚠️  Could not load optimizer state: {e}")
         
         if 'scheduler_state_dict' in checkpoint:
             try:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 print(f"✅ Loaded scheduler state")
-            except:
-                print(f"⚠️  Could not load scheduler state")
+            except Exception as e:
+                print(f"⚠️  Could not load scheduler state: {e}")
         
         if cfg.use_swa and 'swa_model_state_dict' in checkpoint:
             try:
                 swa_model.load_state_dict(checkpoint['swa_model_state_dict'])
                 print(f"✅ Loaded SWA model state")
-            except:
-                print(f"⚠️  Could not load SWA model state")
+            except Exception as e:
+                print(f"⚠️  Could not load SWA model state: {e}")
+        
+        # Clear checkpoint from memory after loading
+        del checkpoint
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("🧹 Checkpoint cleared from memory\n")
     
     print(f"   LR: {cfg.base_lr:.2e}, Total steps: {total_steps}")
     print(f"   Loss weights: λ_reasoning: {cfg.lambda_reasoning_start}→{cfg.lambda_reasoning_end}, λ_answer: {cfg.lambda_answer_start}→{cfg.lambda_answer_end}")
