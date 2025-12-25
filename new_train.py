@@ -329,15 +329,15 @@ class VQATrainer:
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4,
-            pin_memory=True
+            num_workers=4,  # Reduced to save memory
+            pin_memory=True  # Disable to save memory
         )
         self.val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size * 2,
+            batch_size=batch_size,  # Same as train to avoid OOM
             shuffle=False,
-            num_workers=4,
-            pin_memory=True
+            num_workers=2,  # Reduced to save memory
+            pin_memory=False  # Disable to save memory
         )
         
         # Loss function
@@ -490,6 +490,10 @@ class VQATrainer:
                 
                 # Zero gradients
                 self.optimizer.zero_grad()
+                
+                # Clear CUDA cache periodically to avoid fragmentation
+                if self.global_step % 100 == 0:
+                    torch.cuda.empty_cache()
                 
                 self.global_step += 1
             
@@ -720,9 +724,9 @@ def main():
         # Resume training
         'resume_checkpoint': None,  # Path to checkpoint để resume, hoặc None
         
-        # Training
-        'batch_size': 16,
-        'gradient_accumulation_steps': 4,  # Effective batch = 64
+        # Training - OPTIMIZED FOR MEMORY (15GB GPU)
+        'batch_size': 4,  # Reduced from 16 to save memory
+        'gradient_accumulation_steps': 16,  # Increased to keep effective batch = 64
         'num_epochs': 20,
         'learning_rate': 5e-5,
         'weight_decay': 0.01,
@@ -778,6 +782,15 @@ def main():
         fusion='concat',  # Can try 'add' or 'cross_attention'
         use_reasoning_attention=True
     )
+    
+    # Enable gradient checkpointing to save memory
+    print("[INFO] Enabling gradient checkpointing to save memory...")
+    if hasattr(model.clip_model, 'gradient_checkpointing_enable'):
+        model.clip_model.gradient_checkpointing_enable()
+    if hasattr(model.text_encoder, 'gradient_checkpointing_enable'):
+        model.text_encoder.gradient_checkpointing_enable()
+    if hasattr(model.decoder_backbone, 'gradient_checkpointing_enable'):
+        model.decoder_backbone.gradient_checkpointing_enable()
     
     # Load full dataset
     print("[INFO] Loading full dataset...")
