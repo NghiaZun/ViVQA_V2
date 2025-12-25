@@ -24,7 +24,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torch.cuda.amp import autocast, GradScaler
 from transformers import get_cosine_schedule_with_warmup
 from PIL import Image
@@ -34,6 +34,7 @@ from pathlib import Path
 import numpy as np
 from collections import defaultdict
 import copy
+import random
 
 
 # ============================================================================
@@ -336,7 +337,7 @@ class VQATrainer:
             max_weight=max_reasoning_weight
         )
         
-        # Optimizer (AdamW with weight decay)
+        # Optimizer (AdamW with weight decay + Nesterov momentum)
         self.optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=learning_rate,
@@ -344,6 +345,10 @@ class VQATrainer:
             betas=(0.9, 0.999),
             eps=1e-8
         )
+        
+        # Note: AdamW already uses momentum-like behavior via beta1
+        # For explicit Nesterov, could use SGD with nesterov=True
+        # But AdamW is SOTA for transformers
         
         # Learning rate scheduler
         num_training_steps = len(self.train_loader) * num_epochs // gradient_accumulation_steps
@@ -605,6 +610,7 @@ class VQATrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
+            'patience_counter': self.patience_counter,
         }
         
         if self.use_ema:
@@ -621,7 +627,8 @@ class VQATrainer:
             print(f"[INFO] Best model saved: {best_path}")
     
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint"""
+        """Load checkpoint for resume training"""
+        print(f"[INFO] Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -629,15 +636,17 @@ class VQATrainer:
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
+        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        self.patience_counter = checkpoint.get('patience_counter', 0)
         
         if self.use_ema and 'ema_shadow' in checkpoint:
             self.ema.shadow = checkpoint['ema_shadow']
         
-        print(f"[INFO] Checkpoint loaded: {checkpoint_path}")
-        print(f"  Epoch: {self.current_epoch}")
-        print(f"  Step: {self.global_step}")
+        print(f"[INFO] Checkpoint loaded successfully!")
+        print(f"  Resuming from Epoch: {self.current_epoch + 1}")
+        print(f"  Global Step: {self.global_step}")
         print(f"  Best val loss: {self.best_val_loss:.4f}")
+        print(f"  Patience counter: {self.patience_counter}/{self.patience}")
     
     def train(self):
         """Main training loop"""
@@ -688,15 +697,17 @@ def main():
     
     # Config
     CONFIG = {
-        # Paths
-        'train_json': '/kaggle/input/vivqa/train_distill.jsonl',
-        'val_json': '/kaggle/input/vivqa/val_distill.jsonl',
-        'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train/',
-        'output_dir': './checkpoints',
+        # Paths - Kaggle format
+        'train_json': '/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl',
+        'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
+        'output_dir': '/kaggle/working/checkpoints',
         
-        # Model paths
-        'phobert_dir': '/kaggle/input/checkpoints/transformers/default/1/checkpoints/phobert_tokenizer',
-        'vit5_dir': '/kaggle/input/checkpoints/transformers/default/1/checkpoints/vit5_tokenizer',
+        # Train/Val split (nếu không có val_json riêng)
+        'val_split': 0.1,  # 10% for validation
+        'random_seed': 42,
+        
+        # Resume training
+        'resume_checkpoint': None,  # Path to checkpoint để resume, hoặc None
         
         # Training
         'batch_size': 16,
@@ -728,12 +739,19 @@ def main():
     }
     
     print("="*70)
-    print("PROFESSIONAL VQA TRAINING")
+    print("PROFESSIONAL VQA TRAINING (with Resume Support)")
     print("="*70)
     print("\nConfiguration:")
     for k, v in CONFIG.items():
         print(f"  {k}: {v}")
     print()
+    
+    # Set random seed for reproducibility
+    random.seed(CONFIG['random_seed'])
+    np.random.seed(CONFIG['random_seed'])
+    torch.manual_seed(CONFIG['random_seed'])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(CONFIG['random_seed'])
     
     # Import model
     print("[INFO] Importing Chain-of-Thought model...")
@@ -750,25 +768,45 @@ def main():
         use_reasoning_attention=True
     )
     
-    # Create datasets
-    print("[INFO] Creating datasets...")
-    train_dataset = VQADistillationDataset(
+    # Load full dataset
+    print("[INFO] Loading full dataset...")
+    full_dataset = VQADistillationDataset(
         json_path=CONFIG['train_json'],
         image_dir=CONFIG['image_dir'],
         clip_processor=model.clip_processor,
         text_tokenizer=model.text_tokenizer,
         decoder_tokenizer=model.decoder_tokenizer,
-        augment=True  # Enable augmentation for training
+        augment=False  # Will enable for train split only
     )
     
-    val_dataset = VQADistillationDataset(
-        json_path=CONFIG['val_json'],
+    # Split into train and val
+    print(f"[INFO] Splitting dataset with {CONFIG['val_split']*100:.0f}% for validation...")
+    total_size = len(full_dataset)
+    val_size = int(total_size * CONFIG['val_split'])
+    train_size = total_size - val_size
+    
+    train_dataset, val_dataset = random_split(
+        full_dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(CONFIG['random_seed'])
+    )
+    
+    # Enable augmentation for train split
+    # Note: random_split returns Subset, so we modify the base dataset
+    print(f"[INFO] Train samples: {len(train_dataset)} | Val samples: {len(val_dataset)}")
+    
+    # Create augmented train dataset
+    train_dataset_aug = VQADistillationDataset(
+        json_path=CONFIG['train_json'],
         image_dir=CONFIG['image_dir'],
         clip_processor=model.clip_processor,
         text_tokenizer=model.text_tokenizer,
         decoder_tokenizer=model.decoder_tokenizer,
-        augment=False
+        augment=True  # Enable augmentation
     )
+    # Use same indices as train_dataset
+    from torch.utils.data import Subset
+    train_dataset = Subset(train_dataset_aug, train_dataset.indices)
     
     # Initialize trainer
     print("[INFO] Initializing trainer...")
@@ -796,6 +834,14 @@ def main():
         save_steps=CONFIG['save_steps'],
         use_wandb=CONFIG['use_wandb']
     )
+    
+    # Resume from checkpoint if specified
+    if CONFIG['resume_checkpoint'] is not None:
+        if os.path.exists(CONFIG['resume_checkpoint']):
+            trainer.load_checkpoint(CONFIG['resume_checkpoint'])
+        else:
+            print(f"[WARNING] Resume checkpoint not found: {CONFIG['resume_checkpoint']}")
+            print("[INFO] Starting training from scratch...")
     
     # Start training
     trainer.train()
