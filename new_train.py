@@ -724,9 +724,9 @@ def main():
         # Resume training
         'resume_checkpoint': None,  # Path to checkpoint để resume, hoặc None
         
-        # Training - OPTIMIZED FOR MEMORY (15GB GPU)
-        'batch_size': 4,  # Reduced from 16 to save memory
-        'gradient_accumulation_steps': 16,  # Increased to keep effective batch = 64
+        # Training - EXTREME MEMORY OPTIMIZATION (15GB GPU)
+        'batch_size': 2,  # Further reduced to 2 to save memory
+        'gradient_accumulation_steps': 32,  # Increased to keep effective batch = 64
         'num_epochs': 20,
         'learning_rate': 5e-5,
         'weight_decay': 0.01,
@@ -740,7 +740,7 @@ def main():
         
         # Advanced features
         'use_amp': True,
-        'use_ema': True,
+        'use_ema': False,  # DISABLED - EMA uses too much memory (duplicate weights)
         'ema_decay': 0.999,
         
         # Early stopping
