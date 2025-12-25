@@ -96,11 +96,11 @@ class TwoStageTrainConfig:
     stage3_epochs: int = 30  # + Vision encoder last 2 layers
     
     # Two-stage loss weights (ENHANCED: Dynamic weighting)
-    # ⚠️ INCREASED: Force model to generate longer reasoning
-    lambda_reasoning_start: float = 1.5  # Start HIGHER to force reasoning quality
-    lambda_reasoning_end: float = 0.5    # End higher than before
-    lambda_answer_start: float = 1.5     # Lower to reduce answer focus early
-    lambda_answer_end: float = 3.0       # Still emphasize answer at end
+    # ⚠️ ADJUSTED: Epoch 14 lost format, need to re-balance!
+    lambda_reasoning_start: float = 0.8  # REDUCED from 1.5 - format more important than length!
+    lambda_reasoning_end: float = 0.3    # REDUCED from 0.5
+    lambda_answer_start: float = 2.5     # INCREASED from 1.5 - enforce delimiter!
+    lambda_answer_end: float = 4.0       # INCREASED from 3.0
     
     # Loss improvements (from Three-Stage)
     label_smoothing: float = 0.1  # Reduce overfitting
@@ -132,6 +132,9 @@ class TwoStageTrainConfig:
     # Early stopping
     es_patience: int = 15
     es_min_delta: float = 1e-4
+    
+    # Checkpoint saving
+    save_checkpoint_fp16: bool = False  # Save checkpoints in fp16 (half size, slight precision loss)
     
     # Logging
     log_csv: str = "train_log_two_stage.csv"
@@ -476,6 +479,29 @@ def set_training_stage(model, stage: int):
                             p.requires_grad = True
         except:
             pass
+
+def save_checkpoint_efficient(checkpoint, path, use_fp16=False):
+    """
+    Save checkpoint with optional memory optimization.
+    If use_fp16=True, converts state dicts to fp16 (half size).
+    """
+    if use_fp16:
+        # Convert model state dict to fp16
+        checkpoint_fp16 = {}
+        for key, value in checkpoint.items():
+            if key.endswith('_state_dict') and isinstance(value, dict):
+                # Convert tensors to fp16
+                checkpoint_fp16[key] = {
+                    k: v.half() if isinstance(v, torch.Tensor) and v.dtype == torch.float32 else v
+                    for k, v in value.items()
+                }
+            else:
+                checkpoint_fp16[key] = value
+        
+        torch.save(checkpoint_fp16, path)
+        print(f"💾 Saved checkpoint (FP16, ~50% smaller)")
+    else:
+        torch.save(checkpoint, path)
 
 def compute_loss(model, batch, device, criterion=None):
     """Compute loss"""
@@ -1051,13 +1077,23 @@ def train():
             'best_val_loss': best_val_loss,
             'es_counter': es_counter,
         }
-        if cfg.use_swa and swa_model is not None:
+        # Only save SWA state every 10 epochs to save disk space
+        if cfg.use_swa and swa_model is not None and ((epoch + 1) % 10 == 0 or epoch >= cfg.num_epochs - 5):
             checkpoint['swa_model_state_dict'] = swa_model.state_dict()
+            print("💾 Saved SWA model state (every 10 epochs)")
         
-        torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_two_stage.pt"))
+        save_checkpoint_efficient(
+            checkpoint, 
+            os.path.join(cfg.save_dir, "latest_checkpoint_two_stage.pt"),
+            use_fp16=cfg.save_checkpoint_fp16
+        )
         
         if (epoch + 1) % 10 == 0:
-            torch.save(checkpoint, os.path.join(cfg.save_dir, f"checkpoint_two_stage_epoch_{epoch+1}.pt"))
+            save_checkpoint_efficient(
+                checkpoint,
+                os.path.join(cfg.save_dir, f"checkpoint_two_stage_epoch_{epoch+1}.pt"),
+                use_fp16=cfg.save_checkpoint_fp16
+            )
         
         # Early stopping
         if es_counter >= cfg.es_patience:
