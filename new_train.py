@@ -746,10 +746,10 @@ def main():
         # Early stopping
         'patience': 5,
         
-        # Logging
-        'log_steps': 50,
-        'eval_steps': 500,
-        'save_steps': 1000,
+        # Logging - ADJUSTED FOR GRADIENT ACCUMULATION
+        'log_steps': 10,     # Log mỗi 10 accumulation steps (was 50)
+        'eval_steps': 0,     # DISABLE mid-epoch eval (too slow), only eval at epoch end
+        'save_steps': 0,     # DISABLE mid-epoch save (too slow), only save at epoch end
         'use_wandb': False,
     }
     
