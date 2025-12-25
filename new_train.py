@@ -615,8 +615,12 @@ class VQATrainer:
         return avg_loss, avg_losses
     
     def save_checkpoint(self, filename, is_best=False):
-        """Save model checkpoint"""
-        checkpoint_path = self.output_dir / filename
+        """Save model checkpoint - ONLY SAVE BEST to save disk space"""
+        if not is_best:
+            # Skip non-best checkpoints to save disk space (each ~2.5GB)
+            return
+        
+        checkpoint_path = self.output_dir / 'best_model.pt'  # Always overwrite
         
         checkpoint = {
             'epoch': self.current_epoch,
@@ -631,15 +635,16 @@ class VQATrainer:
         if self.use_ema:
             checkpoint['ema_shadow'] = self.ema.shadow
         
-        torch.save(checkpoint, checkpoint_path)
-        print(f"[INFO] Checkpoint saved: {checkpoint_path}")
+        # Save with atomic write to prevent corruption
+        temp_path = self.output_dir / 'best_model_temp.pt'
+        torch.save(checkpoint, temp_path)
         
-        if is_best:
-            self.best_model_path = checkpoint_path
-            # Also save as best.pt
-            best_path = self.output_dir / 'best_model.pt'
-            torch.save(checkpoint, best_path)
-            print(f"[INFO] Best model saved: {best_path}")
+        # Atomic rename
+        import shutil
+        shutil.move(str(temp_path), str(checkpoint_path))
+        
+        self.best_model_path = checkpoint_path
+        print(f"[INFO] ✓ Best model saved: {checkpoint_path} (Epoch {self.current_epoch+1}, Loss: {self.best_val_loss:.4f})")
     
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint for resume training"""
@@ -686,12 +691,12 @@ class VQATrainer:
             else:
                 self.patience_counter += 1
             
-            if self.patience_counter >= self.patience or should_stop:
+            if self.patience_counter >= self.patience:
                 print(f"\n[INFO] Early stopping at epoch {epoch+1}")
                 break
             
-            # Save epoch checkpoint
-            self.save_checkpoint(f'checkpoint_epoch_{epoch+1}.pt')
+            # Don't save every epoch checkpoint to save disk space
+            # Only best model is saved
         
         print("\n" + "="*70)
         print("TRAINING COMPLETE")
