@@ -173,18 +173,26 @@ class ChainOfThoughtLoss(nn.Module):
     def forward(self, outputs, answer_labels, reasoning_labels, reasoning_weight=1.0):
         """
         outputs: dict with 'reasoning_logits' and 'answer_logits'
-        answer_labels: teacher answer ids (ground truth)
-        reasoning_labels: teacher reasoning ids (explanation)
+        answer_labels: teacher answer ids (ground truth) - [batch_size, seq_len]
+        reasoning_labels: teacher reasoning ids (explanation) - [batch_size, seq_len]
         reasoning_weight: confidence score from teacher
+        
+        Note: Current model outputs [batch_size, vocab_size] for single token prediction
+        We take first token of labels for simplicity
         """
         total_loss = 0.0
         loss_dict = {}
         
         # 1. REASONING LOSS (priority - model phải học suy nghĩ trước)
         if 'reasoning_logits' in outputs and reasoning_labels is not None:
+            # Model output: [batch_size, vocab_size]
+            # Labels: [batch_size, seq_len] -> take first non-pad token
+            # Simple approach: take first token (index 0)
+            first_reasoning_token = reasoning_labels[:, 0]  # [batch_size]
+            
             reasoning_loss = self.ce_loss(
-                outputs['reasoning_logits'].view(-1, outputs['reasoning_logits'].size(-1)),
-                reasoning_labels.view(-1)
+                outputs['reasoning_logits'],  # [batch_size, vocab_size]
+                first_reasoning_token  # [batch_size]
             )
             total_loss += self.alpha_reasoning * reasoning_loss
             loss_dict['reasoning_loss'] = reasoning_loss.item()
@@ -194,9 +202,12 @@ class ChainOfThoughtLoss(nn.Module):
         
         # 2. ANSWER LOSS (based on reasoning context)
         if 'answer_logits' in outputs:
+            # Same approach: take first token of answer
+            first_answer_token = answer_labels[:, 0]  # [batch_size]
+            
             answer_loss = self.ce_loss(
-                outputs['answer_logits'].view(-1, outputs['answer_logits'].size(-1)),
-                answer_labels.view(-1)
+                outputs['answer_logits'],  # [batch_size, vocab_size]
+                first_answer_token  # [batch_size]
             )
             total_loss += self.alpha_answer * answer_loss
             loss_dict['answer_loss'] = answer_loss.item()
