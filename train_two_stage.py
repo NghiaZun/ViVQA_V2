@@ -91,10 +91,11 @@ class TwoStageTrainConfig:
     stage3_epochs: int = 30  # + Vision encoder last 2 layers
     
     # Two-stage loss weights (ENHANCED: Dynamic weighting)
-    lambda_reasoning_start: float = 0.5  # Start higher to learn structure
-    lambda_reasoning_end: float = 0.2    # End lower to focus answer
-    lambda_answer_start: float = 2.0     # Start moderate
-    lambda_answer_end: float = 4.0       # End higher to maximize answer accuracy
+    # ⚠️ INCREASED: Force model to generate longer reasoning
+    lambda_reasoning_start: float = 1.5  # Start HIGHER to force reasoning quality
+    lambda_reasoning_end: float = 0.5    # End higher than before
+    lambda_answer_start: float = 1.5     # Lower to reduce answer focus early
+    lambda_answer_end: float = 3.0       # Still emphasize answer at end
     
     # Loss improvements (from Three-Stage)
     label_smoothing: float = 0.1  # Reduce overfitting
@@ -120,8 +121,8 @@ class TwoStageTrainConfig:
     length_penalty: float = 1.2
     
     # Two-stage inference
-    two_stage_inference: bool = True  # Generate reasoning → answer separately
-    eval_with_gt_reasoning: bool = True  # Also eval with GT reasoning (upper bound)
+    two_stage_inference: bool = False  # DISABLED: Too slow, model stuck anyway
+    eval_with_gt_reasoning: bool = False  # Also eval with GT reasoning (upper bound)
     
     # Early stopping
     es_patience: int = 15
@@ -825,8 +826,32 @@ def train():
         avg_train_a_loss = train_answer_loss / len(train_loader)
         
         # ==================
-        # VALIDATION
+        # VALIDATION (Every 2 epochs to save time)
         # ==================
+        should_validate = (epoch + 1) % 2 == 0 or (epoch + 1) >= cfg.num_epochs - 5
+        
+        if not should_validate:
+            # Skip validation, just print training loss
+            print(f"\n[EPOCH {epoch+1}] Train Loss: {avg_train_loss:.4f} (R: {avg_train_r_loss:.4f}, A: {avg_train_a_loss:.4f}) | "
+                  f"Val: SKIPPED (saving time)")
+            
+            # Save checkpoint every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                checkpoint = {
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'best_val_loss': best_val_loss,
+                    'es_counter': es_counter,
+                }
+                if cfg.use_swa and swa_model is not None:
+                    checkpoint['swa_model_state_dict'] = swa_model.state_dict()
+                torch.save(checkpoint, os.path.join(cfg.save_dir, "latest_checkpoint_two_stage.pt"))
+            
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
         eval_model = swa_model if (cfg.use_swa and epoch >= cfg.swa_start_epoch) else model
         eval_model.eval()
         val_loss = 0
