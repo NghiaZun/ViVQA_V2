@@ -183,12 +183,19 @@ class ChainOfThoughtLoss(nn.Module):
             answer_labels.view(-1)
         )
         
-        # Quality loss: Penalize low confidence when should be high
+        # Quality loss: Calibrate confidence based on actual correctness
         quality_loss = 0.0
         if outputs.reasoning_confidence is not None:
-            # Target: confidence should be high (close to 1)
-            # Simple MSE loss to push confidence toward 1.0
-            target_confidence = torch.ones_like(outputs.reasoning_confidence)
+            # Compute accuracy for each sample (simplified: check if argmax matches)
+            reasoning_preds = reasoning_logits.argmax(dim=-1)
+            reasoning_correct = (reasoning_preds == reasoning_labels).float().mean(dim=1)  # [batch]
+            
+            # Target confidence = actual correctness
+            # If reasoning is correct, confidence should be high (1.0)
+            # If reasoning is wrong, confidence should be low (0.0)
+            target_confidence = reasoning_correct
+            
+            # Calibration loss: confidence should match correctness
             quality_loss = F.mse_loss(outputs.reasoning_confidence, target_confidence)
         
         # Total loss
