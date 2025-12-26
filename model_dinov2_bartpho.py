@@ -216,7 +216,7 @@ class DINOv2BARTphoVQA(nn.Module):
         dinov2_model_name='facebook/dinov2-base',  # 86M params
         bartpho_model_name='vinai/bartpho-syllable',  # 396M params (large variant)
         num_cross_attn_layers=3,  # SOTA: 3 layers
-        num_heads=12,
+        num_heads=16,  # 1024 dim ÷ 16 heads = 64 (BARTpho standard)
         dropout=0.1,
         use_reasoning_quality_check=True,
         gradient_checkpointing=True
@@ -567,6 +567,7 @@ if __name__ == '__main__':
         dinov2_model_name='facebook/dinov2-base',
         bartpho_model_name='vinai/bartpho-syllable',
         num_cross_attn_layers=3,
+        num_heads=16,  # Fixed: 1024 ÷ 16 = 64
         use_reasoning_quality_check=True,
         gradient_checkpointing=True
     )

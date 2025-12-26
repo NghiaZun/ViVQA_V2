@@ -656,6 +656,7 @@ def main():
         dinov2_model_name='facebook/dinov2-base',
         bartpho_model_name='vinai/bartpho-syllable',
         num_cross_attn_layers=3,
+        num_heads=16,  # Must be divisible: 1024 ÷ 16 = 64
         use_reasoning_quality_check=True,
         gradient_checkpointing=True
     )
