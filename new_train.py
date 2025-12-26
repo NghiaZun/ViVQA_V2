@@ -439,6 +439,7 @@ class VQATrainer:
                     pixel_values=batch['pixel_values'],
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
+                    reasoning_labels=batch.get('reasoning_labels'),  # CRITICAL: Pass reasoning labels
                     labels=batch['labels']
                 )
                 
@@ -578,6 +579,7 @@ class VQATrainer:
                     pixel_values=batch['pixel_values'],
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
+                    reasoning_labels=batch.get('reasoning_labels'),  # Pass reasoning labels for loss
                     labels=batch['labels']
                 )
                 

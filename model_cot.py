@@ -180,7 +180,11 @@ class ChainOfThoughtVQAModel(nn.Module):
         return_reasoning_hidden=False
     ):
         """
-        Forward pass using ViT5 decoder properly
+        TRUE SEQUENTIAL CHAIN-OF-THOUGHT Forward Pass
+        ==============================================
+        1. Decode reasoning first (conditioned on image+question)
+        2. Extract reasoning hidden states
+        3. Decode answer (conditioned on image+question+reasoning)
         
         Args:
             pixel_values: [B, 3, 224, 224]
@@ -202,38 +206,58 @@ class ChainOfThoughtVQAModel(nn.Module):
         encoder_hidden = self.encoder_projection(fused_embeds)  # [B, decoder_dim]
         encoder_hidden = encoder_hidden.unsqueeze(1)  # [B, 1, decoder_dim]
         
-        # 4. DECODE with ViT5 decoder (teacher forcing if labels provided)
-        # Reasoning generation (first)
+        # =====================================================================
+        # 4. STEP 1: DECODE REASONING (conditioned on image+question)
+        # =====================================================================
+        reasoning_hidden_states = None
         if reasoning_labels is not None:
-            # Training: use teacher forcing
+            # Training/Validation: use teacher forcing to compute loss
             reasoning_outputs = self.decoder_backbone(
                 decoder_input_ids=reasoning_labels,
                 encoder_outputs=(encoder_hidden,),
-                return_dict=True
+                return_dict=True,
+                output_hidden_states=True  # Get hidden states for answer conditioning
             )
             reasoning_logits = reasoning_outputs.logits  # [B, L_r, vocab_size]
+            
+            # Extract reasoning decoder's last hidden state
+            # Shape: [B, L_r, decoder_dim]
+            reasoning_hidden_states = reasoning_outputs.decoder_hidden_states[-1]
         else:
-            # Inference: no labels, just return None (use generate() instead)
+            # Pure inference (no labels): return None (use generate() instead)
             reasoning_logits = None
         
-        # Answer generation (second, based on reasoning)
+        # =====================================================================
+        # 5. STEP 2: DECODE ANSWER (conditioned on image+question+REASONING)
+        # =====================================================================
         if labels is not None:
-            # Training: use teacher forcing
+            # Combine encoder hidden with reasoning hidden states
+            if reasoning_hidden_states is not None:
+                # Concatenate encoder context with reasoning context
+                # encoder_hidden: [B, 1, decoder_dim]
+                # reasoning_hidden_states: [B, L_r, decoder_dim]
+                combined_encoder_hidden = torch.cat([encoder_hidden, reasoning_hidden_states], dim=1)
+                # Shape: [B, 1+L_r, decoder_dim]
+            else:
+                # Fallback: only use encoder hidden (when reasoning not available)
+                combined_encoder_hidden = encoder_hidden
+            
+            # Decode answer conditioned on combined context
             answer_outputs = self.decoder_backbone(
                 decoder_input_ids=labels,
-                encoder_outputs=(encoder_hidden,),
+                encoder_outputs=(combined_encoder_hidden,),
                 return_dict=True
             )
             answer_logits = answer_outputs.logits  # [B, L_a, vocab_size]
         else:
-            # Inference: no labels, just return None (use generate() instead)
+            # Pure inference (no labels): return None (use generate() instead)
             answer_logits = None
         
-        # 5. RETURN
+        # 6. RETURN
         output = CoTOutput(
             reasoning_logits=reasoning_logits,
             answer_logits=answer_logits,
-            reasoning_hidden=fused_embeds if return_reasoning_hidden else None
+            reasoning_hidden=reasoning_hidden_states if return_reasoning_hidden else None
         )
         
         return output
@@ -245,17 +269,24 @@ class ChainOfThoughtVQAModel(nn.Module):
         input_ids,
         attention_mask,
         max_length=32,
+        max_reasoning_length=128,
         num_beams=1,
         return_reasoning=False
     ):
         """
-        Generate answer with proper autoregressive decoding using ViT5 decoder
+        TRUE SEQUENTIAL CoT Generation (Inference)
+        ===========================================
+        1. Generate reasoning autoregressively
+        2. Encode reasoning output
+        3. Generate answer conditioned on reasoning
+        
+        This mimics how humans think: reasoning first, then answer.
         """
         self.eval()
         device = pixel_values.device
         batch_size = pixel_values.size(0)
         
-        # 1. Encode inputs
+        # 1. Encode inputs (image + question)
         image_embeds = self.encode_image(pixel_values)
         text_embeds = self.encode_text(input_ids, attention_mask)
         fused_embeds = self.fuse_features(image_embeds, text_embeds)
@@ -264,9 +295,43 @@ class ChainOfThoughtVQAModel(nn.Module):
         encoder_hidden = self.encoder_projection(fused_embeds)
         encoder_hidden = encoder_hidden.unsqueeze(1)  # [B, 1, decoder_dim]
         
-        # 3. Generate answer using ViT5 decoder
-        output_ids = self.decoder_backbone.generate(
+        # =====================================================================
+        # 3. STEP 1: Generate reasoning autoregressively
+        # =====================================================================
+        reasoning_ids = self.decoder_backbone.generate(
             inputs_embeds=encoder_hidden,
+            max_length=max_reasoning_length,
+            num_beams=num_beams,
+            early_stopping=True,
+            pad_token_id=self.decoder_tokenizer.pad_token_id,
+            eos_token_id=self.decoder_tokenizer.eos_token_id,
+        )
+        
+        # Decode reasoning text (for logging/debugging)
+        reasoning_text = self.decoder_tokenizer.decode(reasoning_ids[0], skip_special_tokens=True)
+        
+        # =====================================================================
+        # 4. STEP 2: Encode reasoning output to get hidden states
+        # =====================================================================
+        # Run decoder with generated reasoning to extract hidden states
+        reasoning_outputs = self.decoder_backbone(
+            decoder_input_ids=reasoning_ids,
+            encoder_outputs=(encoder_hidden,),
+            return_dict=True,
+            output_hidden_states=True
+        )
+        reasoning_hidden_states = reasoning_outputs.decoder_hidden_states[-1]  # [B, L_r, D]
+        
+        # =====================================================================
+        # 5. STEP 3: Generate answer conditioned on reasoning
+        # =====================================================================
+        # Combine encoder hidden with reasoning hidden states
+        combined_encoder_hidden = torch.cat([encoder_hidden, reasoning_hidden_states], dim=1)
+        # Shape: [B, 1+L_r, decoder_dim]
+        
+        # Generate answer using combined context
+        answer_ids = self.decoder_backbone.generate(
+            inputs_embeds=combined_encoder_hidden,
             max_length=max_length,
             num_beams=num_beams,
             early_stopping=True,
@@ -274,20 +339,10 @@ class ChainOfThoughtVQAModel(nn.Module):
             eos_token_id=self.decoder_tokenizer.eos_token_id,
         )
         
-        # 4. Decode
-        answer_text = self.decoder_tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        # 6. Decode answer text
+        answer_text = self.decoder_tokenizer.decode(answer_ids[0], skip_special_tokens=True)
         
         if return_reasoning:
-            # For reasoning, generate separately
-            reasoning_ids = self.decoder_backbone.generate(
-                inputs_embeds=encoder_hidden,
-                max_length=max_length * 2,  # Reasoning is longer
-                num_beams=num_beams,
-                early_stopping=True,
-                pad_token_id=self.decoder_tokenizer.pad_token_id,
-                eos_token_id=self.decoder_tokenizer.eos_token_id,
-            )
-            reasoning_text = self.decoder_tokenizer.decode(reasoning_ids[0], skip_special_tokens=True)
             return answer_text, reasoning_text
         
         return answer_text
