@@ -87,7 +87,7 @@ def main(args):
         text_encoder='vinai/phobert-base',
         decoder='VietAI/vit5-base',
         hidden_dim=768,
-        fusion='co_attention',  # SAME as training
+        fusion='concat',  # SAME as training (checkpoint was saved with 'concat')
         use_reasoning_attention=True  # SAME as training
     )
 

@@ -784,9 +784,51 @@ def main():
         text_encoder='vinai/phobert-base',
         decoder='VietAI/vit5-base',
         hidden_dim=768,
-        fusion='concat',  # Can try 'add' or 'cross_attention'
+        fusion='cross_attention',  # SOTA: Bidirectional cross-attention (better than concat)
         use_reasoning_attention=True
     )
+    
+    # ===== STAGED UNFREEZING STRATEGY =====
+    def freeze_encoder(encoder, name):
+        """Freeze all parameters of an encoder"""
+        for param in encoder.parameters():
+            param.requires_grad = False
+        print(f"[INFO] ✓ Frozen {name}")
+    
+    def unfreeze_last_n_layers(encoder, name, n_layers=2):
+        """Unfreeze last n layers of encoder"""
+        # For transformers, unfreeze last n layers
+        if hasattr(encoder, 'encoder') and hasattr(encoder.encoder, 'layer'):
+            # BERT-like (PhoBERT)
+            total_layers = len(encoder.encoder.layer)
+            for i, layer in enumerate(encoder.encoder.layer):
+                if i >= total_layers - n_layers:
+                    for param in layer.parameters():
+                        param.requires_grad = True
+            # Also unfreeze pooler if exists
+            if hasattr(encoder, 'pooler'):
+                for param in encoder.pooler.parameters():
+                    param.requires_grad = True
+            print(f"[INFO] ✓ Unfrozen last {n_layers} layers of {name}")
+        elif hasattr(encoder, 'vision_model'):
+            # CLIP vision model
+            if hasattr(encoder.vision_model, 'encoder') and hasattr(encoder.vision_model.encoder, 'layers'):
+                total_layers = len(encoder.vision_model.encoder.layers)
+                for i, layer in enumerate(encoder.vision_model.encoder.layers):
+                    if i >= total_layers - n_layers:
+                        for param in layer.parameters():
+                            param.requires_grad = True
+                # Unfreeze post_layernorm and projection
+                if hasattr(encoder, 'visual_projection'):
+                    for param in encoder.visual_projection.parameters():
+                        param.requires_grad = True
+                print(f"[INFO] ✓ Unfrozen last {n_layers} layers of {name}")
+    
+    # Stage 1: Freeze ALL encoders (only train fusion + heads)
+    print("\n[STAGE 1] Freezing all encoders, training fusion + heads only...")
+    freeze_encoder(model.clip_model, "CLIP")
+    freeze_encoder(model.text_encoder, "PhoBERT")
+    # Decoder frozen by default (we only use it as vocabulary reference)
     
     # Enable gradient checkpointing to save memory
     print("[INFO] Enabling gradient checkpointing to save memory...")
@@ -837,16 +879,25 @@ def main():
     from torch.utils.data import Subset
     train_dataset = Subset(train_dataset_aug, train_dataset.indices)
     
-    # Initialize trainer
-    print("[INFO] Initializing trainer...")
-    trainer = VQATrainer(
+    # ===== STAGED TRAINING =====
+    print("\n" + "="*70)
+    print("STAGED UNFREEZING TRAINING STRATEGY")
+    print("="*70)
+    print("Stage 1: Train fusion + heads only (5 epochs)")
+    print("Stage 2: Unfreeze PhoBERT last 2 layers (5 epochs)")
+    print("Stage 3: Unfreeze CLIP last 2 layers (remaining epochs)")
+    print("="*70 + "\n")
+    
+    # === STAGE 1: Fusion + Heads only ===
+    print("\n[STAGE 1/3] Training fusion + heads (encoders frozen)...")
+    trainer_stage1 = VQATrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         output_dir=CONFIG['output_dir'],
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=CONFIG['num_epochs'],
+        num_epochs=5,  # Stage 1: 5 epochs
         learning_rate=CONFIG['learning_rate'],
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
@@ -863,17 +914,76 @@ def main():
         save_steps=CONFIG['save_steps'],
         use_wandb=CONFIG['use_wandb']
     )
+    trainer_stage1.train()
     
-    # Resume from checkpoint if specified
-    if CONFIG['resume_checkpoint'] is not None:
-        if os.path.exists(CONFIG['resume_checkpoint']):
-            trainer.load_checkpoint(CONFIG['resume_checkpoint'])
-        else:
-            print(f"[WARNING] Resume checkpoint not found: {CONFIG['resume_checkpoint']}")
-            print("[INFO] Starting training from scratch...")
+    # === STAGE 2: Unfreeze PhoBERT last layers ===
+    print("\n[STAGE 2/3] Unfreezing PhoBERT last 2 layers...")
+    unfreeze_last_n_layers(model.text_encoder, "PhoBERT", n_layers=2)
     
-    # Start training
-    trainer.train()
+    trainer_stage2 = VQATrainer(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        output_dir=CONFIG['output_dir'],
+        batch_size=CONFIG['batch_size'],
+        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
+        num_epochs=5,  # Stage 2: 5 epochs
+        learning_rate=CONFIG['learning_rate'] * 0.5,  # Lower LR for fine-tuning
+        weight_decay=CONFIG['weight_decay'],
+        warmup_ratio=CONFIG['warmup_ratio'],
+        max_grad_norm=CONFIG['max_grad_norm'],
+        alpha_reasoning=CONFIG['alpha_reasoning'],
+        alpha_answer=CONFIG['alpha_answer'],
+        label_smoothing=CONFIG['label_smoothing'],
+        use_amp=CONFIG['use_amp'],
+        use_ema=CONFIG['use_ema'],
+        ema_decay=CONFIG['ema_decay'],
+        patience=CONFIG['patience'],
+        log_steps=CONFIG['log_steps'],
+        eval_steps=CONFIG['eval_steps'],
+        save_steps=CONFIG['save_steps'],
+        use_wandb=CONFIG['use_wandb']
+    )
+    # Load best from stage 1
+    stage1_best = os.path.join(CONFIG['output_dir'], 'best_model.pt')
+    if os.path.exists(stage1_best):
+        trainer_stage2.load_checkpoint(stage1_best)
+    trainer_stage2.train()
+    
+    # === STAGE 3: Unfreeze CLIP last layers ===
+    print("\n[STAGE 3/3] Unfreezing CLIP last 2 layers...")
+    unfreeze_last_n_layers(model.clip_model, "CLIP", n_layers=2)
+    
+    remaining_epochs = CONFIG['num_epochs'] - 10  # Remaining after stage 1+2
+    trainer_stage3 = VQATrainer(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        output_dir=CONFIG['output_dir'],
+        batch_size=CONFIG['batch_size'],
+        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
+        num_epochs=remaining_epochs,  # Stage 3: rest of epochs
+        learning_rate=CONFIG['learning_rate'] * 0.3,  # Even lower LR
+        weight_decay=CONFIG['weight_decay'],
+        warmup_ratio=CONFIG['warmup_ratio'],
+        max_grad_norm=CONFIG['max_grad_norm'],
+        alpha_reasoning=CONFIG['alpha_reasoning'],
+        alpha_answer=CONFIG['alpha_answer'],
+        label_smoothing=CONFIG['label_smoothing'],
+        use_amp=CONFIG['use_amp'],
+        use_ema=CONFIG['use_ema'],
+        ema_decay=CONFIG['ema_decay'],
+        patience=CONFIG['patience'],
+        log_steps=CONFIG['log_steps'],
+        eval_steps=CONFIG['eval_steps'],
+        save_steps=CONFIG['save_steps'],
+        use_wandb=CONFIG['use_wandb']
+    )
+    # Load best from stage 2
+    stage2_best = os.path.join(CONFIG['output_dir'], 'best_model.pt')
+    if os.path.exists(stage2_best):
+        trainer_stage3.load_checkpoint(stage2_best)
+    trainer_stage3.train()
     
     print("\n[INFO] Training completed successfully!")
 
