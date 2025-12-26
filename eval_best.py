@@ -196,10 +196,16 @@ def main(args):
                 rougel_list.append(rougel)
                 
                 total += 1
+                
+                # Decode question (handle batch dimension)
+                question_ids = item['input_ids']
+                if question_ids.dim() > 1:
+                    question_ids = question_ids[0]
+                question_text = model.text_tokenizer.decode(question_ids.tolist(), skip_special_tokens=True)
 
                 writer.writerow({
-                    'img_id': item.get('img_id', [''])[0],
-                    'question': model.text_tokenizer.decode(item['input_ids'].tolist() if isinstance(item['input_ids'], torch.Tensor) else item['input_ids'][0], skip_special_tokens=True),
+                    'img_id': item.get('img_id', [''])[0] if isinstance(item.get('img_id'), list) else item.get('img_id', ''),
+                    'question': question_text,
                     'pred_answer': answer_text,
                     'gt_answer': gt_answer,
                     'pred_reasoning': '',
