@@ -166,9 +166,16 @@ def main(args):
                     answer_ids = torch.argmax(out.answer_logits, dim=-1)
                     answer_text = model.decoder_tokenizer.decode(answer_ids[0], skip_special_tokens=True)
 
-                # Decode GT answers
-                gt_answer = model.decoder_tokenizer.decode(item['labels'].tolist(), skip_special_tokens=True)
-                gt_reasoning = model.decoder_tokenizer.decode(item.get('reasoning_labels', item['labels']).tolist(), skip_special_tokens=True)
+                # Decode GT answers (handle batch dimension)
+                labels = item['labels']
+                if labels.dim() > 1:
+                    labels = labels[0]  # Take first item if batched
+                gt_answer = model.decoder_tokenizer.decode(labels.tolist(), skip_special_tokens=True)
+                
+                reasoning_labels = item.get('reasoning_labels', item['labels'])
+                if reasoning_labels.dim() > 1:
+                    reasoning_labels = reasoning_labels[0]
+                gt_reasoning = model.decoder_tokenizer.decode(reasoning_labels.tolist(), skip_special_tokens=True)
 
                 pred_norm = normalize_text(answer_text)
                 gt_norm = normalize_text(gt_answer)
