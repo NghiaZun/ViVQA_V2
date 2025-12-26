@@ -110,9 +110,10 @@ class VQADistillationDataset(Dataset):
             return_tensors='pt'
         )
         
-        # Tokenize answer
+        # Tokenize answer (handle different field names)
+        answer_text = item.get('answer', item.get('predicted_answer', item.get('final_answer', '')))
         answer_enc = self.tokenizer(
-            item['answer'],
+            answer_text,
             max_length=self.max_answer_len,
             padding='max_length',
             truncation=True,
