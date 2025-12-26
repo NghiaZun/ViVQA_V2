@@ -173,47 +173,51 @@ class ChainOfThoughtLoss(nn.Module):
     def forward(self, outputs, answer_labels, reasoning_labels, reasoning_weight=1.0):
         """
         outputs: dict with 'reasoning_logits' and 'answer_logits'
-        answer_labels: teacher answer ids (ground truth) - [batch_size, seq_len]
-        reasoning_labels: teacher reasoning ids (explanation) - [batch_size, seq_len]
+        answer_labels: teacher answer ids - [batch_size, seq_len]
+        reasoning_labels: teacher reasoning ids - [batch_size, seq_len]
         reasoning_weight: confidence score from teacher
         
-        Note: Current model outputs [batch_size, vocab_size] for single token prediction
-        We take first token of labels for simplicity
+        NEW: Model outputs [batch_size, seq_len, vocab_size] from ViT5 decoder
         """
         total_loss = 0.0
         loss_dict = {}
         
-        # 1. REASONING LOSS (priority - model phải học suy nghĩ trước)
-        if 'reasoning_logits' in outputs and reasoning_labels is not None:
-            # Model output: [batch_size, vocab_size]
-            # Labels: [batch_size, seq_len] -> take first non-pad token
-            # Simple approach: take first token (index 0)
-            first_reasoning_token = reasoning_labels[:, 0]  # [batch_size]
+        # 1. REASONING LOSS (priority - model must learn to think first)
+        if 'reasoning_logits' in outputs and reasoning_labels is not None and outputs['reasoning_logits'] is not None:
+            reasoning_logits = outputs['reasoning_logits']  # [B, L_r, vocab_size]
             
+            # Shift for teacher forcing: predict next token
+            # Flatten for CrossEntropyLoss
+            shift_logits = reasoning_logits[:, :-1, :].contiguous()  # [B, L-1, V]
+            shift_labels = reasoning_labels[:, 1:].contiguous()  # [B, L-1]
+            
+            # Reshape for loss computation
             reasoning_loss = self.ce_loss(
-                outputs['reasoning_logits'],  # [batch_size, vocab_size]
-                first_reasoning_token  # [batch_size]
+                shift_logits.view(-1, shift_logits.size(-1)),  # [B*(L-1), V]
+                shift_labels.view(-1)  # [B*(L-1)]
             )
             total_loss += self.alpha_reasoning * reasoning_loss
             loss_dict['reasoning_loss'] = reasoning_loss.item()
         else:
-            # Fallback nếu model chưa có reasoning head
             loss_dict['reasoning_loss'] = 0.0
         
         # 2. ANSWER LOSS (based on reasoning context)
-        if 'answer_logits' in outputs:
-            # Same approach: take first token of answer
-            first_answer_token = answer_labels[:, 0]  # [batch_size]
+        if 'answer_logits' in outputs and outputs['answer_logits'] is not None:
+            answer_logits = outputs['answer_logits']  # [B, L_a, vocab_size]
             
+            # Shift for teacher forcing
+            shift_logits = answer_logits[:, :-1, :].contiguous()  # [B, L-1, V]
+            shift_labels = answer_labels[:, 1:].contiguous()  # [B, L-1]
+            
+            # Reshape for loss computation
             answer_loss = self.ce_loss(
-                outputs['answer_logits'],  # [batch_size, vocab_size]
-                first_answer_token  # [batch_size]
+                shift_logits.view(-1, shift_logits.size(-1)),  # [B*(L-1), V]
+                shift_labels.view(-1)  # [B*(L-1)]
             )
             total_loss += self.alpha_answer * answer_loss
             loss_dict['answer_loss'] = answer_loss.item()
         
         # 3. Weight by teacher confidence
-        # Reasoning_weight cao = teacher confident = tăng weight cho sample này
         confidence_scale = reasoning_weight / self.max_weight
         weighted_loss = total_loss * confidence_scale
         

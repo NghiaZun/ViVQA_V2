@@ -103,59 +103,13 @@ class ChainOfThoughtVQAModel(nn.Module):
             )
             self.fusion_norm = nn.LayerNorm(hidden_dim)
         
-        # 4. REASONING HEAD (First - think first!)
-        # Split into feature extraction + prediction
-        self.reasoning_feature_extractor = nn.Sequential(
+        # 4. ENCODER PROJECTION (project fused features to decoder dim)
+        self.encoder_projection = nn.Sequential(
             nn.Linear(hidden_dim, self.decoder_dim),
             nn.LayerNorm(self.decoder_dim),
-            nn.GELU(),  # GELU is SOTA (better than ReLU)
+            nn.GELU(),
             nn.Dropout(dropout)
         )
-        self.reasoning_predictor = nn.Linear(self.decoder_dim, self.decoder_tokenizer.vocab_size)
-        
-        # 5. ANSWER HEAD (Second - answer based on reasoning)
-        self.use_reasoning_attention = use_reasoning_attention
-        
-        if use_reasoning_attention:
-            # SOTA: Gated Cross-Attention (Flamingo-style)
-            # Answer query projection
-            self.answer_query_proj = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU()
-            )
-            
-            # Cross-attention: Answer attends to reasoning features
-            self.reasoning_cross_attention = nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=8,
-                dropout=dropout,
-                batch_first=True
-            )
-            
-            # Gating mechanism (SOTA feature)
-            self.gate_proj = nn.Linear(hidden_dim, hidden_dim)
-            
-            # Layer norm after attention
-            self.cross_attn_norm = nn.LayerNorm(hidden_dim)
-            
-            # Answer head
-            self.answer_head = nn.Sequential(
-                nn.Linear(hidden_dim, self.decoder_dim),
-                nn.LayerNorm(self.decoder_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(self.decoder_dim, self.decoder_tokenizer.vocab_size)
-            )
-        else:
-            # Simple answer head
-            self.answer_head = nn.Sequential(
-                nn.Linear(hidden_dim, self.decoder_dim),
-                nn.LayerNorm(self.decoder_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(self.decoder_dim, self.decoder_tokenizer.vocab_size)
-            )
         
         print(f"[INFO] Model initialized with {self.count_parameters():,} parameters")
     
@@ -226,65 +180,54 @@ class ChainOfThoughtVQAModel(nn.Module):
         return_reasoning_hidden=False
     ):
         """
-        Forward pass: Image + Question → Reasoning → Answer
+        Forward pass using ViT5 decoder properly
         
         Args:
             pixel_values: [B, 3, 224, 224]
-            input_ids: [B, L]
+            input_ids: [B, L] - question tokens
             attention_mask: [B, L]
-            reasoning_labels: [B, L_r] (optional, for training)
-            labels: [B, L_a] (optional, for training)
-            return_reasoning_hidden: Return reasoning hidden states
+            reasoning_labels: [B, L_r] - reasoning target (optional for training)
+            labels: [B, L_a] - answer target (optional for training)
         """
         batch_size = pixel_values.size(0)
         
-        # 1. ENCODE
+        # 1. ENCODE: Image + Text
         image_embeds = self.encode_image(pixel_values)  # [B, 512]
         text_embeds = self.encode_text(input_ids, attention_mask)  # [B, 768]
         
-        # 2. FUSE
+        # 2. FUSE: Combine vision and language
         fused_embeds = self.fuse_features(image_embeds, text_embeds)  # [B, hidden_dim]
         
-        # 3. REASONING HEAD (Think first!)
-        # Extract reasoning features (intermediate representation)
-        reasoning_features = self.reasoning_feature_extractor(fused_embeds)  # [B, decoder_dim]
-        reasoning_logits = self.reasoning_predictor(reasoning_features)  # [B, vocab_size]
+        # 3. PROJECT: to decoder dimension
+        encoder_hidden = self.encoder_projection(fused_embeds)  # [B, decoder_dim]
+        encoder_hidden = encoder_hidden.unsqueeze(1)  # [B, 1, decoder_dim]
         
-        # 4. ANSWER HEAD (Answer based on reasoning)
-        if self.use_reasoning_attention:
-            # SOTA Gated Cross-Attention approach
-            
-            # Step 1: Project answer query
-            answer_query = self.answer_query_proj(fused_embeds)  # [B, hidden_dim]
-            
-            # Step 2: Prepare for cross-attention
-            # Query: what answer wants to know [B, 1, hidden_dim]
-            # Key/Value: reasoning features [B, 1, hidden_dim]
-            answer_query_seq = answer_query.unsqueeze(1)  
-            
-            # Project reasoning features back to hidden_dim for attention
-            reasoning_key_value = fused_embeds.unsqueeze(1)  # Use original fused as key/value
-            # Note: Could also use reasoning_features projected back to hidden_dim
-            
-            # Step 3: Cross-attention (answer attends to reasoning context)
-            cross_attended, attn_weights = self.reasoning_cross_attention(
-                query=answer_query_seq,
-                key=reasoning_key_value,
-                value=reasoning_key_value
+        # 4. DECODE with ViT5 decoder (teacher forcing if labels provided)
+        # Reasoning generation (first)
+        if reasoning_labels is not None:
+            # Training: use teacher forcing
+            reasoning_outputs = self.decoder_backbone(
+                decoder_input_ids=reasoning_labels,
+                encoder_outputs=(encoder_hidden,),
+                return_dict=True
             )
-            cross_attended = cross_attended.squeeze(1)  # [B, hidden_dim]
-            
-            # Step 4: Gated residual connection (Flamingo-style)
-            gate = torch.sigmoid(self.gate_proj(answer_query))  # [B, hidden_dim]
-            gated_output = answer_query + gate * cross_attended  # Gated fusion
-            
-            # Step 5: Layer norm (stabilize)
-            gated_output = self.cross_attn_norm(gated_output)
-            
-            # Step 6: Generate answer
-            answer_logits = self.answer_head(gated_output)
+            reasoning_logits = reasoning_outputs.logits  # [B, L_r, vocab_size]
         else:
-            answer_logits = self.answer_head(fused_embeds)
+            # Inference: no labels, just return None (use generate() instead)
+            reasoning_logits = None
+        
+        # Answer generation (second, based on reasoning)
+        if labels is not None:
+            # Training: use teacher forcing
+            answer_outputs = self.decoder_backbone(
+                decoder_input_ids=labels,
+                encoder_outputs=(encoder_hidden,),
+                return_dict=True
+            )
+            answer_logits = answer_outputs.logits  # [B, L_a, vocab_size]
+        else:
+            # Inference: no labels, just return None (use generate() instead)
+            answer_logits = None
         
         # 5. RETURN
         output = CoTOutput(
@@ -302,28 +245,48 @@ class ChainOfThoughtVQAModel(nn.Module):
         input_ids,
         attention_mask,
         max_length=32,
-        num_beams=4,
+        num_beams=1,
         return_reasoning=False
     ):
         """
-        Generate answer (and optionally reasoning) for inference
+        Generate answer with proper autoregressive decoding using ViT5 decoder
         """
         self.eval()
+        device = pixel_values.device
+        batch_size = pixel_values.size(0)
         
-        # Forward pass
-        outputs = self.forward(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask
+        # 1. Encode inputs
+        image_embeds = self.encode_image(pixel_values)
+        text_embeds = self.encode_text(input_ids, attention_mask)
+        fused_embeds = self.fuse_features(image_embeds, text_embeds)
+        
+        # 2. Project to decoder dimension
+        encoder_hidden = self.encoder_projection(fused_embeds)
+        encoder_hidden = encoder_hidden.unsqueeze(1)  # [B, 1, decoder_dim]
+        
+        # 3. Generate answer using ViT5 decoder
+        output_ids = self.decoder_backbone.generate(
+            inputs_embeds=encoder_hidden,
+            max_length=max_length,
+            num_beams=num_beams,
+            early_stopping=True,
+            pad_token_id=self.decoder_tokenizer.pad_token_id,
+            eos_token_id=self.decoder_tokenizer.eos_token_id,
         )
         
-        # Decode answer
-        answer_ids = torch.argmax(outputs.answer_logits, dim=-1)
-        answer_text = self.decoder_tokenizer.decode(answer_ids[0], skip_special_tokens=True)
+        # 4. Decode
+        answer_text = self.decoder_tokenizer.decode(output_ids[0], skip_special_tokens=True)
         
         if return_reasoning:
-            # Decode reasoning
-            reasoning_ids = torch.argmax(outputs.reasoning_logits, dim=-1)
+            # For reasoning, generate separately
+            reasoning_ids = self.decoder_backbone.generate(
+                inputs_embeds=encoder_hidden,
+                max_length=max_length * 2,  # Reasoning is longer
+                num_beams=num_beams,
+                early_stopping=True,
+                pad_token_id=self.decoder_tokenizer.pad_token_id,
+                eos_token_id=self.decoder_tokenizer.eos_token_id,
+            )
             reasoning_text = self.decoder_tokenizer.decode(reasoning_ids[0], skip_special_tokens=True)
             return answer_text, reasoning_text
         

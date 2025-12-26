@@ -157,14 +157,24 @@ def main(args):
                 input_ids = item['input_ids'].unsqueeze(0).to(device) if item['input_ids'].dim()==1 else item['input_ids'].to(device)
                 attention_mask = item['attention_mask'].unsqueeze(0).to(device) if item['attention_mask'].dim()==1 else item['attention_mask'].to(device)
 
-                # Use model.generate_answer for greedy decode
+                # Use model.generate_answer for greedy decode (with reasoning)
                 try:
-                    answer_text = model.generate_answer(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask, return_reasoning=False)
-                except Exception:
+                    answer_text, reasoning_text = model.generate_answer(
+                        pixel_values=pixel_values, 
+                        input_ids=input_ids, 
+                        attention_mask=attention_mask, 
+                        return_reasoning=True  # Generate both answer and reasoning
+                    )
+                except Exception as e:
                     # Fallback: forward and argmax
+                    print(f"Warning: generate failed ({e}), using fallback")
                     out = model(pixel_values=pixel_values, input_ids=input_ids, attention_mask=attention_mask)
-                    answer_ids = torch.argmax(out.answer_logits, dim=-1)
-                    answer_text = model.decoder_tokenizer.decode(answer_ids[0], skip_special_tokens=True)
+                    if out.answer_logits is not None:
+                        answer_ids = torch.argmax(out.answer_logits, dim=-1)
+                        answer_text = model.decoder_tokenizer.decode(answer_ids[0], skip_special_tokens=True)
+                    else:
+                        answer_text = ""
+                    reasoning_text = ""
 
                 # Decode GT answers (handle batch dimension)
                 labels = item['labels']
@@ -208,7 +218,7 @@ def main(args):
                     'question': question_text,
                     'pred_answer': answer_text,
                     'gt_answer': gt_answer,
-                    'pred_reasoning': '',
+                    'pred_reasoning': reasoning_text,  # Now includes model's reasoning
                     'gt_reasoning': gt_reasoning
                 })
 
