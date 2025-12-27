@@ -76,28 +76,28 @@ def evaluate_model(
                 rougel = 2 * r_lcs * p_lcs / (r_lcs + p_lcs)
         return rouge1, rougel
 
-        results = []
-        print("[INFO] Generating predictions...")
-        with torch.no_grad():
-            for batch in tqdm(test_loader):
-                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-                reasoning_text, answer_text, _ = model.generate(
-                    pixel_values=batch['pixel_values'],
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    max_reasoning_len=128,
-                    max_answer_len=32,
-                    num_beams=4
-                )
-                for i in range(len(answer_text)):
-                    results.append({
-                        'image_id': batch['image_id'][i] if isinstance(batch['image_id'], list) else batch['image_id'],
-                        'question': batch['question'][i] if isinstance(batch['question'], list) else batch['question'],
-                        'pred_answer': answer_text[i],
-                        'pred_reasoning': reasoning_text[i]
-                    })
-        stats = {'total_samples': len(results)}
-        return results, stats
+    results = []
+    print("[INFO] Generating predictions...")
+    with torch.no_grad():
+        for batch in tqdm(test_loader):
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            reasoning_text, answer_text, _ = model.generate(
+                pixel_values=batch['pixel_values'],
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask'],
+                max_reasoning_len=128,
+                max_answer_len=32,
+                num_beams=4
+            )
+            for i in range(len(answer_text)):
+                results.append({
+                    'image_id': batch['image_id'][i] if isinstance(batch['image_id'], list) else batch['image_id'],
+                    'question': batch['question'][i] if isinstance(batch['question'], list) else batch['question'],
+                    'pred_answer': answer_text[i],
+                    'pred_reasoning': reasoning_text[i]
+                })
+    stats = {'total_samples': len(results)}
+    return results, stats
 
 
 def main():
