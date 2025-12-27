@@ -150,8 +150,10 @@ def main():
 
         def __getitem__(self, idx):
             item = self.samples[idx]
-            img_path = item['image'] if 'image' in item else item['image_path']
-            img_path = img_path.split('/')[-1]
+            # Lấy img_id làm image_id, và lấy question đúng trường
+            img_id = item['img_id']
+            # Nếu file ảnh là img_id.jpg/png, sửa lại tên file cho đúng
+            img_path = f"{img_id}.jpg"
             full_img_path = f"{self.image_dir}/{img_path}"
             from PIL import Image
             image = Image.open(full_img_path).convert('RGB')
@@ -168,7 +170,7 @@ def main():
                 'pixel_values': pixel_values,
                 'input_ids': question_enc['input_ids'][0],
                 'attention_mask': question_enc['attention_mask'][0],
-                'image_id': item.get('image', item.get('image_path', '')),
+                'image_id': img_id,
                 'question': question
             }
 
