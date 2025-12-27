@@ -14,6 +14,7 @@ Target: 70%+ accuracy trên ViVQA
 
 import os
 import json
+import csv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -258,6 +259,7 @@ class VQATrainer:
         save_steps=0,
         use_wandb=False,
         resume_checkpoint=None,  # Path to checkpoint for resume
+        load_optimizer=True,  # Whether to load optimizer state (False for stage transition)
         stage_name="main"  # Training stage name
     ):
         self.model = model
@@ -338,9 +340,13 @@ class VQATrainer:
         self.patience_counter = 0
         self.best_model_path = self.output_dir / f'best_model_{stage_name}.pt'
         
+        # CSV logger for metrics tracking
+        self.csv_log_path = self.output_dir / f'training_log_{stage_name}.csv'
+        self.init_csv_logger()
+        
         # Resume từ checkpoint nếu có
         if resume_checkpoint:
-            self.load_checkpoint(resume_checkpoint)
+            self.load_checkpoint(resume_checkpoint, load_optimizer=load_optimizer)
         
         print(f"\n[INFO] Trainer initialized for stage: {stage_name}")
         print(f"  Effective batch size: {batch_size * gradient_accumulation_steps}")
@@ -348,6 +354,61 @@ class VQATrainer:
         print(f"  Warmup steps: {num_warmup_steps}")
         if resume_checkpoint:
             print(f"  Resumed from epoch {self.current_epoch}")
+    
+    def init_csv_logger(self):
+        """Initialize CSV logger for tracking metrics"""
+        # Check if file exists and has content (resume case)
+        if self.csv_log_path.exists() and self.current_epoch > 0:
+            print(f"[INFO] Resuming CSV logging to {self.csv_log_path}")
+            return
+        
+        # Create new CSV with headers
+        with open(self.csv_log_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'epoch',
+                'train_loss',
+                'train_reasoning_loss',
+                'train_answer_loss',
+                'train_quality_loss',
+                'train_confidence_scale',
+                'val_loss',
+                'val_reasoning_loss',
+                'val_answer_loss',
+                'val_quality_loss',
+                'val_confidence_scale',
+                'val_reasoning_conf_mean',
+                'val_reasoning_conf_std',
+                'learning_rate',
+                'patience_counter',
+                'is_best'
+            ])
+        print(f"[INFO] CSV logging initialized: {self.csv_log_path}")
+    
+    def log_to_csv(self, epoch, train_components, val_components, is_best):
+        """Log epoch metrics to CSV"""
+        current_lr = self.scheduler.get_last_lr()[0]
+        
+        with open(self.csv_log_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                epoch + 1,
+                train_components.get('total_loss', 0),
+                train_components.get('reasoning_loss', 0),
+                train_components.get('answer_loss', 0),
+                train_components.get('quality_loss', 0),
+                train_components.get('confidence_scale', 0),
+                val_components.get('total_loss', 0),
+                val_components.get('reasoning_loss', 0),
+                val_components.get('answer_loss', 0),
+                val_components.get('quality_loss', 0),
+                val_components.get('confidence_scale', 0),
+                val_components.get('reasoning_confidence_mean', 0),
+                val_components.get('reasoning_confidence_std', 0),
+                f"{current_lr:.2e}",
+                self.patience_counter,
+                1 if is_best else 0
+            ])
     
     def save_checkpoint(self, epoch, val_loss, is_best=False):
         """Save full training state for resume"""
@@ -374,26 +435,49 @@ class VQATrainer:
         latest_path = self.output_dir / f'checkpoint_{self.stage_name}_latest.pt'
         torch.save(checkpoint, latest_path)
     
-    def load_checkpoint(self, checkpoint_path):
-        """Load full training state for resume"""
+    def load_checkpoint(self, checkpoint_path, load_optimizer=True):
+        """Load training state for resume
+        
+        Args:
+            checkpoint_path: Path to checkpoint file
+            load_optimizer: If False, only load model weights (for stage transition)
+                          If True, load full state including optimizer (for same-stage resume)
+        """
         print(f"[INFO] Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
+        # Always load model weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print(f"[INFO] ✓ Model weights loaded")
         
-        self.current_epoch = checkpoint['epoch'] + 1  # Start from next epoch
-        self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.patience_counter = checkpoint.get('patience_counter', 0)
-        
-        if self.scaler and 'scaler_state_dict' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
-        print(f"[INFO] ✓ Checkpoint loaded. Resuming from epoch {self.current_epoch}")
-        print(f"[INFO]   Best val loss: {self.best_val_loss:.4f}")
-        print(f"[INFO]   Global step: {self.global_step}")
+        if load_optimizer:
+            # Load optimizer state (for same-stage resume)
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+                self.current_epoch = checkpoint['epoch'] + 1  # Start from next epoch
+                self.global_step = checkpoint['global_step']
+                self.best_val_loss = checkpoint['best_val_loss']
+                self.patience_counter = checkpoint.get('patience_counter', 0)
+                
+                if self.scaler and 'scaler_state_dict' in checkpoint:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                
+                print(f"[INFO] ✓ Full state loaded. Resuming from epoch {self.current_epoch}")
+                print(f"[INFO]   Best val loss: {self.best_val_loss:.4f}")
+                print(f"[INFO]   Global step: {self.global_step}")
+            except ValueError as e:
+                print(f"[WARNING] Failed to load optimizer state: {e}")
+                print(f"[INFO] Continuing with fresh optimizer (this is normal for stage transition)")
+        else:
+            # Only load model weights (for stage transition)
+            print(f"[INFO] ✓ Model-only load (fresh optimizer for new stage)")
+            # Reset training state for new stage
+            self.current_epoch = 0
+            self.global_step = 0
+            self.best_val_loss = float('inf')
+            self.patience_counter = 0
     
     def train_epoch(self, epoch):
         """Train one epoch"""
@@ -541,9 +625,11 @@ class VQATrainer:
                 print(f"  {k}: {v:.4f}")
             
             # Save best model
+            is_best = False
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
+                is_best = True
                 self.save_checkpoint(epoch, val_loss, is_best=True)
             else:
                 self.patience_counter += 1
@@ -551,6 +637,9 @@ class VQATrainer:
             
             # Save latest checkpoint
             self.save_checkpoint(epoch, val_loss, is_best=False)
+            
+            # Log to CSV
+            self.log_to_csv(epoch, train_components, val_components, is_best)
             
             # Early stopping
             if self.patience_counter >= self.patience:
@@ -777,6 +866,7 @@ def main():
         save_steps=CONFIG['save_steps'],
         use_wandb=CONFIG['use_wandb'],
         resume_checkpoint=trainer_s1.best_model_path,
+        load_optimizer=False,  # Stage transition - model weights only
         stage_name="stage2"
     )
     trainer_s2.train()
@@ -808,6 +898,7 @@ def main():
         save_steps=CONFIG['save_steps'],
         use_wandb=CONFIG['use_wandb'],
         resume_checkpoint=trainer_s2.best_model_path,
+        load_optimizer=False,  # Stage transition - model weights only
         stage_name="stage3"
     )
     trainer_s3.train()
@@ -841,6 +932,7 @@ def main():
         save_steps=CONFIG['save_steps'],
         use_wandb=CONFIG['use_wandb'],
         resume_checkpoint=trainer_s3.best_model_path,
+        load_optimizer=False,  # Stage transition - model weights only
         stage_name="stage4"
     )
     trainer_s4.train()
