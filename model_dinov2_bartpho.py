@@ -27,6 +27,7 @@ from transformers import (
     AutoTokenizer,
     MBartForConditionalGeneration
 )
+from transformers.modeling_outputs import BaseModelOutput
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import math
@@ -501,8 +502,10 @@ class DINOv2BARTphoVQA(nn.Module):
         fused_features, _ = self.fuse_multimodal(text_features, visual_features)
         
         # 2. Generate reasoning using BARTpho decoder
+        # Wrap fused_features trong BaseModelOutput để transformers có thể truy cập
+        encoder_outputs_wrapped = BaseModelOutput(last_hidden_state=fused_features)
         reasoning_outputs = self.bartpho.generate(
-            encoder_outputs=(fused_features,),
+            encoder_outputs=encoder_outputs_wrapped,
             max_length=max_reasoning_len,
             num_beams=num_beams,
             temperature=temperature,
@@ -532,8 +535,10 @@ class DINOv2BARTphoVQA(nn.Module):
         # 4. Generate answer conditioned on reasoning
         enhanced_encoder_output = torch.cat([fused_features, reasoning_hidden], dim=1)
         
+        # Wrap enhanced_encoder_output trong BaseModelOutput
+        enhanced_encoder_wrapped = BaseModelOutput(last_hidden_state=enhanced_encoder_output)
         answer_outputs = self.bartpho.generate(
-            encoder_outputs=(enhanced_encoder_output,),
+            encoder_outputs=enhanced_encoder_wrapped,
             max_length=max_answer_len,
             num_beams=num_beams,
             temperature=temperature,
