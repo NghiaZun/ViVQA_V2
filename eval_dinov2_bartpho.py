@@ -103,10 +103,10 @@ def evaluate_model(
 def main():
     # Config
     CONFIG = {
-        'checkpoint_path': '/kaggle/working/checkpoints_dinov2_bartpho/best_model_stage4.pt',
-        'test_json': '/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl',  # Replace với test set
+        'checkpoint_path': '/kaggle/input/test-3/transformers/default/1/best_model_stage3.pt',
+        'test_csv': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv',  # Đọc file test gốc CSV
         'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test',
-        'output_json': '/kaggle/working/predictions.json',
+        'output_csv': '/kaggle/working/predictions.csv',
         'batch_size': 4,
     }
     
@@ -130,14 +130,53 @@ def main():
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"[INFO] ✓ Loaded checkpoint from {CONFIG['checkpoint_path']}")
     
-    # Load test data
-    print("\n[INFO] Loading test dataset...")
-    test_dataset = VQADistillationDataset(
-        json_path=CONFIG['test_json'],
+    # Load test data từ CSV gốc
+    print("\n[INFO] Loading test dataset from CSV...")
+    import csv
+    class VQATestCSVDataset(torch.utils.data.Dataset):
+        def __init__(self, csv_path, image_dir, vision_processor, tokenizer, max_question_len=64):
+            self.samples = []
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    self.samples.append(row)
+            self.image_dir = image_dir
+            self.vision_processor = vision_processor
+            self.tokenizer = tokenizer
+            self.max_question_len = max_question_len
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            item = self.samples[idx]
+            img_path = item['image'] if 'image' in item else item['image_path']
+            img_path = img_path.split('/')[-1]
+            full_img_path = f"{self.image_dir}/{img_path}"
+            from PIL import Image
+            image = Image.open(full_img_path).convert('RGB')
+            pixel_values = self.vision_processor(images=image, return_tensors='pt')['pixel_values'][0]
+            question = item['question']
+            question_enc = self.tokenizer(
+                question,
+                max_length=self.max_question_len,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            return {
+                'pixel_values': pixel_values,
+                'input_ids': question_enc['input_ids'][0],
+                'attention_mask': question_enc['attention_mask'][0],
+                'image_id': item.get('image', item.get('image_path', '')),
+                'question': question
+            }
+
+    test_dataset = VQATestCSVDataset(
+        csv_path=CONFIG['test_csv'],
         image_dir=CONFIG['image_dir'],
         vision_processor=model.vision_processor,
-        tokenizer=model.tokenizer,
-        augment=False
+        tokenizer=model.tokenizer
     )
     
     # Evaluate
@@ -148,20 +187,14 @@ def main():
         device=device
     )
 
-    # Save results to JSON
-    with open(CONFIG['output_json'], 'w', encoding='utf-8') as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
-    # Save results to CSV (for metrics)
-    import csv
-    csv_path = CONFIG['output_json'].replace('.json', '.csv')
-    with open(csv_path, 'w', newline='', encoding='utf-8') as csvf:
-        writer = csv.DictWriter(csvf, fieldnames=['pred_answer','gt_answer','pred_reasoning'])
+    # Save results to CSV only
+    with open(CONFIG['output_csv'], 'w', newline='', encoding='utf-8') as csvf:
+        writer = csv.DictWriter(csvf, fieldnames=['image_id','question','pred_answer','pred_reasoning'])
         writer.writeheader()
         for row in results:
             writer.writerow(row)
 
-    print(f"\n[INFO] ✓ Predictions saved to {CONFIG['output_json']} and {csv_path}")
+    print(f"\n[INFO] ✓ Predictions saved to {CONFIG['output_csv']}")
     print("\nStatistics:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
