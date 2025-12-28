@@ -492,23 +492,24 @@ class VQATrainer:
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs}")
         
         for step, batch in enumerate(progress_bar):
-            # Move to device
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            # Move only tensor fields to device (skip string fields like img_id, question)
+            tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
+                           if torch.is_tensor(v)}
             
             # Prepare labels (shift for decoder)
-            reasoning_labels = batch['reasoning_input_ids'].clone()
-            answer_labels = batch['answer_input_ids'].clone()
+            reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
+            answer_labels = tensor_batch['answer_input_ids'].clone()
             
             # Forward pass
             with autocast(enabled=self.use_amp):
                 outputs = self.model(
-                    pixel_values=batch['pixel_values'],
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    reasoning_input_ids=batch['reasoning_input_ids'],
-                    reasoning_attention_mask=batch['reasoning_attention_mask'],
-                    answer_input_ids=batch['answer_input_ids'],
-                    answer_attention_mask=batch['answer_attention_mask']
+                    pixel_values=tensor_batch['pixel_values'],
+                    input_ids=tensor_batch['input_ids'],
+                    attention_mask=tensor_batch['attention_mask'],
+                    reasoning_input_ids=tensor_batch['reasoning_input_ids'],
+                    reasoning_attention_mask=tensor_batch['reasoning_attention_mask'],
+                    answer_input_ids=tensor_batch['answer_input_ids'],
+                    answer_attention_mask=tensor_batch['answer_attention_mask']
                 )
                 
                 loss, loss_dict = self.criterion(outputs, reasoning_labels, answer_labels)
@@ -572,20 +573,22 @@ class VQATrainer:
         progress_bar = tqdm(self.val_loader, desc="Evaluating")
         
         for batch in progress_bar:
-            batch = {k: v.to(self.device) for k, v in batch.items()}
+            # Move only tensor fields to device (skip string fields like img_id, question)
+            tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
+                           if torch.is_tensor(v)}
             
-            reasoning_labels = batch['reasoning_input_ids'].clone()
-            answer_labels = batch['answer_input_ids'].clone()
+            reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
+            answer_labels = tensor_batch['answer_input_ids'].clone()
             
             with autocast(enabled=self.use_amp):
                 outputs = self.model(
-                    pixel_values=batch['pixel_values'],
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    reasoning_input_ids=batch['reasoning_input_ids'],
-                    reasoning_attention_mask=batch['reasoning_attention_mask'],
-                    answer_input_ids=batch['answer_input_ids'],
-                    answer_attention_mask=batch['answer_attention_mask']
+                    pixel_values=tensor_batch['pixel_values'],
+                    input_ids=tensor_batch['input_ids'],
+                    attention_mask=tensor_batch['attention_mask'],
+                    reasoning_input_ids=tensor_batch['reasoning_input_ids'],
+                    reasoning_attention_mask=tensor_batch['reasoning_attention_mask'],
+                    answer_input_ids=tensor_batch['answer_input_ids'],
+                    answer_attention_mask=tensor_batch['answer_attention_mask']
                 )
                 
                 loss, loss_dict = self.criterion(outputs, reasoning_labels, answer_labels)
