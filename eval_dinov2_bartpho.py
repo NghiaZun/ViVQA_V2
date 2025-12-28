@@ -98,25 +98,40 @@ def evaluate_model(
                 num_beams=1  # Greedy for speed
             )
             
-            # Check if we have ground truth answers
-            gt_answers = batch.get('answer', None)
-            gt_reasonings = batch.get('reasoning', None)
+            # Check if we have ground truth (from VQADistillationDataset)
+            gt_answer_labels = batch.get('labels', None)
+            gt_reasoning_labels = batch.get('reasoning_labels', None)
             
             for i in range(len(answer_text)):
                 pred_answer = answer_text[i]
                 pred_reasoning = reasoning_text[i]
                 
+                # Get img_id (fallback to index if not available)
+                if 'img_id' in batch:
+                    img_id = batch['img_id'][i] if isinstance(batch['img_id'], list) else batch['img_id']
+                else:
+                    img_id = f"sample_{i}"
+                
+                # Decode question from input_ids
+                if 'question' in batch:
+                    question = batch['question'][i] if isinstance(batch['question'], list) else batch['question']
+                else:
+                    question_ids = batch['input_ids'][i] if batch['input_ids'].dim() > 1 else batch['input_ids']
+                    question = model.tokenizer.decode(question_ids.cpu().tolist(), skip_special_tokens=True)
+                
                 result_row = {
-                    'img_id': batch['img_id'][i] if isinstance(batch['img_id'], list) else batch['img_id'],
-                    'question': batch['question'][i] if isinstance(batch['question'], list) else batch['question'],
+                    'img_id': str(img_id),
+                    'question': question,
                     'pred_answer': pred_answer,
                     'pred_reasoning': pred_reasoning
                 }
                 
-                # Compute metrics if GT available
-                if gt_answers is not None:
+                # Compute metrics if GT available (decode from labels)
+                if gt_answer_labels is not None:
                     has_gt = True
-                    gt_answer = gt_answers[i] if isinstance(gt_answers, list) else gt_answers
+                    # Decode GT answer from labels tensor
+                    answer_label_ids = gt_answer_labels[i] if gt_answer_labels.dim() > 1 else gt_answer_labels
+                    gt_answer = model.tokenizer.decode(answer_label_ids.cpu().tolist(), skip_special_tokens=True)
                     result_row['gt_answer'] = gt_answer
                     
                     # Normalize
@@ -138,8 +153,10 @@ def evaluate_model(
                     rouge1_list.append(rouge1)
                     rougel_list.append(rougel)
                 
-                if gt_reasonings is not None:
-                    gt_reasoning = gt_reasonings[i] if isinstance(gt_reasonings, list) else gt_reasonings
+                # Decode GT reasoning if available
+                if gt_reasoning_labels is not None:
+                    reasoning_label_ids = gt_reasoning_labels[i] if gt_reasoning_labels.dim() > 1 else gt_reasoning_labels
+                    gt_reasoning = model.tokenizer.decode(reasoning_label_ids.cpu().tolist(), skip_special_tokens=True)
                     result_row['gt_reasoning'] = gt_reasoning
                 
                 results.append(result_row)
