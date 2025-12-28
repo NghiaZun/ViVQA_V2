@@ -496,9 +496,12 @@ class VQATrainer:
             tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
                            if torch.is_tensor(v)}
             
-            # Prepare labels (shift for decoder)
+            # Prepare labels (mask padding tokens with -100)
             reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
+            reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
+            
             answer_labels = tensor_batch['answer_input_ids'].clone()
+            answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
             
             # Forward pass
             with autocast(enabled=self.use_amp):
@@ -577,8 +580,12 @@ class VQATrainer:
             tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
                            if torch.is_tensor(v)}
             
+            # Prepare labels (mask padding tokens with -100)
             reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
+            reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
+            
             answer_labels = tensor_batch['answer_input_ids'].clone()
+            answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
             
             with autocast(enabled=self.use_amp):
                 outputs = self.model(
@@ -733,7 +740,7 @@ def main():
         'alpha_reasoning': 0.6,
         'alpha_answer': 0.4,
         'alpha_quality': 0.1,
-        'label_smoothing': 0.1,
+        'label_smoothing': 0.05,  # Reduced from 0.1 to lower initial loss
         
         # Advanced
         'use_amp': True,
