@@ -129,6 +129,10 @@ class VQADistillationDataset(Dataset):
             'reasoning_attention_mask': reasoning_enc['attention_mask'][0],
             'answer_input_ids': answer_enc['input_ids'][0],
             'answer_attention_mask': answer_enc['attention_mask'][0],
+            'labels': answer_enc['input_ids'][0],  # For evaluation
+            'reasoning_labels': reasoning_enc['input_ids'][0],  # For evaluation
+            'img_id': item.get('image_id', item.get('img_id', f"img_{idx}")),  # For evaluation
+            'question': item['question'],  # For evaluation (already string)
         }
 
 
@@ -293,15 +297,15 @@ class VQATrainer:
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True, 
-            num_workers=2,
-            pin_memory=True
+            num_workers=0,  # Reduced to save RAM
+            pin_memory=True if torch.cuda.is_available() else False
         )
         self.val_loader = DataLoader(
             val_dataset, 
             batch_size=batch_size, 
             shuffle=False, 
-            num_workers=2,
-            pin_memory=True
+            num_workers=0,  # Reduced to save RAM
+            pin_memory=True if torch.cuda.is_available() else False
         )
         
         # Loss function
@@ -536,6 +540,11 @@ class VQATrainer:
             for k, v in loss_dict.items():
                 loss_components[k] += v
             
+            # Clear cache periodically to prevent memory buildup
+            if (step + 1) % (self.gradient_accumulation_steps * 10) == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
             # Update progress bar
             if (step + 1) % self.log_steps == 0:
                 avg_loss = total_loss / (step + 1)
@@ -709,9 +718,9 @@ def main():
         'random_seed': 42,
         
         # Training
-        'batch_size': 2,
-        'gradient_accumulation_steps': 32,
-        'num_epochs': 30,  # Increased to 30 for staged training
+        'batch_size': 1,  # Reduced to save GPU memory
+        'gradient_accumulation_steps': 64,  # Increased to maintain effective batch size
+        'num_epochs': 54,  # Total epochs across all stages
         'learning_rate': 3e-5,  # Lower LR cho large model
         'weight_decay': 0.01,
         'warmup_ratio': 0.1,
@@ -800,10 +809,11 @@ def main():
     print("\n" + "="*70)
     print("STAGED TRAINING STRATEGY")
     print("="*70)
-    print("Stage 1: Train fusion + heads only (8 epochs)")
-    print("Stage 2: Unfreeze DINOv2 last 4 layers (7 epochs)")
-    print("Stage 3: Unfreeze BARTpho encoder last 6 layers (7 epochs)")
-    print("Stage 4: Full fine-tuning (8 epochs)")
+    print("Stage 1: Train fusion + heads only (15 epochs)")
+    print("Stage 2: Unfreeze DINOv2 last 4 layers (12 epochs)")
+    print("Stage 3: Unfreeze BARTpho encoder last 6 layers (12 epochs)")
+    print("Stage 4: Full fine-tuning (15 epochs)")
+    print("Total: 54 epochs")
     print("="*70 + "\n")
     
     # === STAGE 1: Fusion + Heads only ===
@@ -812,6 +822,11 @@ def main():
     freeze_module(model.bartpho.model.encoder, "BARTpho Encoder")
     freeze_module(model.bartpho.model.decoder, "BARTpho Decoder")
     
+    # Clear GPU cache before starting
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"[INFO] GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+    
     trainer_s1 = VQATrainer(
         model=model,
         train_dataset=train_dataset,
@@ -819,7 +834,7 @@ def main():
         output_dir=CONFIG['output_dir'],
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=8,
+        num_epochs=15,
         learning_rate=CONFIG['learning_rate'],
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
@@ -839,6 +854,11 @@ def main():
     )
     trainer_s1.train()
     
+    # Clear GPU cache between stages
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"[INFO] GPU Memory after Stage 1: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    
     # === STAGE 2: Unfreeze DINOv2 last layers ===
     print("\n[STAGE 2/4] Unfreezing DINOv2 last 4 layers...")
     unfreeze_last_n_layers(model.vision_encoder, "DINOv2", n_layers=4)
@@ -850,7 +870,7 @@ def main():
         output_dir=CONFIG['output_dir'],
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=7,
+        num_epochs=12,
         learning_rate=CONFIG['learning_rate'] * 0.5,
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
@@ -871,6 +891,11 @@ def main():
     )
     trainer_s2.train()
     
+    # Clear GPU cache between stages
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"[INFO] GPU Memory after Stage 2: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    
     # === STAGE 3: Unfreeze BARTpho encoder last layers ===
     print("\n[STAGE 3/4] Unfreezing BARTpho encoder last 6 layers...")
     unfreeze_last_n_layers(model.bartpho.model.encoder, "BARTpho Encoder", n_layers=6)
@@ -882,7 +907,7 @@ def main():
         output_dir=CONFIG['output_dir'],
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=7,
+        num_epochs=12,
         learning_rate=CONFIG['learning_rate'] * 0.3,
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
@@ -903,6 +928,11 @@ def main():
     )
     trainer_s3.train()
     
+    # Clear GPU cache between stages
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"[INFO] GPU Memory after Stage 3: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    
     # === STAGE 4: Full fine-tuning ===
     print("\n[STAGE 4/4] Full fine-tuning (all layers unfrozen)...")
     unfreeze_module(model.vision_encoder, "DINOv2")
@@ -916,7 +946,7 @@ def main():
         output_dir=CONFIG['output_dir'],
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=8,
+        num_epochs=15,
         learning_rate=CONFIG['learning_rate'] * 0.1,
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],

@@ -95,7 +95,9 @@ def evaluate_model(
                 attention_mask=batch['attention_mask'],
                 max_reasoning_len=128,
                 max_answer_len=32,
-                num_beams=1  # Greedy for speed
+                num_beams=4,  # Use beam search for better quality
+                repetition_penalty=1.2,
+                length_penalty=1.0
             )
             
             # Check if we have ground truth (from VQADistillationDataset)
