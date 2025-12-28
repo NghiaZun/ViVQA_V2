@@ -77,6 +77,14 @@ def evaluate_model(
         return rouge1, rougel
 
     results = []
+    
+    # Metrics tracking
+    exact_matches = []
+    rouge1_list = []
+    rougel_list = []
+    f1_list = []
+    has_gt = False
+    
     print("[INFO] Generating predictions...")
     with torch.no_grad():
         for batch in tqdm(test_loader):
@@ -87,31 +95,102 @@ def evaluate_model(
                 attention_mask=batch['attention_mask'],
                 max_reasoning_len=128,
                 max_answer_len=32,
-                num_beams=4
+                num_beams=1  # Greedy for speed
             )
+            
+            # Check if we have ground truth answers
+            gt_answers = batch.get('answer', None)
+            gt_reasonings = batch.get('reasoning', None)
+            
             for i in range(len(answer_text)):
-                results.append({
+                pred_answer = answer_text[i]
+                pred_reasoning = reasoning_text[i]
+                
+                result_row = {
                     'image_id': batch['image_id'][i] if isinstance(batch['image_id'], list) else batch['image_id'],
                     'question': batch['question'][i] if isinstance(batch['question'], list) else batch['question'],
-                    'pred_answer': answer_text[i],
-                    'pred_reasoning': reasoning_text[i]
-                })
+                    'pred_answer': pred_answer,
+                    'pred_reasoning': pred_reasoning
+                }
+                
+                # Compute metrics if GT available
+                if gt_answers is not None:
+                    has_gt = True
+                    gt_answer = gt_answers[i] if isinstance(gt_answers, list) else gt_answers
+                    result_row['gt_answer'] = gt_answer
+                    
+                    # Normalize
+                    pred_norm = normalize_text(pred_answer)
+                    gt_norm = normalize_text(gt_answer)
+                    
+                    # Exact Match
+                    is_correct = (pred_norm == gt_norm)
+                    exact_matches.append(1.0 if is_correct else 0.0)
+                    
+                    # Token F1
+                    pred_tokens = pred_norm.split()
+                    gt_tokens = gt_norm.split()
+                    f1 = compute_f1(pred_tokens, gt_tokens)
+                    f1_list.append(f1)
+                    
+                    # ROUGE
+                    rouge1, rougel = compute_rouge(pred_norm, gt_norm)
+                    rouge1_list.append(rouge1)
+                    rougel_list.append(rougel)
+                
+                if gt_reasonings is not None:
+                    gt_reasoning = gt_reasonings[i] if isinstance(gt_reasonings, list) else gt_reasonings
+                    result_row['gt_reasoning'] = gt_reasoning
+                
+                results.append(result_row)
+    
+    # Compute statistics
     stats = {'total_samples': len(results)}
+    
+    if has_gt:
+        stats['exact_match_acc'] = np.mean(exact_matches) * 100.0
+        stats['token_f1'] = np.mean(f1_list) * 100.0
+        stats['rouge1'] = np.mean(rouge1_list) * 100.0
+        stats['rougel'] = np.mean(rougel_list) * 100.0
+    
     return results, stats
 
 
 def main():
-    # Config
-    CONFIG = {
-        'checkpoint_path': '/kaggle/input/test-3/transformers/default/1/best_model_stage3.pt',
-        'test_csv': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv',  # Đọc file test gốc CSV
-        'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test',
-        'output_csv': '/kaggle/working/predictions.csv',
-        'batch_size': 4,
-    }
+    import argparse
+    parser = argparse.ArgumentParser(description='Evaluate DINOv2 + BARTpho VQA')
+    parser.add_argument('--mode', type=str, default='test', choices=['test', 'val'],
+                       help='Evaluation mode: test (no GT) or val (with GT metrics)')
+    parser.add_argument('--checkpoint', type=str, default='/kaggle/input/test-3/transformers/default/1/best_model_stage3.pt',
+                       help='Path to checkpoint')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
+    parser.add_argument('--output_csv', type=str, default='/kaggle/working/predictions.csv',
+                       help='Output CSV path')
+    args = parser.parse_args()
+    
+    # Config based on mode
+    if args.mode == 'val':
+        CONFIG = {
+            'checkpoint_path': args.checkpoint,
+            'train_json': '/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl',
+            'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
+            'output_csv': args.output_csv,
+            'batch_size': args.batch_size,
+            'use_val_split': True,
+            'val_split': 0.1,
+        }
+    else:  # test mode
+        CONFIG = {
+            'checkpoint_path': args.checkpoint,
+            'test_csv': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv',
+            'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test',
+            'output_csv': args.output_csv,
+            'batch_size': args.batch_size,
+            'use_val_split': False,
+        }
     
     print("="*70)
-    print("EVALUATION: DINOv2 + BARTpho VQA")
+    print(f"EVALUATION: DINOv2 + BARTpho VQA ({args.mode.upper()} mode)")
     print("="*70)
     
     # Load model
@@ -129,57 +208,81 @@ def main():
     checkpoint = torch.load(CONFIG['checkpoint_path'], map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"[INFO] ✓ Loaded checkpoint from {CONFIG['checkpoint_path']}")
+    if 'epoch' in checkpoint:
+        print(f"      Epoch: {checkpoint['epoch']}")
+    if 'best_val_loss' in checkpoint:
+        print(f"      Best Val Loss: {checkpoint['best_val_loss']:.4f}")
     
-    # Load test data từ CSV gốc
-    print("\n[INFO] Loading test dataset from CSV...")
-    import csv
-    class VQATestCSVDataset(torch.utils.data.Dataset):
-        def __init__(self, csv_path, image_dir, vision_processor, tokenizer, max_question_len=64):
-            self.samples = []
-            with open(csv_path, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    self.samples.append(row)
-            self.image_dir = image_dir
-            self.vision_processor = vision_processor
-            self.tokenizer = tokenizer
-            self.max_question_len = max_question_len
+    # Load dataset based on mode
+    if args.mode == 'val':
+        print("\n[INFO] Loading validation dataset with ground truth...")
+        full_dataset = VQADistillationDataset(
+            json_path=CONFIG['train_json'],
+            image_dir=CONFIG['image_dir'],
+            vision_processor=model.vision_processor,
+            tokenizer=model.tokenizer,
+            augment=False
+        )
+        
+        # Split into val (same as training)
+        total_size = len(full_dataset)
+        val_size = int(total_size * CONFIG['val_split'])
+        train_size = total_size - val_size
+        torch.manual_seed(42)  # Same seed as training
+        _, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+        print(f"[INFO] Using validation split: {len(test_dataset)} samples")
+    else:
+        print("\n[INFO] Loading test dataset from CSV (no GT)...")
+        import csv
+        
+        class VQATestCSVDataset(torch.utils.data.Dataset):
+            def __init__(self, csv_path, image_dir, vision_processor, tokenizer, max_question_len=64):
+                self.samples = []
+                with open(csv_path, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        self.samples.append(row)
+                self.image_dir = image_dir
+                self.vision_processor = vision_processor
+                self.tokenizer = tokenizer
+                self.max_question_len = max_question_len
 
-        def __len__(self):
-            return len(self.samples)
+            def __len__(self):
+                return len(self.samples)
 
-        def __getitem__(self, idx):
-            item = self.samples[idx]
-            # Lấy img_id làm image_id, và lấy question đúng trường
-            img_id = item['img_id']
-            # Nếu file ảnh là img_id.jpg/png, sửa lại tên file cho đúng
-            img_path = f"{img_id}.jpg"
-            full_img_path = f"{self.image_dir}/{img_path}"
-            from PIL import Image
-            image = Image.open(full_img_path).convert('RGB')
-            pixel_values = self.vision_processor(images=image, return_tensors='pt')['pixel_values'][0]
-            question = item['question']
-            question_enc = self.tokenizer(
-                question,
-                max_length=self.max_question_len,
-                padding='max_length',
-                truncation=True,
-                return_tensors='pt'
-            )
-            return {
-                'pixel_values': pixel_values,
-                'input_ids': question_enc['input_ids'][0],
-                'attention_mask': question_enc['attention_mask'][0],
-                'image_id': img_id,
-                'question': question
-            }
-
-    test_dataset = VQATestCSVDataset(
-        csv_path=CONFIG['test_csv'],
-        image_dir=CONFIG['image_dir'],
-        vision_processor=model.vision_processor,
-        tokenizer=model.tokenizer
-    )
+            def __getitem__(self, idx):
+                item = self.samples[idx]
+                # Lấy img_id làm image_id, và lấy question đúng trường
+                img_id = item['img_id']
+                # Nếu file ảnh là img_id.jpg/png, sửa lại tên file cho đúng
+                img_path = f"{img_id}.jpg"
+                full_img_path = f"{self.image_dir}/{img_path}"
+                from PIL import Image
+                image = Image.open(full_img_path).convert('RGB')
+                pixel_values = self.vision_processor(images=image, return_tensors='pt')['pixel_values'][0]
+                question = item['question']
+                question_enc = self.tokenizer(
+                    question,
+                    max_length=self.max_question_len,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt'
+                )
+                return {
+                    'pixel_values': pixel_values,
+                    'input_ids': question_enc['input_ids'][0],
+                    'attention_mask': question_enc['attention_mask'][0],
+                    'image_id': img_id,
+                    'question': question
+                }
+        
+        test_dataset = VQATestCSVDataset(
+            csv_path=CONFIG['test_csv'],
+            image_dir=CONFIG['image_dir'],
+            vision_processor=model.vision_processor,
+            tokenizer=model.tokenizer
+        )
+        print(f"[INFO] Loaded {len(test_dataset)} test samples")
     
     # Evaluate
     results, stats = evaluate_model(
@@ -189,17 +292,37 @@ def main():
         device=device
     )
 
-    # Save results to CSV only
+    # Save results to CSV
+    import csv
+    import os
+    os.makedirs(os.path.dirname(CONFIG['output_csv']) if os.path.dirname(CONFIG['output_csv']) else '.', exist_ok=True)
+    
+    # Determine fieldnames based on available data
+    fieldnames = ['image_id', 'question', 'pred_answer', 'pred_reasoning']
+    if results and 'gt_answer' in results[0]:
+        fieldnames.extend(['gt_answer', 'gt_reasoning'])
+    
     with open(CONFIG['output_csv'], 'w', newline='', encoding='utf-8') as csvf:
-        writer = csv.DictWriter(csvf, fieldnames=['image_id','question','pred_answer','pred_reasoning'])
+        writer = csv.DictWriter(csvf, fieldnames=fieldnames)
         writer.writeheader()
         for row in results:
             writer.writerow(row)
 
     print(f"\n[INFO] ✓ Predictions saved to {CONFIG['output_csv']}")
-    print("\nStatistics:")
-    for k, v in stats.items():
-        print(f"  {k}: {v}")
+    
+    print("\n" + "="*70)
+    print("EVALUATION RESULTS")
+    print("="*70)
+    print(f"Total samples: {stats['total_samples']}")
+    
+    if 'exact_match_acc' in stats:
+        print(f"Exact Match Accuracy: {stats['exact_match_acc']:.2f}%")
+        print(f"Token F1 Score:       {stats['token_f1']:.2f}%")
+        print(f"ROUGE-1:              {stats['rouge1']:.2f}%")
+        print(f"ROUGE-L:              {stats['rougel']:.2f}%")
+    else:
+        print("(No ground truth available - test mode)")
+    print("="*70)
 
 
 if __name__ == '__main__':

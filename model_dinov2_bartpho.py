@@ -266,10 +266,9 @@ class DINOv2BARTphoVQA(nn.Module):
             )
         
         # === 6. GENERATION HEADS ===
-        # Reasoning head: Generate step-by-step reasoning
+        # Custom heads for Chain-of-Thought generation
+        # These will be used for BOTH training and inference
         self.reasoning_head = nn.Linear(bart_hidden_dim, self.bartpho.config.vocab_size)
-        
-        # Answer head: Generate final answer (conditioned on reasoning)
         self.answer_head = nn.Linear(bart_hidden_dim, self.bartpho.config.vocab_size)
         
         # === 7. GRADIENT CHECKPOINTING (Save memory) ===
@@ -474,12 +473,14 @@ class DINOv2BARTphoVQA(nn.Module):
         attention_mask,
         max_reasoning_len=128,
         max_answer_len=32,
-        num_beams=4,
+        num_beams=1,
         temperature=1.0,
         top_p=0.9
     ):
         """
-        Inference mode: Generate reasoning và answer
+        Inference mode: Generate reasoning và answer using CUSTOM HEADS
+        
+        CRITICAL: Use same heads as training (reasoning_head, answer_head)
         
         Args:
             pixel_values: [batch, 3, 224, 224]
@@ -487,7 +488,7 @@ class DINOv2BARTphoVQA(nn.Module):
             attention_mask: [batch, seq_len]
             max_reasoning_len: Max length for reasoning
             max_answer_len: Max length for answer
-            num_beams: Beam search width
+            num_beams: Beam search width (default 1 for greedy)
         Returns:
             reasoning_text: List[str]
             answer_text: List[str]
@@ -501,27 +502,19 @@ class DINOv2BARTphoVQA(nn.Module):
         text_features = self.encode_text(input_ids, attention_mask)
         fused_features, _ = self.fuse_multimodal(text_features, visual_features)
         
-        # 2. Generate reasoning using BARTpho decoder
-        # Wrap fused_features trong BaseModelOutput để transformers có thể truy cập
-        encoder_outputs_wrapped = BaseModelOutput(last_hidden_state=fused_features)
-        reasoning_outputs = self.bartpho.generate(
-            encoder_outputs=encoder_outputs_wrapped,
+        # 2. Generate reasoning using CUSTOM reasoning_head (autoregressive)
+        reasoning_ids = self._generate_with_custom_head(
+            encoder_hidden_states=fused_features,
+            head=self.reasoning_head,
             max_length=max_reasoning_len,
             num_beams=num_beams,
             temperature=temperature,
-            top_p=top_p,
-            do_sample=True if temperature > 0 else False,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            return_dict_in_generate=True,
-            output_hidden_states=True
+            top_p=top_p
         )
         
-        reasoning_ids = reasoning_outputs.sequences  # [batch, seq_len]
         reasoning_text = self.tokenizer.batch_decode(reasoning_ids, skip_special_tokens=True)
         
         # 3. Get reasoning hidden states for quality check
-        # Re-encode reasoning to get hidden states
         reasoning_hidden = self.bartpho.model.decoder(
             input_ids=reasoning_ids,
             encoder_hidden_states=fused_features,
@@ -532,25 +525,100 @@ class DINOv2BARTphoVQA(nn.Module):
         if self.use_quality_check:
             reasoning_confidence = self.reasoning_quality_checker(reasoning_hidden)
         
-        # 4. Generate answer conditioned on reasoning
+        # 4. Generate answer using CUSTOM answer_head (conditioned on reasoning)
         enhanced_encoder_output = torch.cat([fused_features, reasoning_hidden], dim=1)
         
-        # Wrap enhanced_encoder_output trong BaseModelOutput
-        enhanced_encoder_wrapped = BaseModelOutput(last_hidden_state=enhanced_encoder_output)
-        answer_outputs = self.bartpho.generate(
-            encoder_outputs=enhanced_encoder_wrapped,
+        answer_ids = self._generate_with_custom_head(
+            encoder_hidden_states=enhanced_encoder_output,
+            head=self.answer_head,
             max_length=max_answer_len,
             num_beams=num_beams,
             temperature=temperature,
-            top_p=top_p,
-            do_sample=True if temperature > 0 else False,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id
+            top_p=top_p
         )
         
-        answer_text = self.tokenizer.batch_decode(answer_outputs, skip_special_tokens=True)
+        answer_text = self.tokenizer.batch_decode(answer_ids, skip_special_tokens=True)
         
         return reasoning_text, answer_text, reasoning_confidence
+    
+    def _generate_with_custom_head(
+        self,
+        encoder_hidden_states,
+        head,
+        max_length=128,
+        num_beams=1,
+        temperature=1.0,
+        top_p=0.9
+    ):
+        """
+        Autoregressive generation using custom head
+        
+        Args:
+            encoder_hidden_states: [batch, seq_len, hidden_dim]
+            head: nn.Linear custom head (reasoning_head or answer_head)
+            max_length: Max generation length
+            num_beams: Beam search (1 = greedy)
+            temperature: Sampling temperature
+            top_p: Nucleus sampling
+        Returns:
+            generated_ids: [batch, max_length]
+        """
+        batch_size = encoder_hidden_states.size(0)
+        device = encoder_hidden_states.device
+        
+        # Start with BOS token
+        input_ids = torch.full(
+            (batch_size, 1),
+            self.tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device
+        )
+        
+        # Autoregressive decoding
+        for step in range(max_length - 1):
+            # Decoder forward
+            decoder_outputs = self.bartpho.model.decoder(
+                input_ids=input_ids,
+                encoder_hidden_states=encoder_hidden_states,
+                return_dict=True,
+                use_cache=False
+            )
+            
+            hidden_states = decoder_outputs.last_hidden_state  # [batch, cur_len, hidden]
+            
+            # Get logits from custom head
+            logits = head(hidden_states[:, -1, :])  # [batch, vocab_size] - last token
+            
+            # Apply temperature
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            # Top-p (nucleus) sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = 0
+                
+                for i in range(batch_size):
+                    indices_to_remove = sorted_indices[i, sorted_indices_to_remove[i]]
+                    logits[i, indices_to_remove] = float('-inf')
+            
+            # Sample next token
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+            
+            # Append to sequence
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+            
+            # Check if all sequences have EOS
+            if (next_token == self.tokenizer.eos_token_id).all():
+                break
+        
+        return input_ids
 
 
 # ============================================================================
