@@ -107,7 +107,7 @@ def evaluate_model(
                 pred_reasoning = reasoning_text[i]
                 
                 result_row = {
-                    'image_id': batch['image_id'][i] if isinstance(batch['image_id'], list) else batch['image_id'],
+                    'img_id': batch['img_id'][i] if isinstance(batch['img_id'], list) else batch['img_id'],
                     'question': batch['question'][i] if isinstance(batch['question'], list) else batch['question'],
                     'pred_answer': pred_answer,
                     'pred_reasoning': pred_reasoning
@@ -272,7 +272,7 @@ def main():
                     'pixel_values': pixel_values,
                     'input_ids': question_enc['input_ids'][0],
                     'attention_mask': question_enc['attention_mask'][0],
-                    'image_id': img_id,
+                    'img_id': img_id,
                     'question': question
                 }
         
@@ -298,7 +298,7 @@ def main():
     os.makedirs(os.path.dirname(CONFIG['output_csv']) if os.path.dirname(CONFIG['output_csv']) else '.', exist_ok=True)
     
     # Determine fieldnames based on available data
-    fieldnames = ['image_id', 'question', 'pred_answer', 'pred_reasoning']
+    fieldnames = ['img_id', 'question', 'pred_answer', 'pred_reasoning']
     if results and 'gt_answer' in results[0]:
         fieldnames.extend(['gt_answer', 'gt_reasoning'])
     
