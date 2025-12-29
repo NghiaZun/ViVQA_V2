@@ -391,8 +391,6 @@ class VQATrainer:
         
         print(f"\n[INFO] Trainer initialized for stage: {stage_name}")
         print(f"  Effective batch size: {batch_size * gradient_accumulation_steps}")
-        print(f"  Training steps: {num_training_steps}")
-        print(f"  Warmup steps: {num_warmup_steps}")
         if resume_checkpoint:
             print(f"  Resumed from epoch {self.current_epoch}")
     
