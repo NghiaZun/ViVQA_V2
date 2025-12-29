@@ -357,14 +357,33 @@ class VQATrainer:
         if resume_checkpoint:
             # Auto-detect epoch offset from old stage-based checkpoints
             epoch_offset = 0
+            load_opt = load_optimizer
+            
             if 'stage2' in str(resume_checkpoint):
                 epoch_offset = 15  # Stage 1 had 15 epochs
+                load_opt = False  # Don't load optimizer - different trainable params
             elif 'stage3' in str(resume_checkpoint):
                 epoch_offset = 27  # Stage 1 (15) + Stage 2 (12)
+                load_opt = False  # Don't load optimizer - different trainable params
             elif 'stage4' in str(resume_checkpoint):
                 epoch_offset = 39  # Stage 1 (15) + Stage 2 (12) + Stage 3 (12)
+                load_opt = False  # Don't load optimizer - different trainable params
             
-            self.load_checkpoint(resume_checkpoint, load_optimizer=load_optimizer, epoch_offset=epoch_offset)
+            # If checkpoint is from old stage system, need to manually set epoch
+            if epoch_offset > 0:
+                # Load model weights only, then manually set the epoch
+                self.load_checkpoint(resume_checkpoint, load_optimizer=False, epoch_offset=0)
+                # Manually set the correct epoch based on checkpoint
+                try:
+                    checkpoint = torch.load(resume_checkpoint, map_location=self.device)
+                    checkpoint_epoch = checkpoint.get('epoch', 0)
+                    self.current_epoch = checkpoint_epoch + epoch_offset + 1  # Map to global epoch
+                    print(f"[INFO] Manually set global epoch: {self.current_epoch} (checkpoint epoch {checkpoint_epoch} + offset {epoch_offset} + 1)")
+                except:
+                    pass
+            else:
+                # New progressive checkpoint - can load full state
+                self.load_checkpoint(resume_checkpoint, load_optimizer=load_opt, epoch_offset=epoch_offset)
         
         print(f"\n[INFO] Trainer initialized for stage: {stage_name}")
         print(f"  Effective batch size: {batch_size * gradient_accumulation_steps}")
