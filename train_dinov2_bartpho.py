@@ -48,7 +48,7 @@ class VQADistillationDataset(Dataset):
         tokenizer,  # BARTpho tokenizer
         max_question_len=64,
         max_answer_len=32,
-        max_reasoning_len=128,
+        max_reasoning_len=96,  # Reduced from 128 to make reasoning easier to learn
         augment=False
     ):
         self.data = self.load_data(json_path)
@@ -719,7 +719,7 @@ def main():
     
     CONFIG = {
         # Paths
-        'train_json': '/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl',
+        'train_json': '/kaggle/input/teacher-3-12/teacher_outputs_train.jsonl',
         'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
         'output_dir': '/kaggle/working/checkpoints_dinov2_bartpho',
         
@@ -740,18 +740,18 @@ def main():
         'alpha_reasoning': 0.6,
         'alpha_answer': 0.4,
         'alpha_quality': 0.1,
-        'label_smoothing': 0.05,  # Reduced from 0.1 to lower initial loss
+        'label_smoothing': 0.0,  # Removed to lower loss (was causing artificially high loss)
         
         # Advanced
         'use_amp': True,
-        'patience': 5,
+        'patience': 8,  # Increased to allow more training
         'log_steps': 10,
         'eval_steps': 0,
         'save_steps': 0,
         'use_wandb': False,
         
         # Resume
-        'resume_from': None,  # Path to checkpoint, or None
+        'resume_from': None,  # Stage 1 complete, resume at stage 2 level
     }
     
     print("="*70)
@@ -873,6 +873,9 @@ def main():
     print("\n[STAGE 2/4] Unfreezing DINOv2 last 4 layers...")
     unfreeze_last_n_layers(model.vision_encoder, "DINOv2", n_layers=4)
     
+    # Resume checkpoint for stage 2 (use latest to continue from last epoch)
+    stage2_resume = '/kaggle/input/s2/transformers/default/1/checkpoint_stage2_latest.pt'
+    
     trainer_s2 = VQATrainer(
         model=model,
         train_dataset=train_dataset,
@@ -881,7 +884,7 @@ def main():
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
         num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.5,
+        learning_rate=CONFIG['learning_rate'] * 0.8,  # Increased from 0.5x to learn faster
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
         max_grad_norm=CONFIG['max_grad_norm'],
@@ -895,8 +898,8 @@ def main():
         eval_steps=CONFIG['eval_steps'],
         save_steps=CONFIG['save_steps'],
         use_wandb=CONFIG['use_wandb'],
-        resume_checkpoint=trainer_s1.best_model_path,
-        load_optimizer=False,  # Stage transition - model weights only
+        resume_checkpoint=stage2_resume,  # Resume from stage 2 latest
+        load_optimizer=True,  # Load optimizer state to continue same stage
         stage_name="stage2"
     )
     trainer_s2.train()
@@ -918,7 +921,7 @@ def main():
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
         num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.3,
+        learning_rate=CONFIG['learning_rate'] * 0.5,  # Increased from 0.3x to learn faster
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
         max_grad_norm=CONFIG['max_grad_norm'],
@@ -957,7 +960,7 @@ def main():
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
         num_epochs=15,
-        learning_rate=CONFIG['learning_rate'] * 0.1,
+        learning_rate=CONFIG['learning_rate'] * 0.2,  # Increased from 0.1x for better final tuning
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
         max_grad_norm=CONFIG['max_grad_norm'],
