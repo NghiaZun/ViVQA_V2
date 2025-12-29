@@ -262,9 +262,10 @@ class VQATrainer:
         eval_steps=0,
         save_steps=0,
         use_wandb=False,
-        resume_checkpoint=None,  # Path to checkpoint for resume
-        load_optimizer=True,  # Whether to load optimizer state (False for stage transition)
-        stage_name="main"  # Training stage name
+        resume_checkpoint=None,
+        load_optimizer=True,
+        stage_name="main",
+        stage_milestones=None,  # Dict: {epoch: (stage_name, lr_scale, modules_to_unfreeze)}
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -287,6 +288,8 @@ class VQATrainer:
         self.save_steps = save_steps
         self.use_wandb = use_wandb
         self.stage_name = stage_name
+        self.stage_milestones = stage_milestones or {}
+        self.base_learning_rate = learning_rate
         
         # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -349,8 +352,19 @@ class VQATrainer:
         self.init_csv_logger()
         
         # Resume từ checkpoint nếu có
+        self.resume_checkpoint = resume_checkpoint
+        self.load_optimizer = load_optimizer
         if resume_checkpoint:
-            self.load_checkpoint(resume_checkpoint, load_optimizer=load_optimizer)
+            # Auto-detect epoch offset from old stage-based checkpoints
+            epoch_offset = 0
+            if 'stage2' in str(resume_checkpoint):
+                epoch_offset = 15  # Stage 1 had 15 epochs
+            elif 'stage3' in str(resume_checkpoint):
+                epoch_offset = 27  # Stage 1 (15) + Stage 2 (12)
+            elif 'stage4' in str(resume_checkpoint):
+                epoch_offset = 39  # Stage 1 (15) + Stage 2 (12) + Stage 3 (12)
+            
+            self.load_checkpoint(resume_checkpoint, load_optimizer=load_optimizer, epoch_offset=epoch_offset)
         
         print(f"\n[INFO] Trainer initialized for stage: {stage_name}")
         print(f"  Effective batch size: {batch_size * gradient_accumulation_steps}")
@@ -439,20 +453,42 @@ class VQATrainer:
         latest_path = self.output_dir / f'checkpoint_{self.stage_name}_latest.pt'
         torch.save(checkpoint, latest_path)
     
-    def load_checkpoint(self, checkpoint_path, load_optimizer=True):
+    def load_checkpoint(self, checkpoint_path, load_optimizer=True, epoch_offset=0):
         """Load training state for resume
         
         Args:
             checkpoint_path: Path to checkpoint file
             load_optimizer: If False, only load model weights (for stage transition)
                           If True, load full state including optimizer (for same-stage resume)
+            epoch_offset: Offset to add to checkpoint epoch (for old stage-based checkpoints)
+                         Example: stage2 epoch 9 → global epoch 24 (offset=15)
         """
         print(f"[INFO] Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Check if file exists
+        if not os.path.exists(checkpoint_path):
+            print(f"[ERROR] Checkpoint file not found: {checkpoint_path}")
+            print(f"[INFO] Starting from scratch instead")
+            return
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            print(f"[INFO] ✓ Checkpoint loaded successfully")
+            print(f"[INFO]   Checkpoint epoch: {checkpoint.get('epoch', 'N/A')}")
+            print(f"[INFO]   Checkpoint stage: {checkpoint.get('stage_name', 'N/A')}")
+            print(f"[INFO]   Checkpoint global_step: {checkpoint.get('global_step', 'N/A')}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load checkpoint: {e}")
+            print(f"[INFO] Starting from scratch instead")
+            return
         
         # Always load model weights
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"[INFO] ✓ Model weights loaded")
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"[INFO] ✓ Model weights loaded")
+        except Exception as e:
+            print(f"[ERROR] Failed to load model weights: {e}")
+            return
         
         if load_optimizer:
             # Load optimizer state (for same-stage resume)
@@ -460,7 +496,11 @@ class VQATrainer:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 
-                self.current_epoch = checkpoint['epoch'] + 1  # Start from next epoch
+                # Map old epoch to new global epoch system
+                checkpoint_epoch = checkpoint['epoch']
+                mapped_epoch = checkpoint_epoch + epoch_offset
+                self.current_epoch = mapped_epoch + 1  # Start from next epoch
+                
                 self.global_step = checkpoint['global_step']
                 self.best_val_loss = checkpoint['best_val_loss']
                 self.patience_counter = checkpoint.get('patience_counter', 0)
@@ -468,12 +508,22 @@ class VQATrainer:
                 if self.scaler and 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 
-                print(f"[INFO] ✓ Full state loaded. Resuming from epoch {self.current_epoch}")
+                print(f"[INFO] ✓ Full state loaded")
+                if epoch_offset > 0:
+                    print(f"[INFO]   Checkpoint epoch {checkpoint_epoch} → Global epoch {mapped_epoch} (offset +{epoch_offset})")
+                print(f"[INFO]   Resuming from global epoch {self.current_epoch + 1} (0-indexed: {self.current_epoch})")
                 print(f"[INFO]   Best val loss: {self.best_val_loss:.4f}")
                 print(f"[INFO]   Global step: {self.global_step}")
-            except ValueError as e:
+                print(f"[INFO]   Patience counter: {self.patience_counter}")
+            except Exception as e:
                 print(f"[WARNING] Failed to load optimizer state: {e}")
-                print(f"[INFO] Continuing with fresh optimizer (this is normal for stage transition)")
+                print(f"[WARNING] Exception type: {type(e).__name__}")
+                print(f"[INFO] Continuing with fresh optimizer (starting from epoch 0)")
+                # Reset on failure
+                self.current_epoch = 0
+                self.global_step = 0
+                self.best_val_loss = float('inf')
+                self.patience_counter = 0
         else:
             # Only load model weights (for stage transition)
             print(f"[INFO] ✓ Model-only load (fresh optimizer for new stage)")
@@ -483,8 +533,48 @@ class VQATrainer:
             self.best_val_loss = float('inf')
             self.patience_counter = 0
     
+    def handle_stage_transition(self, epoch):
+        """Check and handle stage transitions based on epoch milestones"""
+        if epoch in self.stage_milestones:
+            stage_name, lr_scale, unfreeze_actions = self.stage_milestones[epoch]
+            print(f"\n{'='*70}")
+            print(f"[STAGE TRANSITION] Epoch {epoch+1}: {stage_name}")
+            print(f"{'='*70}")
+            
+            # Unfreeze modules
+            for action, module_name, *args in unfreeze_actions:
+                if action == 'unfreeze_last_n':
+                    n_layers = args[0] if args else 2
+                    module = self.get_module_by_name(module_name)
+                    if module:
+                        unfreeze_last_n_layers(module, module_name, n_layers)
+                elif action == 'unfreeze_all':
+                    module = self.get_module_by_name(module_name)
+                    if module:
+                        unfreeze_module(module, module_name)
+            
+            # Update learning rate
+            new_lr = self.base_learning_rate * lr_scale
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
+            print(f"[INFO] Learning rate updated: {new_lr:.2e}")
+            print(f"{'='*70}\n")
+    
+    def get_module_by_name(self, name):
+        """Get module by string name"""
+        if name == 'vision_encoder':
+            return self.model.vision_encoder
+        elif name == 'bartpho_encoder':
+            return self.model.bartpho.model.encoder
+        elif name == 'bartpho_decoder':
+            return self.model.bartpho.model.decoder
+        return None
+    
     def train_epoch(self, epoch):
         """Train one epoch"""
+        # Handle stage transitions at the beginning of epoch
+        self.handle_stage_transition(epoch)
+        
         self.model.train()
         total_loss = 0
         loss_components = defaultdict(float)
@@ -751,7 +841,7 @@ def main():
         'use_wandb': False,
         
         # Resume
-        'resume_from': None,  # Stage 1 complete, resume at stage 2 level
+        'resume_from': '/kaggle/input/s2/transformers/default/1/checkpoint_stage2_latest.pt',
     }
     
     print("="*70)
@@ -815,41 +905,48 @@ def main():
     from torch.utils.data import Subset
     train_dataset = Subset(train_dataset_aug, train_dataset.indices)
     
-    # ===== STAGED TRAINING =====
+    # ===== STAGED TRAINING WITH AUTOMATIC UNFREEZING =====
     print("\n" + "="*70)
-    print("STAGED TRAINING STRATEGY")
+    print("STAGED TRAINING STRATEGY (Automatic)")
     print("="*70)
-    print("Stage 1: Train fusion + heads only (15 epochs)")
-    print("Stage 2: Unfreeze DINOv2 last 4 layers (12 epochs)")
-    print("Stage 3: Unfreeze BARTpho encoder last 6 layers (12 epochs)")
-    print("Stage 4: Full fine-tuning (15 epochs)")
+    print("Epoch 0-14: Stage 1 - Fusion + heads only (15 epochs)")
+    print("Epoch 15-26: Stage 2 - Unfreeze DINOv2 last 4 layers (12 epochs)")
+    print("Epoch 27-38: Stage 3 - Unfreeze BARTpho encoder last 6 layers (12 epochs)")
+    print("Epoch 39-53: Stage 4 - Full fine-tuning (15 epochs)")
     print("Total: 54 epochs")
     print("="*70 + "\n")
     
-    # === STAGE 1: SKIPPED (already completed) ===
-    print("\n[STAGE 1/4] SKIPPED - Stage 1 already completed")
-    print("[INFO] Resuming from Stage 2 checkpoint...")
-    
-    # Note: Stage 1 completed, skip to Stage 2
-    # Uncomment below to retrain Stage 1:
-    """
-    print("\n[STAGE 1/4] Training fusion + heads (encoders frozen)...")
+    # Freeze all encoders initially (Stage 1 setup)
+    print("[INFO] Initial setup: Freezing all encoders...")
     freeze_module(model.vision_encoder, "DINOv2")
     freeze_module(model.bartpho.model.encoder, "BARTpho Encoder")
     freeze_module(model.bartpho.model.decoder, "BARTpho Decoder")
     
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+    # Define stage milestones: {epoch: (stage_name, lr_scale, unfreeze_actions)}
+    # unfreeze_actions: [(action_type, module_name, *args), ...]
+    stage_milestones = {
+        15: ('Stage 2: Unfreeze DINOv2 last 4 layers', 0.8, [
+            ('unfreeze_last_n', 'vision_encoder', 4)
+        ]),
+        27: ('Stage 3: Unfreeze BARTpho encoder last 6 layers', 0.5, [
+            ('unfreeze_last_n', 'bartpho_encoder', 6)
+        ]),
+        39: ('Stage 4: Full fine-tuning', 0.2, [
+            ('unfreeze_all', 'vision_encoder'),
+            ('unfreeze_all', 'bartpho_encoder'),
+            ('unfreeze_last_n', 'bartpho_decoder', 6)
+        ])
+    }
     
-    trainer_s1 = VQATrainer(
+    # Single trainer for all 54 epochs
+    trainer = VQATrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         output_dir=CONFIG['output_dir'],
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=15,
+        num_epochs=54,  # Total epochs
         learning_rate=CONFIG['learning_rate'],
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
@@ -865,128 +962,14 @@ def main():
         save_steps=CONFIG['save_steps'],
         use_wandb=CONFIG['use_wandb'],
         resume_checkpoint=CONFIG['resume_from'],
-        stage_name="stage1"
+        load_optimizer=True,
+        stage_name="progressive",
+        stage_milestones=stage_milestones
     )
-    trainer_s1.train()
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory after Stage 1: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    """
-    
-    # === STAGE 2: Unfreeze DINOv2 last layers ===
-    print("\n[STAGE 2/4] Unfreezing DINOv2 last 4 layers...")
-    unfreeze_last_n_layers(model.vision_encoder, "DINOv2", n_layers=4)
-    
-    # Resume checkpoint for stage 2 (use latest to continue from last epoch)
-    stage2_resume = '/kaggle/input/s2/transformers/default/1/checkpoint_stage2_latest.pt'
-    
-    trainer_s2 = VQATrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        output_dir=CONFIG['output_dir'],
-        batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.8,  # Increased from 0.5x to learn faster
-        weight_decay=CONFIG['weight_decay'],
-        warmup_ratio=CONFIG['warmup_ratio'],
-        max_grad_norm=CONFIG['max_grad_norm'],
-        alpha_reasoning=CONFIG['alpha_reasoning'],
-        alpha_answer=CONFIG['alpha_answer'],
-        alpha_quality=CONFIG['alpha_quality'],
-        label_smoothing=CONFIG['label_smoothing'],
-        use_amp=CONFIG['use_amp'],
-        patience=CONFIG['patience'],
-        log_steps=CONFIG['log_steps'],
-        eval_steps=CONFIG['eval_steps'],
-        save_steps=CONFIG['save_steps'],
-        use_wandb=CONFIG['use_wandb'],
-        resume_checkpoint=stage2_resume,  # Resume from stage 2 latest
-        load_optimizer=True,  # Load optimizer state to continue same stage
-        stage_name="stage2"
-    )
-    trainer_s2.train()
-    
-    # Clear GPU cache between stages
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory after Stage 2: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    
-    # === STAGE 3: Unfreeze BARTpho encoder last layers ===
-    print("\n[STAGE 3/4] Unfreezing BARTpho encoder last 6 layers...")
-    unfreeze_last_n_layers(model.bartpho.model.encoder, "BARTpho Encoder", n_layers=6)
-    
-    trainer_s3 = VQATrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        output_dir=CONFIG['output_dir'],
-        batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.5,  # Increased from 0.3x to learn faster
-        weight_decay=CONFIG['weight_decay'],
-        warmup_ratio=CONFIG['warmup_ratio'],
-        max_grad_norm=CONFIG['max_grad_norm'],
-        alpha_reasoning=CONFIG['alpha_reasoning'],
-        alpha_answer=CONFIG['alpha_answer'],
-        alpha_quality=CONFIG['alpha_quality'],
-        label_smoothing=CONFIG['label_smoothing'],
-        use_amp=CONFIG['use_amp'],
-        patience=CONFIG['patience'],
-        log_steps=CONFIG['log_steps'],
-        eval_steps=CONFIG['eval_steps'],
-        save_steps=CONFIG['save_steps'],
-        use_wandb=CONFIG['use_wandb'],
-        resume_checkpoint=trainer_s2.best_model_path,
-        load_optimizer=False,  # Stage transition - model weights only
-        stage_name="stage3"
-    )
-    trainer_s3.train()
-    
-    # Clear GPU cache between stages
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory after Stage 3: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    
-    # === STAGE 4: Full fine-tuning ===
-    print("\n[STAGE 4/4] Full fine-tuning (all layers unfrozen)...")
-    unfreeze_module(model.vision_encoder, "DINOv2")
-    unfreeze_module(model.bartpho.model.encoder, "BARTpho Encoder")
-    unfreeze_last_n_layers(model.bartpho.model.decoder, "BARTpho Decoder", n_layers=6)
-    
-    trainer_s4 = VQATrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        output_dir=CONFIG['output_dir'],
-        batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=15,
-        learning_rate=CONFIG['learning_rate'] * 0.2,  # Increased from 0.1x for better final tuning
-        weight_decay=CONFIG['weight_decay'],
-        warmup_ratio=CONFIG['warmup_ratio'],
-        max_grad_norm=CONFIG['max_grad_norm'],
-        alpha_reasoning=CONFIG['alpha_reasoning'],
-        alpha_answer=CONFIG['alpha_answer'],
-        alpha_quality=CONFIG['alpha_quality'],
-        label_smoothing=CONFIG['label_smoothing'],
-        use_amp=CONFIG['use_amp'],
-        patience=CONFIG['patience'],
-        log_steps=CONFIG['log_steps'],
-        eval_steps=CONFIG['eval_steps'],
-        save_steps=CONFIG['save_steps'],
-        use_wandb=CONFIG['use_wandb'],
-        resume_checkpoint=trainer_s3.best_model_path,
-        load_optimizer=False,  # Stage transition - model weights only
-        stage_name="stage4"
-    )
-    trainer_s4.train()
+    trainer.train()
     
     print("\n[INFO] Training completed successfully!")
-    print(f"[INFO] Final best model: {trainer_s4.best_model_path}")
+    print(f"[INFO] Final best model: {trainer.best_model_path}")
 
 
 if __name__ == '__main__':
