@@ -20,7 +20,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from transformers import get_cosine_schedule_with_warmup
 from PIL import Image
 from tqdm.auto import tqdm
@@ -542,7 +543,7 @@ class AutoregressiveCOTTrainer:
             use_teacher_forcing = random.random() < teacher_forcing_ratio
             
             try:
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', 'cuda', enabled=self.use_amp):
                     if use_teacher_forcing:
                         # Teacher forcing: use ground truth reasoning
                         outputs = self.model(
@@ -559,16 +560,30 @@ class AutoregressiveCOTTrainer:
                     else:
                         # Autoregressive: generate reasoning first
                         with torch.no_grad():  # No gradients for generation
-                            reasoning_outputs = self.model.generate_reasoning(
-                                pixel_values=tensor_batch['pixel_values'],
-                                input_ids=tensor_batch['input_ids'],
-                                attention_mask=tensor_batch['attention_mask'],
+                            # First encode and fuse
+                            visual_features = self.model.encode_image(tensor_batch['pixel_values'])
+                            text_features = self.model.encode_text(
+                                tensor_batch['input_ids'],
+                                tensor_batch['attention_mask']
+                            )
+                            fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
+                            
+                            # Then generate reasoning using bartpho.generate
+                            from transformers.modeling_outputs import BaseModelOutput
+                            encoder_outputs_wrapped = BaseModelOutput(last_hidden_state=fused_features)
+                            reasoning_outputs = self.model.bartpho.generate(
+                                encoder_outputs=encoder_outputs_wrapped,
                                 max_length=96,
                                 num_beams=1,  # Greedy for memory efficiency
-                                do_sample=False
+                                pad_token_id=self.model.tokenizer.pad_token_id,
+                                eos_token_id=self.model.tokenizer.eos_token_id,
+                                bos_token_id=self.model.tokenizer.bos_token_id,
                             )
                             # Detach to save memory
                             reasoning_outputs = reasoning_outputs.detach()
+                            fused_features = fused_features.detach()
+                            visual_features = None
+                            text_features = None
                         
                         # Clear cache after generation
                         if torch.cuda.is_available():
@@ -682,14 +697,24 @@ class AutoregressiveCOTTrainer:
                 answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
                 
                 with autocast(enabled=self.use_amp):
-                    # Generate reasoning
-                    reasoning_outputs = self.model.generate_reasoning(
-                        pixel_values=tensor_batch['pixel_values'],
-                        input_ids=tensor_batch['input_ids'],
-                        attention_mask=tensor_batch['attention_mask'],
+                    # Encode and fuse first
+                    visual_features = self.model.encode_image(tensor_batch['pixel_values'])
+                    text_features = self.model.encode_text(
+                        tensor_batch['input_ids'],
+                        tensor_batch['attention_mask']
+                    )
+                    fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
+                    
+                    # Generate reasoning using bartpho.generate
+                    from transformers.modeling_outputs import BaseModelOutput
+                    encoder_outputs_wrapped = BaseModelOutput(last_hidden_state=fused_features)
+                    reasoning_outputs = self.model.bartpho.generate(
+                        encoder_outputs=encoder_outputs_wrapped,
                         max_length=96,
                         num_beams=1,
-                        do_sample=False
+                        pad_token_id=self.model.tokenizer.pad_token_id,
+                        eos_token_id=self.model.tokenizer.eos_token_id,
+                        bos_token_id=self.model.tokenizer.bos_token_id,
                     )
                     
                     # Clear cache after generation
