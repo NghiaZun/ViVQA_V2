@@ -228,7 +228,8 @@ class AutoregressiveCOTTrainer:
         scheduled_sampling_anneal_epochs=10,  # Anneal over N epochs
         resume_checkpoint=None,
         load_optimizer=True,
-        stage_name="main"
+        stage_name="main",
+        stage_milestones=None,  # Dict: {epoch: (stage_name, lr_scale, unfreeze_actions)}
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -250,6 +251,8 @@ class AutoregressiveCOTTrainer:
         self.save_steps = save_steps
         self.validate_every_n_epochs = validate_every_n_epochs
         self.stage_name = stage_name
+        self.stage_milestones = stage_milestones or {}
+        self.base_learning_rate = learning_rate
         
         # Scheduled sampling params
         self.scheduled_sampling_start = scheduled_sampling_start
@@ -317,7 +320,33 @@ class AutoregressiveCOTTrainer:
         
         # Resume
         if resume_checkpoint:
-            self.load_checkpoint(resume_checkpoint, load_optimizer=load_optimizer)
+            # Auto-detect epoch offset from old stage-based checkpoints
+            epoch_offset = 0
+            load_opt = load_optimizer
+            
+            if 'stage2' in str(resume_checkpoint):
+                epoch_offset = 15
+                load_opt = False
+            elif 'stage3' in str(resume_checkpoint):
+                epoch_offset = 27
+                load_opt = False
+            elif 'stage4' in str(resume_checkpoint):
+                epoch_offset = 39
+                load_opt = False
+            
+            if epoch_offset > 0:
+                # Old checkpoint - load model only, manually set epoch
+                self.load_checkpoint(resume_checkpoint, load_optimizer=False)
+                try:
+                    checkpoint = torch.load(resume_checkpoint, map_location=self.device)
+                    checkpoint_epoch = checkpoint.get('epoch', 0)
+                    self.current_epoch = checkpoint_epoch + epoch_offset + 1
+                    print(f"[INFO] Manually set global epoch: {self.current_epoch} (checkpoint epoch {checkpoint_epoch} + offset {epoch_offset} + 1)")
+                except:
+                    pass
+            else:
+                # New progressive checkpoint
+                self.load_checkpoint(resume_checkpoint, load_optimizer=load_opt)
         
         print(f"\n[INFO] Autoregressive COT Trainer initialized")
         print(f"  Stage: {stage_name}")
@@ -448,8 +477,48 @@ class AutoregressiveCOTTrainer:
             self.best_val_loss = float('inf')
             self.patience_counter = 0
     
+    def handle_stage_transition(self, epoch):
+        """Check and handle stage transitions based on epoch milestones"""
+        if epoch in self.stage_milestones:
+            stage_name, lr_scale, unfreeze_actions = self.stage_milestones[epoch]
+            print(f"\n{'='*70}")
+            print(f"[STAGE TRANSITION] Epoch {epoch+1}: {stage_name}")
+            print(f"{'='*70}")
+            
+            # Unfreeze modules
+            for action, module_name, *args in unfreeze_actions:
+                if action == 'unfreeze_last_n':
+                    n_layers = args[0] if args else 2
+                    module = self.get_module_by_name(module_name)
+                    if module:
+                        unfreeze_last_n_layers(module, module_name, n_layers)
+                elif action == 'unfreeze_all':
+                    module = self.get_module_by_name(module_name)
+                    if module:
+                        unfreeze_module(module, module_name)
+            
+            # Update learning rate
+            new_lr = self.base_learning_rate * lr_scale
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = new_lr
+            print(f"[INFO] Learning rate updated: {new_lr:.2e}")
+            print(f"{'='*70}\n")
+    
+    def get_module_by_name(self, name):
+        """Get module by string name"""
+        if name == 'vision_encoder':
+            return self.model.vision_encoder
+        elif name == 'bartpho_encoder':
+            return self.model.bartpho.model.encoder
+        elif name == 'bartpho_decoder':
+            return self.model.bartpho.model.decoder
+        return None
+    
     def train_epoch(self, epoch):
         """Train one epoch with autoregressive generation"""
+        # Handle stage transitions at the beginning of epoch
+        self.handle_stage_transition(epoch)
+        
         self.model.train()
         total_loss = 0
         loss_components = defaultdict(float)
@@ -890,33 +959,47 @@ def main():
     from torch.utils.data import Subset
     train_dataset = Subset(train_dataset_aug, train_dataset.indices)
     
-    # ===== STAGED TRAINING =====
+    # ===== STAGED TRAINING WITH AUTOMATIC UNFREEZING =====
     print("\n" + "="*70)
-    print("AUTOREGRESSIVE COT STAGED TRAINING")
+    print("AUTOREGRESSIVE COT STAGED TRAINING (Automatic)")
     print("="*70)
-    print("Stage 1: Fusion + heads (15 epochs)")
-    print("Stage 2: DINOv2 last 4 layers (12 epochs)")
-    print("Stage 3: BARTpho encoder last 6 layers (12 epochs)")
-    print("Stage 4: Full fine-tuning (15 epochs)")
+    print("Epoch 0-14: Stage 1 - Fusion + heads only (15 epochs)")
+    print("Epoch 15-26: Stage 2 - Unfreeze DINOv2 last 4 layers (12 epochs)")
+    print("Epoch 27-38: Stage 3 - Unfreeze BARTpho encoder last 6 layers (12 epochs)")
+    print("Epoch 39-53: Stage 4 - Full fine-tuning (15 epochs)")
+    print("Total: 54 epochs")
     print("="*70 + "\n")
     
-    # === STAGE 1 ===
-    print("\n[STAGE 1/4] Training fusion + heads...")
+    # Freeze all encoders initially (Stage 1 setup)
+    print("[INFO] Initial setup: Freezing all encoders...")
     freeze_module(model.vision_encoder, "DINOv2")
     freeze_module(model.bartpho.model.encoder, "BARTpho Encoder")
     freeze_module(model.bartpho.model.decoder, "BARTpho Decoder")
     
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    # Define stage milestones
+    stage_milestones = {
+        15: ('Stage 2: Unfreeze DINOv2 last 4 layers', 0.8, [
+            ('unfreeze_last_n', 'vision_encoder', 4)
+        ]),
+        27: ('Stage 3: Unfreeze BARTpho encoder last 6 layers', 0.5, [
+            ('unfreeze_last_n', 'bartpho_encoder', 6)
+        ]),
+        39: ('Stage 4: Full fine-tuning', 0.2, [
+            ('unfreeze_all', 'vision_encoder'),
+            ('unfreeze_all', 'bartpho_encoder'),
+            ('unfreeze_last_n', 'bartpho_decoder', 6)
+        ])
+    }
     
-    trainer_s1 = AutoregressiveCOTTrainer(
+    # Single trainer for all 54 epochs
+    trainer = AutoregressiveCOTTrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         output_dir=CONFIG['output_dir'],
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=15,
+        num_epochs=54,  # Total epochs
         learning_rate=CONFIG['learning_rate'],
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
@@ -928,123 +1011,19 @@ def main():
         patience=CONFIG['patience'],
         log_steps=CONFIG['log_steps'],
         save_steps=100,  # Save every 100 steps for OOM safety
-        validate_every_n_epochs=1,  # Validate every epoch
+        validate_every_n_epochs=1,
         scheduled_sampling_start=CONFIG['scheduled_sampling_start'],
         scheduled_sampling_end=CONFIG['scheduled_sampling_end'],
         scheduled_sampling_anneal_epochs=CONFIG['scheduled_sampling_anneal_epochs'],
         resume_checkpoint=CONFIG['resume_from'],
-        stage_name="stage1"
+        load_optimizer=True,
+        stage_name="progressive",
+        stage_milestones=stage_milestones
     )
-    trainer_s1.train()
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # === STAGE 2 ===
-    print("\n[STAGE 2/4] Unfreezing DINOv2 last 4 layers...")
-    unfreeze_last_n_layers(model.vision_encoder, "DINOv2", n_layers=4)
-    
-    trainer_s2 = AutoregressiveCOTTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        output_dir=CONFIG['output_dir'],
-        batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.8,
-        weight_decay=CONFIG['weight_decay'],
-        warmup_ratio=CONFIG['warmup_ratio'],
-        max_grad_norm=CONFIG['max_grad_norm'],
-        alpha_reasoning=CONFIG['alpha_reasoning'],
-        alpha_answer=CONFIG['alpha_answer'],
-        label_smoothing=CONFIG['label_smoothing'],
-        use_amp=CONFIG['use_amp'],
-        patience=CONFIG['patience'],
-        log_steps=CONFIG['log_steps'],
-        save_steps=100,  # Save every 100 steps for OOM safety
-        validate_every_n_epochs=1,  # Validate every epoch
-        scheduled_sampling_start=0.0,  # No teacher forcing in later stages
-        scheduled_sampling_end=0.0,
-        scheduled_sampling_anneal_epochs=0,
-        resume_checkpoint=trainer_s1.best_model_path,
-        load_optimizer=False,
-        stage_name="stage2"
-    )
-    trainer_s2.train()
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # === STAGE 3 ===
-    print("\n[STAGE 3/4] Unfreezing BARTpho encoder last 6 layers...")
-    unfreeze_last_n_layers(model.bartpho.model.encoder, "BARTpho Encoder", n_layers=6)
-    
-    trainer_s3 = AutoregressiveCOTTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        output_dir=CONFIG['output_dir'],
-        batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.5,
-        weight_decay=CONFIG['weight_decay'],
-        warmup_ratio=CONFIG['warmup_ratio'],
-        max_grad_norm=CONFIG['max_grad_norm'],
-        alpha_reasoning=CONFIG['alpha_reasoning'],
-        alpha_answer=CONFIG['alpha_answer'],
-        label_smoothing=CONFIG['label_smoothing'],
-        use_amp=CONFIG['use_amp'],
-        patience=CONFIG['patience'],
-        log_steps=CONFIG['log_steps'],
-        scheduled_sampling_start=0.0,
-        scheduled_sampling_end=0.0,
-        scheduled_sampling_anneal_epochs=0,
-        resume_checkpoint=trainer_s2.best_model_path,
-        load_optimizer=False,
-        stage_name="stage3"
-    )
-    trainer_s3.train()
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # === STAGE 4 ===
-    print("\n[STAGE 4/4] Full fine-tuning...")
-    unfreeze_module(model.vision_encoder, "DINOv2")
-    unfreeze_module(model.bartpho.model.encoder, "BARTpho Encoder")
-    unfreeze_last_n_layers(model.bartpho.model.decoder, "BARTpho Decoder", n_layers=6)
-    
-    trainer_s4 = AutoregressiveCOTTrainer(
-        model=model,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        output_dir=CONFIG['output_dir'],
-        batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=15,
-        learning_rate=CONFIG['learning_rate'] * 0.2,
-        weight_decay=CONFIG['weight_decay'],
-        warmup_ratio=CONFIG['warmup_ratio'],
-        max_grad_norm=CONFIG['max_grad_norm'],
-        alpha_reasoning=CONFIG['alpha_reasoning'],
-        alpha_answer=CONFIG['alpha_answer'],
-        label_smoothing=CONFIG['label_smoothing'],
-        use_amp=CONFIG['use_amp'],
-        patience=CONFIG['patience'],
-        log_steps=CONFIG['log_steps'],
-        scheduled_sampling_start=0.0,
-        scheduled_sampling_end=0.0,
-        scheduled_sampling_anneal_epochs=0,
-        resume_checkpoint=trainer_s3.best_model_path,
-        load_optimizer=False,
-        stage_name="stage4"
-    )
-    trainer_s4.train()
+    trainer.train()
     
     print("\n[INFO] Training completed!")
-    print(f"[INFO] Final best model: {trainer_s4.best_model_path}")
+    print(f"[INFO] Final best model: {trainer.best_model_path}")
 
 
 if __name__ == '__main__':
