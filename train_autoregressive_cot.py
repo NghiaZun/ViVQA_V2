@@ -462,7 +462,8 @@ class AutoregressiveCOTTrainer:
                 # DON'T load scheduler - let it restart fresh to avoid LR decay issues
                 # self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 self.current_epoch = checkpoint['epoch'] + 1
-                self.global_step = checkpoint['global_step']
+                # IMPORTANT: Reset global_step to 0 so scheduler starts fresh
+                self.global_step = 0
                 self.best_val_loss = checkpoint['best_val_loss']
                 self.patience_counter = checkpoint.get('patience_counter', 0)
                 

@@ -521,7 +521,8 @@ class VQATrainer:
                 mapped_epoch = checkpoint_epoch + epoch_offset
                 self.current_epoch = mapped_epoch + 1  # Start from next epoch
                 
-                self.global_step = checkpoint['global_step']
+                # IMPORTANT: Reset global_step to 0 so scheduler starts fresh
+                self.global_step = 0
                 self.best_val_loss = checkpoint['best_val_loss']
                 self.patience_counter = checkpoint.get('patience_counter', 0)
                 
