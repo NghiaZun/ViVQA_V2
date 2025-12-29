@@ -328,19 +328,10 @@ class VQATrainer:
             eps=1e-8
         )
         
-        # Learning rate scheduler
-        num_training_steps = len(self.train_loader) * num_epochs // gradient_accumulation_steps
-        num_warmup_steps = int(num_training_steps * warmup_ratio)
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
-        )
-        
         # Mixed precision scaler
         self.scaler = GradScaler() if use_amp else None
         
-        # Training state
+        # Training state (initialize before loading checkpoint)
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float('inf')
@@ -349,9 +340,8 @@ class VQATrainer:
         
         # CSV logger for metrics tracking
         self.csv_log_path = self.output_dir / f'training_log_{stage_name}.csv'
-        self.init_csv_logger()
         
-        # Resume từ checkpoint nếu có
+        # Resume từ checkpoint nếu có (BEFORE creating scheduler)
         self.resume_checkpoint = resume_checkpoint
         self.load_optimizer = load_optimizer
         if resume_checkpoint:
@@ -384,6 +374,8 @@ class VQATrainer:
             else:
                 # New progressive checkpoint - can load full state
                 self.load_checkpoint(resume_checkpoint, load_optimizer=load_opt, epoch_offset=epoch_offset)
+        
+        # Note: scheduler is created AFTER checkpoint loading (see above)
         
         print(f"\n[INFO] Trainer initialized for stage: {stage_name}")
         print(f"  Effective batch size: {batch_size * gradient_accumulation_steps}")
@@ -513,23 +505,21 @@ class VQATrainer:
             # Load optimizer state (for same-stage resume)
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                # DON'T load scheduler - let it restart fresh to avoid LR decay issues
-                # self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 
                 # Map old epoch to new global epoch system
                 checkpoint_epoch = checkpoint['epoch']
                 mapped_epoch = checkpoint_epoch + epoch_offset
                 self.current_epoch = mapped_epoch + 1  # Start from next epoch
                 
-                # IMPORTANT: Reset global_step to 0 so scheduler starts fresh
-                self.global_step = 0
+                # Keep global_step for smooth LR schedule continuation
+                self.global_step = checkpoint['global_step']
                 self.best_val_loss = checkpoint['best_val_loss']
                 self.patience_counter = checkpoint.get('patience_counter', 0)
                 
                 if self.scaler and 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 
-                print(f"[INFO] ✓ Full state loaded (scheduler reset for fresh LR schedule)")
+                print(f"[INFO] ✓ Full state loaded (smooth LR continuation)")
                 if epoch_offset > 0:
                     print(f"[INFO]   Checkpoint epoch {checkpoint_epoch} → Global epoch {mapped_epoch} (offset +{epoch_offset})")
                 print(f"[INFO]   Resuming from global epoch {self.current_epoch + 1} (0-indexed: {self.current_epoch})")
@@ -553,6 +543,21 @@ class VQATrainer:
             self.global_step = 0
             self.best_val_loss = float('inf')
             self.patience_counter = 0
+        
+        # Initialize CSV logger AFTER loading checkpoint
+        self.init_csv_logger()
+        
+        # Create scheduler AFTER loading checkpoint (based on remaining epochs)
+        remaining_epochs = num_epochs - self.current_epoch
+        num_training_steps = len(self.train_loader) * remaining_epochs // gradient_accumulation_steps
+        num_warmup_steps = int(num_training_steps * warmup_ratio) if self.current_epoch == 0 else 0
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
+        
+        print(f"[INFO] Scheduler: {remaining_epochs} remaining epochs, {num_training_steps} steps, {num_warmup_steps} warmup")
     
     def handle_stage_transition(self, epoch):
         """Check and handle stage transitions based on epoch milestones"""
