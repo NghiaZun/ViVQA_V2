@@ -543,7 +543,7 @@ class AutoregressiveCOTTrainer:
             use_teacher_forcing = random.random() < teacher_forcing_ratio
             
             try:
-                with autocast('cuda', 'cuda', enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     if use_teacher_forcing:
                         # Teacher forcing: use ground truth reasoning
                         outputs = self.model(
@@ -696,7 +696,7 @@ class AutoregressiveCOTTrainer:
                 answer_labels = tensor_batch['answer_input_ids'].clone()
                 answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
                 
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     # Encode and fuse first
                     visual_features = self.model.encode_image(tensor_batch['pixel_values'])
                     text_features = self.model.encode_text(
