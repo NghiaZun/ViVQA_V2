@@ -459,7 +459,8 @@ class AutoregressiveCOTTrainer:
         if load_optimizer:
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                # DON'T load scheduler - let it restart fresh to avoid LR decay issues
+                # self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 self.current_epoch = checkpoint['epoch'] + 1
                 self.global_step = checkpoint['global_step']
                 self.best_val_loss = checkpoint['best_val_loss']
@@ -468,7 +469,7 @@ class AutoregressiveCOTTrainer:
                 if self.scaler and 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 
-                print(f"[INFO] ✓ Full state loaded. Resuming from epoch {self.current_epoch}")
+                print(f"[INFO] ✓ Full state loaded (scheduler reset for fresh LR schedule). Resuming from epoch {self.current_epoch}")
             except Exception as e:
                 print(f"[WARNING] Failed to load optimizer: {e}")
         else:

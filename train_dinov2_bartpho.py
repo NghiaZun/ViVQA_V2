@@ -513,7 +513,8 @@ class VQATrainer:
             # Load optimizer state (for same-stage resume)
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                # DON'T load scheduler - let it restart fresh to avoid LR decay issues
+                # self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 
                 # Map old epoch to new global epoch system
                 checkpoint_epoch = checkpoint['epoch']
@@ -527,7 +528,7 @@ class VQATrainer:
                 if self.scaler and 'scaler_state_dict' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 
-                print(f"[INFO] ✓ Full state loaded")
+                print(f"[INFO] ✓ Full state loaded (scheduler reset for fresh LR schedule)")
                 if epoch_offset > 0:
                     print(f"[INFO]   Checkpoint epoch {checkpoint_epoch} → Global epoch {mapped_epoch} (offset +{epoch_offset})")
                 print(f"[INFO]   Resuming from global epoch {self.current_epoch + 1} (0-indexed: {self.current_epoch})")
