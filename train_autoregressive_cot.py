@@ -1,15 +1,16 @@
 """
-PROFESSIONAL TRAINING PIPELINE: DINOv2 + BARTpho VQA
-======================================================
-SOTA training với full features:
-✅ Resume training từ bất kỳ checkpoint nào
-✅ Optimizer state + scheduler state persistence
-✅ Momentum scheduling (AdamW với cosine warmup)
-✅ Staged training với reasoning quality validation
-✅ Gradient checkpointing + Mixed Precision
-✅ Chain-of-Thought với quality gating
+AUTOREGRESSIVE COT TRAINING: DINOv2 + BARTpho VQA
+=================================================
+Training với autoregressive reasoning generation:
+✅ Generate reasoning first (no teacher forcing)
+✅ Use generated reasoning as input for answer
+✅ Scheduled sampling (mix teacher forcing & generation)
+✅ Better inference alignment
 
-Target: 70%+ accuracy trên ViVQA
+Flow:
+1. Generate reasoning: reasoning = model.generate(image, question)
+2. Generate answer: answer = model.generate(image, question, reasoning)
+3. Loss: L = α * L_reasoning + β * L_answer
 """
 
 import os
@@ -25,16 +26,15 @@ from PIL import Image
 from tqdm.auto import tqdm
 import numpy as np
 from pathlib import Path
-import copy
 import random
 from collections import defaultdict
 
-# Import model mới
+# Import model
 from model_dinov2_bartpho import DINOv2BARTphoVQA, count_parameters
 
 
 # ============================================================================
-# 1. DATASET
+# 1. DATASET (Same as before)
 # ============================================================================
 
 class VQADistillationDataset(Dataset):
@@ -44,11 +44,11 @@ class VQADistillationDataset(Dataset):
         self, 
         json_path, 
         image_dir,
-        vision_processor,  # DINOv2 AutoImageProcessor
-        tokenizer,  # BARTpho tokenizer
+        vision_processor,
+        tokenizer,
         max_question_len=64,
         max_answer_len=32,
-        max_reasoning_len=96,  # Reduced from 128 to make reasoning easier to learn
+        max_reasoning_len=96,
         augment=False
     ):
         self.data = self.load_data(json_path)
@@ -90,7 +90,7 @@ class VQADistillationDataset(Dataset):
         if self.augment:
             image = self.augment_image(image)
         
-        # Process image với DINOv2 processor
+        # Process image
         pixel_values = self.vision_processor(images=image, return_tensors='pt')['pixel_values'][0]
         
         # Tokenize question
@@ -102,7 +102,7 @@ class VQADistillationDataset(Dataset):
             return_tensors='pt'
         )
         
-        # Tokenize reasoning (teacher output)
+        # Tokenize reasoning (ground truth)
         reasoning_enc = self.tokenizer(
             item.get('reasoning', item.get('teacher_reasoning', '')),
             max_length=self.max_reasoning_len,
@@ -111,7 +111,7 @@ class VQADistillationDataset(Dataset):
             return_tensors='pt'
         )
         
-        # Tokenize answer (handle different field names)
+        # Tokenize answer (ground truth)
         answer_text = item.get('answer', item.get('predicted_answer', item.get('final_answer', '')))
         answer_enc = self.tokenizer(
             answer_text,
@@ -129,114 +129,77 @@ class VQADistillationDataset(Dataset):
             'reasoning_attention_mask': reasoning_enc['attention_mask'][0],
             'answer_input_ids': answer_enc['input_ids'][0],
             'answer_attention_mask': answer_enc['attention_mask'][0],
-            'labels': answer_enc['input_ids'][0],  # For evaluation
-            'reasoning_labels': reasoning_enc['input_ids'][0],  # For evaluation
-            'img_id': item.get('image_id', item.get('img_id', f"img_{idx}")),  # For evaluation
-            'question': item['question'],  # For evaluation (already string)
+            'labels': answer_enc['input_ids'][0],
+            'reasoning_labels': reasoning_enc['input_ids'][0],
+            'img_id': item.get('image_id', item.get('img_id', f"img_{idx}")),
+            'question': item['question'],
         }
 
 
 # ============================================================================
-# 2. LOSS FUNCTIONS
+# 2. AUTOREGRESSIVE COT LOSS
 # ============================================================================
 
-class ChainOfThoughtLoss(nn.Module):
+class AutoregressiveCOTLoss(nn.Module):
     """
-    Multi-task loss với confidence weighting
+    Loss for autoregressive CoT training
     
-    Loss = α * L_reasoning + β * L_answer + γ * L_quality
+    Loss = α * L_reasoning + β * L_answer
     
-    L_quality: Encourage high confidence when correct, low when wrong
+    Both reasoning and answer are generated, then compared to ground truth
     """
     
     def __init__(
         self, 
         alpha_reasoning=0.6, 
         alpha_answer=0.4,
-        alpha_quality=0.1,
-        label_smoothing=0.1
+        label_smoothing=0.0
     ):
         super().__init__()
         self.alpha_reasoning = alpha_reasoning
         self.alpha_answer = alpha_answer
-        self.alpha_quality = alpha_quality
         self.criterion = nn.CrossEntropyLoss(
             ignore_index=-100, 
             label_smoothing=label_smoothing
         )
         
-    def forward(self, outputs, reasoning_labels, answer_labels):
+    def forward(self, reasoning_logits, answer_logits, reasoning_labels, answer_labels):
         """
         Args:
-            outputs: CoTOutput from model
-            reasoning_labels: [batch, seq_len]
-            answer_labels: [batch, seq_len]
-        Returns:
-            loss, loss_dict
+            reasoning_logits: [batch, reasoning_len, vocab]
+            answer_logits: [batch, answer_len, vocab]
+            reasoning_labels: [batch, reasoning_len]
+            answer_labels: [batch, answer_len]
         """
         # Reasoning loss
-        reasoning_logits = outputs.reasoning_logits
         reasoning_loss = self.criterion(
             reasoning_logits.view(-1, reasoning_logits.size(-1)),
             reasoning_labels.view(-1)
         )
         
         # Answer loss
-        answer_logits = outputs.answer_logits
         answer_loss = self.criterion(
             answer_logits.view(-1, answer_logits.size(-1)),
             answer_labels.view(-1)
         )
         
-        # Quality loss: Calibrate confidence based on actual correctness
-        quality_loss = 0.0
-        if outputs.reasoning_confidence is not None:
-            # Compute accuracy for each sample (simplified: check if argmax matches)
-            reasoning_preds = reasoning_logits.argmax(dim=-1)
-            reasoning_correct = (reasoning_preds == reasoning_labels).float().mean(dim=1)  # [batch]
-            
-            # Target confidence = actual correctness
-            # If reasoning is correct, confidence should be high (1.0)
-            # If reasoning is wrong, confidence should be low (0.0)
-            target_confidence = reasoning_correct
-            
-            # Calibration loss: confidence should match correctness
-            quality_loss = F.mse_loss(outputs.reasoning_confidence, target_confidence)
-        
         # Total loss
-        total_loss = (
-            self.alpha_reasoning * reasoning_loss + 
-            self.alpha_answer * answer_loss +
-            self.alpha_quality * quality_loss
-        )
-        
-        # Confidence scale for adaptive weighting
-        if outputs.reasoning_confidence is not None:
-            confidence_scale = outputs.reasoning_confidence.mean().item()
-        else:
-            confidence_scale = 1.0
+        total_loss = self.alpha_reasoning * reasoning_loss + self.alpha_answer * answer_loss
         
         return total_loss, {
             'reasoning_loss': reasoning_loss.item(),
             'answer_loss': answer_loss.item(),
-            'quality_loss': quality_loss if isinstance(quality_loss, float) else quality_loss.item(),
-            'confidence_scale': confidence_scale,
             'total_loss': total_loss.item(),
-            'unweighted_total': (reasoning_loss + answer_loss).item()
         }
 
 
 # ============================================================================
-# 3. TRAINER WITH FULL RESUME SUPPORT
+# 3. AUTOREGRESSIVE COT TRAINER
 # ============================================================================
 
-class VQATrainer:
+class AutoregressiveCOTTrainer:
     """
-    Professional trainer với:
-    - Full checkpoint resume (optimizer, scheduler, scaler, epoch)
-    - Momentum scheduling
-    - Reasoning quality validation
-    - Stage-based training
+    Trainer với autoregressive reasoning generation
     """
     
     def __init__(
@@ -254,17 +217,18 @@ class VQATrainer:
         max_grad_norm=1.0,
         alpha_reasoning=0.6,
         alpha_answer=0.4,
-        alpha_quality=0.1,
-        label_smoothing=0.1,
+        label_smoothing=0.0,
         use_amp=True,
         patience=5,
         log_steps=10,
-        eval_steps=0,
-        save_steps=0,
-        use_wandb=False,
-        resume_checkpoint=None,  # Path to checkpoint for resume
-        load_optimizer=True,  # Whether to load optimizer state (False for stage transition)
-        stage_name="main"  # Training stage name
+        save_steps=100,  # Save checkpoint every N steps (OOM safety)
+        validate_every_n_epochs=1,  # Reduce validation frequency to save memory
+        scheduled_sampling_start=0.0,  # Start with 0% teacher forcing
+        scheduled_sampling_end=0.0,    # End with 0% teacher forcing
+        scheduled_sampling_anneal_epochs=10,  # Anneal over N epochs
+        resume_checkpoint=None,
+        load_optimizer=True,
+        stage_name="main"
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -283,10 +247,14 @@ class VQATrainer:
         self.use_amp = use_amp
         self.patience = patience
         self.log_steps = log_steps
-        self.eval_steps = eval_steps
         self.save_steps = save_steps
-        self.use_wandb = use_wandb
+        self.validate_every_n_epochs = validate_every_n_epochs
         self.stage_name = stage_name
+        
+        # Scheduled sampling params
+        self.scheduled_sampling_start = scheduled_sampling_start
+        self.scheduled_sampling_end = scheduled_sampling_end
+        self.scheduled_sampling_anneal_epochs = scheduled_sampling_anneal_epochs
         
         # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -297,35 +265,34 @@ class VQATrainer:
             train_dataset, 
             batch_size=batch_size, 
             shuffle=True, 
-            num_workers=0,  # Reduced to save RAM
+            num_workers=0,
             pin_memory=True if torch.cuda.is_available() else False
         )
         self.val_loader = DataLoader(
             val_dataset, 
             batch_size=batch_size, 
             shuffle=False, 
-            num_workers=0,  # Reduced to save RAM
+            num_workers=0,
             pin_memory=True if torch.cuda.is_available() else False
         )
         
         # Loss function
-        self.criterion = ChainOfThoughtLoss(
+        self.criterion = AutoregressiveCOTLoss(
             alpha_reasoning=alpha_reasoning,
             alpha_answer=alpha_answer,
-            alpha_quality=alpha_quality,
             label_smoothing=label_smoothing
         )
         
-        # Optimizer với momentum
+        # Optimizer
         self.optimizer = torch.optim.AdamW(
             [p for p in self.model.parameters() if p.requires_grad],
             lr=learning_rate,
             weight_decay=weight_decay,
-            betas=(0.9, 0.999),  # Standard momentum values
+            betas=(0.9, 0.999),
             eps=1e-8
         )
         
-        # Learning rate scheduler
+        # Scheduler
         num_training_steps = len(self.train_loader) * num_epochs // gradient_accumulation_steps
         num_warmup_steps = int(num_training_steps * warmup_ratio)
         self.scheduler = get_cosine_schedule_with_warmup(
@@ -334,7 +301,7 @@ class VQATrainer:
             num_training_steps=num_training_steps
         )
         
-        # Mixed precision scaler
+        # Mixed precision
         self.scaler = GradScaler() if use_amp else None
         
         # Training state
@@ -344,29 +311,25 @@ class VQATrainer:
         self.patience_counter = 0
         self.best_model_path = self.output_dir / f'best_model_{stage_name}.pt'
         
-        # CSV logger for metrics tracking
+        # CSV logger
         self.csv_log_path = self.output_dir / f'training_log_{stage_name}.csv'
         self.init_csv_logger()
         
-        # Resume từ checkpoint nếu có
+        # Resume
         if resume_checkpoint:
             self.load_checkpoint(resume_checkpoint, load_optimizer=load_optimizer)
         
-        print(f"\n[INFO] Trainer initialized for stage: {stage_name}")
+        print(f"\n[INFO] Autoregressive COT Trainer initialized")
+        print(f"  Stage: {stage_name}")
         print(f"  Effective batch size: {batch_size * gradient_accumulation_steps}")
-        print(f"  Training steps: {num_training_steps}")
-        print(f"  Warmup steps: {num_warmup_steps}")
-        if resume_checkpoint:
-            print(f"  Resumed from epoch {self.current_epoch}")
+        print(f"  Scheduled sampling: {scheduled_sampling_start} → {scheduled_sampling_end}")
     
     def init_csv_logger(self):
-        """Initialize CSV logger for tracking metrics"""
-        # Check if file exists and has content (resume case)
+        """Initialize CSV logger"""
         if self.csv_log_path.exists() and self.current_epoch > 0:
             print(f"[INFO] Resuming CSV logging to {self.csv_log_path}")
             return
         
-        # Create new CSV with headers
         with open(self.csv_log_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -374,23 +337,17 @@ class VQATrainer:
                 'train_loss',
                 'train_reasoning_loss',
                 'train_answer_loss',
-                'train_quality_loss',
-                'train_confidence_scale',
                 'val_loss',
                 'val_reasoning_loss',
                 'val_answer_loss',
-                'val_quality_loss',
-                'val_confidence_scale',
-                'val_reasoning_conf_mean',
-                'val_reasoning_conf_std',
                 'learning_rate',
+                'teacher_forcing_ratio',
                 'patience_counter',
                 'is_best'
             ])
-        print(f"[INFO] CSV logging initialized: {self.csv_log_path}")
     
-    def log_to_csv(self, epoch, train_components, val_components, is_best):
-        """Log epoch metrics to CSV"""
+    def log_to_csv(self, epoch, train_components, val_components, teacher_forcing_ratio, is_best):
+        """Log metrics to CSV"""
         current_lr = self.scheduler.get_last_lr()[0]
         
         with open(self.csv_log_path, 'a', newline='', encoding='utf-8') as f:
@@ -400,67 +357,80 @@ class VQATrainer:
                 train_components.get('total_loss', 0),
                 train_components.get('reasoning_loss', 0),
                 train_components.get('answer_loss', 0),
-                train_components.get('quality_loss', 0),
-                train_components.get('confidence_scale', 0),
                 val_components.get('total_loss', 0),
                 val_components.get('reasoning_loss', 0),
                 val_components.get('answer_loss', 0),
-                val_components.get('quality_loss', 0),
-                val_components.get('confidence_scale', 0),
-                val_components.get('reasoning_confidence_mean', 0),
-                val_components.get('reasoning_confidence_std', 0),
                 f"{current_lr:.2e}",
+                f"{teacher_forcing_ratio:.3f}",
                 self.patience_counter,
                 1 if is_best else 0
             ])
     
-    def save_checkpoint(self, epoch, val_loss, is_best=False):
-        """Save full training state for resume"""
-        checkpoint = {
-            'epoch': epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
-            'patience_counter': self.patience_counter,
-            'stage_name': self.stage_name,
-        }
+    def get_teacher_forcing_ratio(self, epoch):
+        """Get teacher forcing ratio for scheduled sampling"""
+        if epoch >= self.scheduled_sampling_anneal_epochs:
+            return self.scheduled_sampling_end
         
-        if self.scaler:
-            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-        
-        # Save checkpoint
-        if is_best:
-            torch.save(checkpoint, self.best_model_path)
-            print(f"[INFO] ✓ Best model saved: {self.best_model_path} (Epoch {epoch+1}, Loss: {val_loss:.4f})")
-        
-        # Also save latest checkpoint
-        latest_path = self.output_dir / f'checkpoint_{self.stage_name}_latest.pt'
-        torch.save(checkpoint, latest_path)
+        # Linear annealing
+        progress = epoch / self.scheduled_sampling_anneal_epochs
+        ratio = self.scheduled_sampling_start + (self.scheduled_sampling_end - self.scheduled_sampling_start) * progress
+        return ratio
+    
+    def save_checkpoint(self, epoch, val_loss=None, is_best=False, force_save=False):
+        """Save checkpoint with OOM safety"""
+        try:
+            checkpoint = {
+                'epoch': epoch,
+                'global_step': self.global_step,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'best_val_loss': self.best_val_loss,
+                'patience_counter': self.patience_counter,
+                'stage_name': self.stage_name,
+            }
+            
+            if self.scaler:
+                checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+            
+            # Always save latest for OOM recovery
+            latest_path = self.output_dir / f'checkpoint_{self.stage_name}_latest.pt'
+            torch.save(checkpoint, latest_path)
+            
+            if is_best and val_loss is not None:
+                torch.save(checkpoint, self.best_model_path)
+                print(f"[INFO] ✓ Best model saved (Loss: {val_loss:.4f})")
+            elif force_save:
+                print(f"[INFO] ✓ Emergency checkpoint saved (Step: {self.global_step})")
+            
+            # Clear memory after saving
+            del checkpoint
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to save checkpoint: {e}")
+            # Try minimal save
+            try:
+                torch.save({'model_state_dict': self.model.state_dict()}, 
+                          self.output_dir / f'emergency_{self.stage_name}.pt')
+                print(f"[INFO] ✓ Emergency model weights saved")
+            except:
+                print(f"[ERROR] Could not save emergency checkpoint")
     
     def load_checkpoint(self, checkpoint_path, load_optimizer=True):
-        """Load training state for resume
-        
-        Args:
-            checkpoint_path: Path to checkpoint file
-            load_optimizer: If False, only load model weights (for stage transition)
-                          If True, load full state including optimizer (for same-stage resume)
-        """
+        """Load checkpoint"""
         print(f"[INFO] Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
-        # Always load model weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
         print(f"[INFO] ✓ Model weights loaded")
         
         if load_optimizer:
-            # Load optimizer state (for same-stage resume)
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                
-                self.current_epoch = checkpoint['epoch'] + 1  # Start from next epoch
+                self.current_epoch = checkpoint['epoch'] + 1
                 self.global_step = checkpoint['global_step']
                 self.best_val_loss = checkpoint['best_val_loss']
                 self.patience_counter = checkpoint.get('patience_counter', 0)
@@ -469,56 +439,105 @@ class VQATrainer:
                     self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 
                 print(f"[INFO] ✓ Full state loaded. Resuming from epoch {self.current_epoch}")
-                print(f"[INFO]   Best val loss: {self.best_val_loss:.4f}")
-                print(f"[INFO]   Global step: {self.global_step}")
-            except ValueError as e:
-                print(f"[WARNING] Failed to load optimizer state: {e}")
-                print(f"[INFO] Continuing with fresh optimizer (this is normal for stage transition)")
+            except Exception as e:
+                print(f"[WARNING] Failed to load optimizer: {e}")
         else:
-            # Only load model weights (for stage transition)
-            print(f"[INFO] ✓ Model-only load (fresh optimizer for new stage)")
-            # Reset training state for new stage
+            print(f"[INFO] ✓ Model-only load")
             self.current_epoch = 0
             self.global_step = 0
             self.best_val_loss = float('inf')
             self.patience_counter = 0
     
     def train_epoch(self, epoch):
-        """Train one epoch"""
+        """Train one epoch with autoregressive generation"""
         self.model.train()
         total_loss = 0
         loss_components = defaultdict(float)
         
+        teacher_forcing_ratio = self.get_teacher_forcing_ratio(epoch)
+        
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs}")
         
         for step, batch in enumerate(progress_bar):
-            # Move only tensor fields to device (skip string fields like img_id, question)
             tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
                            if torch.is_tensor(v)}
             
-            # Prepare labels (mask padding tokens with -100)
+            # Prepare labels
             reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
             reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
             
             answer_labels = tensor_batch['answer_input_ids'].clone()
             answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
             
-            # Forward pass
-            with autocast(enabled=self.use_amp):
-                outputs = self.model(
-                    pixel_values=tensor_batch['pixel_values'],
-                    input_ids=tensor_batch['input_ids'],
-                    attention_mask=tensor_batch['attention_mask'],
-                    reasoning_input_ids=tensor_batch['reasoning_input_ids'],
-                    reasoning_attention_mask=tensor_batch['reasoning_attention_mask'],
-                    answer_input_ids=tensor_batch['answer_input_ids'],
-                    answer_attention_mask=tensor_batch['answer_attention_mask']
-                )
-                
-                loss, loss_dict = self.criterion(outputs, reasoning_labels, answer_labels)
-                loss = loss / self.gradient_accumulation_steps
+            # Decide: use teacher forcing or generation
+            use_teacher_forcing = random.random() < teacher_forcing_ratio
             
-            # Backward pass
+            try:
+                with autocast(enabled=self.use_amp):
+                    if use_teacher_forcing:
+                        # Teacher forcing: use ground truth reasoning
+                        outputs = self.model(
+                            pixel_values=tensor_batch['pixel_values'],
+                            input_ids=tensor_batch['input_ids'],
+                            attention_mask=tensor_batch['attention_mask'],
+                            reasoning_input_ids=tensor_batch['reasoning_input_ids'],
+                            reasoning_attention_mask=tensor_batch['reasoning_attention_mask'],
+                            answer_input_ids=tensor_batch['answer_input_ids'],
+                            answer_attention_mask=tensor_batch['answer_attention_mask']
+                        )
+                        reasoning_logits = outputs.reasoning_logits
+                        answer_logits = outputs.answer_logits
+                    else:
+                        # Autoregressive: generate reasoning first
+                        with torch.no_grad():  # No gradients for generation
+                            reasoning_outputs = self.model.generate_reasoning(
+                                pixel_values=tensor_batch['pixel_values'],
+                                input_ids=tensor_batch['input_ids'],
+                                attention_mask=tensor_batch['attention_mask'],
+                                max_length=96,
+                                num_beams=1,  # Greedy for memory efficiency
+                                do_sample=False
+                            )
+                            # Detach to save memory
+                            reasoning_outputs = reasoning_outputs.detach()
+                        
+                        # Clear cache after generation
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                        # Forward pass with generated reasoning
+                        reasoning_forward = self.model(
+                            pixel_values=tensor_batch['pixel_values'],
+                            input_ids=tensor_batch['input_ids'],
+                            attention_mask=tensor_batch['attention_mask'],
+                            reasoning_input_ids=reasoning_outputs,
+                            reasoning_attention_mask=(reasoning_outputs != self.model.tokenizer.pad_token_id).long(),
+                            answer_input_ids=tensor_batch['answer_input_ids'],
+                            answer_attention_mask=tensor_batch['answer_attention_mask']
+                        )
+                        reasoning_logits = reasoning_forward.reasoning_logits
+                        answer_logits = reasoning_forward.answer_logits
+                    
+                    # Compute loss
+                    loss, loss_dict = self.criterion(
+                        reasoning_logits, answer_logits, 
+                        reasoning_labels, answer_labels
+                    )
+                    loss = loss / self.gradient_accumulation_steps
+                    
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n[WARNING] OOM at step {step}! Saving checkpoint and clearing cache...")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    # Save emergency checkpoint
+                    self.save_checkpoint(epoch, force_save=True)
+                    # Skip this batch
+                    continue
+                else:
+                    raise e
+            
+            # Backward
             if self.use_amp:
                 self.scaler.scale(loss).backward()
             else:
@@ -544,18 +563,24 @@ class VQATrainer:
             for k, v in loss_dict.items():
                 loss_components[k] += v
             
-            # Clear cache periodically to prevent memory buildup
-            if (step + 1) % (self.gradient_accumulation_steps * 10) == 0:
+            # Save periodic checkpoint (OOM safety)
+            if self.save_steps > 0 and self.global_step > 0 and self.global_step % self.save_steps == 0:
+                print(f"\n[INFO] Saving periodic checkpoint at step {self.global_step}...")
+                self.save_checkpoint(epoch, force_save=True)
+            
+            # Aggressive cache clearing for autoregressive generation
+            if (step + 1) % self.gradient_accumulation_steps == 0:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
-            # Update progress bar
+            # Update progress
             if (step + 1) % self.log_steps == 0:
                 avg_loss = total_loss / (step + 1)
                 current_lr = self.scheduler.get_last_lr()[0]
                 progress_bar.set_postfix({
                     'loss': f'{avg_loss:.4f}',
-                    'lr': f'{current_lr:.2e}'
+                    'lr': f'{current_lr:.2e}',
+                    'tf': f'{teacher_forcing_ratio:.2f}'
                 })
         
         # Average losses
@@ -567,83 +592,140 @@ class VQATrainer:
     
     @torch.no_grad()
     def validate(self, epoch):
-        """Validate với reasoning quality metrics"""
+        """Validate with full generation (memory-efficient)"""
         self.model.eval()
         total_loss = 0
         loss_components = defaultdict(float)
-        reasoning_confidences = []
+        num_batches = 0
         
         progress_bar = tqdm(self.val_loader, desc="Evaluating")
         
-        for batch in progress_bar:
-            # Move only tensor fields to device (skip string fields like img_id, question)
-            tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
-                           if torch.is_tensor(v)}
-            
-            # Prepare labels (mask padding tokens with -100)
-            reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
-            reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
-            
-            answer_labels = tensor_batch['answer_input_ids'].clone()
-            answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
-            
-            with autocast(enabled=self.use_amp):
-                outputs = self.model(
-                    pixel_values=tensor_batch['pixel_values'],
-                    input_ids=tensor_batch['input_ids'],
-                    attention_mask=tensor_batch['attention_mask'],
-                    reasoning_input_ids=tensor_batch['reasoning_input_ids'],
-                    reasoning_attention_mask=tensor_batch['reasoning_attention_mask'],
-                    answer_input_ids=tensor_batch['answer_input_ids'],
-                    answer_attention_mask=tensor_batch['answer_attention_mask']
-                )
+        for batch_idx, batch in enumerate(progress_bar):
+            try:
+                tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
+                               if torch.is_tensor(v)}
                 
-                loss, loss_dict = self.criterion(outputs, reasoning_labels, answer_labels)
-            
-            total_loss += loss.item()
-            for k, v in loss_dict.items():
-                loss_components[k] += v
-            
-            # Collect reasoning confidences
-            if outputs.reasoning_confidence is not None:
-                reasoning_confidences.extend(outputs.reasoning_confidence.cpu().numpy())
+                # Prepare labels
+                reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
+                reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
+                
+                answer_labels = tensor_batch['answer_input_ids'].clone()
+                answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
+                
+                with autocast(enabled=self.use_amp):
+                    # Generate reasoning
+                    reasoning_outputs = self.model.generate_reasoning(
+                        pixel_values=tensor_batch['pixel_values'],
+                        input_ids=tensor_batch['input_ids'],
+                        attention_mask=tensor_batch['attention_mask'],
+                        max_length=96,
+                        num_beams=1,
+                        do_sample=False
+                    )
+                    
+                    # Clear cache after generation
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # Forward pass to get logits
+                    outputs = self.model(
+                        pixel_values=tensor_batch['pixel_values'],
+                        input_ids=tensor_batch['input_ids'],
+                        attention_mask=tensor_batch['attention_mask'],
+                        reasoning_input_ids=reasoning_outputs,
+                        reasoning_attention_mask=(reasoning_outputs != self.model.tokenizer.pad_token_id).long(),
+                        answer_input_ids=tensor_batch['answer_input_ids'],
+                        answer_attention_mask=tensor_batch['answer_attention_mask']
+                    )
+                    
+                    loss, loss_dict = self.criterion(
+                        outputs.reasoning_logits, outputs.answer_logits,
+                        reasoning_labels, answer_labels
+                    )
+                
+                total_loss += loss.item()
+                for k, v in loss_dict.items():
+                    loss_components[k] += v
+                num_batches += 1
+                
+                # Periodic cache clearing
+                if (batch_idx + 1) % 10 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n[WARNING] OOM during validation at batch {batch_idx}! Skipping...")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
         
         # Average
-        avg_loss = total_loss / len(self.val_loader)
-        for k in loss_components:
-            loss_components[k] /= len(self.val_loader)
-        
-        # Reasoning quality stats
-        if reasoning_confidences:
-            loss_components['reasoning_confidence_mean'] = np.mean(reasoning_confidences)
-            loss_components['reasoning_confidence_std'] = np.std(reasoning_confidences)
+        if num_batches > 0:
+            avg_loss = total_loss / num_batches
+            for k in loss_components:
+                loss_components[k] /= num_batches
+        else:
+            print("[WARNING] No batches completed in validation!")
+            avg_loss = float('inf')
+            loss_components = {'reasoning_loss': 0, 'answer_loss': 0, 'total_loss': 0}
         
         return avg_loss, dict(loss_components)
     
     def train(self):
         """Main training loop"""
         print(f"\n{'='*70}")
-        print(f"TRAINING STAGE: {self.stage_name}")
+        print(f"AUTOREGRESSIVE COT TRAINING: {self.stage_name}")
         print(f"{'='*70}\n")
         
         for epoch in range(self.current_epoch, self.num_epochs):
+            # Get teacher forcing ratio
+            tf_ratio = self.get_teacher_forcing_ratio(epoch)
+            
             # Train
-            train_loss, train_components = self.train_epoch(epoch)
+            try:
+                train_loss, train_components = self.train_epoch(epoch)
+                
+                print(f"\n[EPOCH {epoch+1}] Train Loss: {train_loss:.4f} (TF: {tf_ratio:.2f})")
+                for k, v in train_components.items():
+                    print(f"  {k}: {v:.4f}")
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n[ERROR] OOM during training epoch {epoch+1}!")
+                    self.save_checkpoint(epoch, force_save=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    raise e
+                else:
+                    raise e
             
-            # Log training
-            print(f"\n[EPOCH {epoch+1}] Train Loss: {train_loss:.4f}")
-            for k, v in train_components.items():
-                print(f"  {k}: {v:.4f}")
+            # Validate (skip if not validation epoch)
+            should_validate = (epoch + 1) % self.validate_every_n_epochs == 0
             
-            # Validate
-            val_loss, val_components = self.validate(epoch)
+            if should_validate:
+                try:
+                    val_loss, val_components = self.validate(epoch)
+                    
+                    print(f"\n[VALIDATION] Loss: {val_loss:.4f}")
+                    for k, v in val_components.items():
+                        print(f"  {k}: {v:.4f}")
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"\n[WARNING] OOM during validation! Skipping validation this epoch.")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        val_loss = float('inf')
+                        val_components = {'reasoning_loss': 0, 'answer_loss': 0, 'total_loss': 0}
+                    else:
+                        raise e
+            else:
+                print(f"\n[INFO] Skipping validation (every {self.validate_every_n_epochs} epochs)")
+                val_loss = self.best_val_loss  # Use previous best
+                val_components = {'reasoning_loss': 0, 'answer_loss': 0, 'total_loss': 0}
             
-            # Log validation
-            print(f"\n[VALIDATION] Loss: {val_loss:.4f}")
-            for k, v in val_components.items():
-                print(f"  {k}: {v:.4f}")
-            
-            # Save best model
+            # Save best
             is_best = False
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
@@ -654,45 +736,38 @@ class VQATrainer:
                 self.patience_counter += 1
                 print(f"[INFO] No improvement. Patience: {self.patience_counter}/{self.patience}")
             
-            # Save latest checkpoint
+            # Save latest
             self.save_checkpoint(epoch, val_loss, is_best=False)
             
             # Log to CSV
-            self.log_to_csv(epoch, train_components, val_components, is_best)
+            self.log_to_csv(epoch, train_components, val_components, tf_ratio, is_best)
             
             # Early stopping
             if self.patience_counter >= self.patience:
-                print(f"\n[INFO] Early stopping triggered at epoch {epoch+1}")
+                print(f"\n[INFO] Early stopping at epoch {epoch+1}")
                 break
         
         print(f"\n{'='*70}")
-        print(f"STAGE {self.stage_name} COMPLETE")
+        print(f"TRAINING COMPLETE")
         print(f"{'='*70}")
         print(f"Best validation loss: {self.best_val_loss:.4f}")
-        print(f"Best model: {self.best_model_path}")
 
 
 # ============================================================================
-# 4. STAGE TRAINING STRATEGY
+# 4. STAGE FUNCTIONS
 # ============================================================================
 
 def freeze_module(module, name):
-    """Freeze all parameters in module"""
     for param in module.parameters():
         param.requires_grad = False
     print(f"[INFO] ✓ Frozen {name}")
 
-
 def unfreeze_module(module, name):
-    """Unfreeze all parameters in module"""
     for param in module.parameters():
         param.requires_grad = True
     print(f"[INFO] ✓ Unfrozen {name}")
 
-
 def unfreeze_last_n_layers(module, name, n_layers=2):
-    """Unfreeze last N transformer layers"""
-    # For DINOv2
     if hasattr(module, 'encoder') and hasattr(module.encoder, 'layer'):
         total_layers = len(module.encoder.layer)
         for i, layer in enumerate(module.encoder.layer):
@@ -700,7 +775,6 @@ def unfreeze_last_n_layers(module, name, n_layers=2):
                 for param in layer.parameters():
                     param.requires_grad = True
         print(f"[INFO] ✓ Unfrozen last {n_layers} layers of {name}")
-    # For BARTpho encoder
     elif hasattr(module, 'layers'):
         total_layers = len(module.layers)
         for i, layer in enumerate(module.layers):
@@ -715,23 +789,23 @@ def unfreeze_last_n_layers(module, name, n_layers=2):
 # ============================================================================
 
 def main():
-    """Main training với staged unfreezing"""
+    """Main training with autoregressive CoT"""
     
     CONFIG = {
         # Paths
         'train_json': '/kaggle/input/teacher-3-12/teacher_outputs_train.jsonl',
         'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
-        'output_dir': '/kaggle/working/checkpoints_dinov2_bartpho',
+        'output_dir': '/kaggle/working/checkpoints_autoregressive_cot',
         
         # Data
         'val_split': 0.1,
         'random_seed': 42,
         
         # Training
-        'batch_size': 1,  # Reduced to save GPU memory
-        'gradient_accumulation_steps': 64,  # Increased to maintain effective batch size
-        'num_epochs': 54,  # Total epochs across all stages
-        'learning_rate': 3e-5,  # Lower LR cho large model
+        'batch_size': 1,
+        'gradient_accumulation_steps': 64,
+        'num_epochs': 54,
+        'learning_rate': 3e-5,
         'weight_decay': 0.01,
         'warmup_ratio': 0.1,
         'max_grad_norm': 1.0,
@@ -739,23 +813,24 @@ def main():
         # Loss weights
         'alpha_reasoning': 0.6,
         'alpha_answer': 0.4,
-        'alpha_quality': 0.1,
-        'label_smoothing': 0.0,  # Removed to lower loss (was causing artificially high loss)
+        'label_smoothing': 0.0,
+        
+        # Scheduled sampling
+        'scheduled_sampling_start': 1.0,  # Start with 100% teacher forcing
+        'scheduled_sampling_end': 0.0,    # End with 0% teacher forcing (full generation)
+        'scheduled_sampling_anneal_epochs': 10,  # Anneal over first 10 epochs
         
         # Advanced
         'use_amp': True,
-        'patience': 8,  # Increased to allow more training
+        'patience': 8,
         'log_steps': 10,
-        'eval_steps': 0,
-        'save_steps': 0,
-        'use_wandb': False,
         
         # Resume
-        'resume_from': None,  # Stage 1 complete, resume at stage 2 level
+        'resume_from': None,
     }
     
     print("="*70)
-    print("SOTA VQA TRAINING: DINOv2 + BARTpho")
+    print("AUTOREGRESSIVE COT TRAINING: DINOv2 + BARTpho")
     print("="*70)
     print("\nConfiguration:")
     for k, v in CONFIG.items():
@@ -772,8 +847,8 @@ def main():
         dinov2_model_name='facebook/dinov2-base',
         bartpho_model_name='vinai/bartpho-syllable',
         num_cross_attn_layers=3,
-        num_heads=16,  # Must be divisible: 1024 ÷ 16 = 64
-        use_reasoning_quality_check=True,
+        num_heads=16,
+        use_reasoning_quality_check=False,  # Not used in autoregressive training
         gradient_checkpointing=True
     )
     
@@ -817,32 +892,24 @@ def main():
     
     # ===== STAGED TRAINING =====
     print("\n" + "="*70)
-    print("STAGED TRAINING STRATEGY")
+    print("AUTOREGRESSIVE COT STAGED TRAINING")
     print("="*70)
-    print("Stage 1: Train fusion + heads only (15 epochs)")
-    print("Stage 2: Unfreeze DINOv2 last 4 layers (12 epochs)")
-    print("Stage 3: Unfreeze BARTpho encoder last 6 layers (12 epochs)")
+    print("Stage 1: Fusion + heads (15 epochs)")
+    print("Stage 2: DINOv2 last 4 layers (12 epochs)")
+    print("Stage 3: BARTpho encoder last 6 layers (12 epochs)")
     print("Stage 4: Full fine-tuning (15 epochs)")
-    print("Total: 54 epochs")
     print("="*70 + "\n")
     
-    # === STAGE 1: SKIPPED (already completed) ===
-    print("\n[STAGE 1/4] SKIPPED - Stage 1 already completed")
-    print("[INFO] Resuming from Stage 2 checkpoint...")
-    
-    # Note: Stage 1 completed, skip to Stage 2
-    # Uncomment below to retrain Stage 1:
-    """
-    print("\n[STAGE 1/4] Training fusion + heads (encoders frozen)...")
+    # === STAGE 1 ===
+    print("\n[STAGE 1/4] Training fusion + heads...")
     freeze_module(model.vision_encoder, "DINOv2")
     freeze_module(model.bartpho.model.encoder, "BARTpho Encoder")
     freeze_module(model.bartpho.model.decoder, "BARTpho Decoder")
     
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
     
-    trainer_s1 = VQATrainer(
+    trainer_s1 = AutoregressiveCOTTrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -856,14 +923,15 @@ def main():
         max_grad_norm=CONFIG['max_grad_norm'],
         alpha_reasoning=CONFIG['alpha_reasoning'],
         alpha_answer=CONFIG['alpha_answer'],
-        alpha_quality=CONFIG['alpha_quality'],
         label_smoothing=CONFIG['label_smoothing'],
         use_amp=CONFIG['use_amp'],
         patience=CONFIG['patience'],
         log_steps=CONFIG['log_steps'],
-        eval_steps=CONFIG['eval_steps'],
-        save_steps=CONFIG['save_steps'],
-        use_wandb=CONFIG['use_wandb'],
+        save_steps=100,  # Save every 100 steps for OOM safety
+        validate_every_n_epochs=1,  # Validate every epoch
+        scheduled_sampling_start=CONFIG['scheduled_sampling_start'],
+        scheduled_sampling_end=CONFIG['scheduled_sampling_end'],
+        scheduled_sampling_anneal_epochs=CONFIG['scheduled_sampling_anneal_epochs'],
         resume_checkpoint=CONFIG['resume_from'],
         stage_name="stage1"
     )
@@ -871,17 +939,12 @@ def main():
     
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory after Stage 1: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    """
     
-    # === STAGE 2: Unfreeze DINOv2 last layers ===
+    # === STAGE 2 ===
     print("\n[STAGE 2/4] Unfreezing DINOv2 last 4 layers...")
     unfreeze_last_n_layers(model.vision_encoder, "DINOv2", n_layers=4)
     
-    # Resume checkpoint for stage 2 (use latest to continue from last epoch)
-    stage2_resume = '/kaggle/input/s2/transformers/default/1/checkpoint_stage2_latest.pt'
-    
-    trainer_s2 = VQATrainer(
+    trainer_s2 = AutoregressiveCOTTrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -889,36 +952,35 @@ def main():
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
         num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.8,  # Increased from 0.5x to learn faster
+        learning_rate=CONFIG['learning_rate'] * 0.8,
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
         max_grad_norm=CONFIG['max_grad_norm'],
         alpha_reasoning=CONFIG['alpha_reasoning'],
         alpha_answer=CONFIG['alpha_answer'],
-        alpha_quality=CONFIG['alpha_quality'],
         label_smoothing=CONFIG['label_smoothing'],
         use_amp=CONFIG['use_amp'],
         patience=CONFIG['patience'],
         log_steps=CONFIG['log_steps'],
-        eval_steps=CONFIG['eval_steps'],
-        save_steps=CONFIG['save_steps'],
-        use_wandb=CONFIG['use_wandb'],
-        resume_checkpoint=stage2_resume,  # Resume from stage 2 latest
-        load_optimizer=True,  # Load optimizer state to continue same stage
+        save_steps=100,  # Save every 100 steps for OOM safety
+        validate_every_n_epochs=1,  # Validate every epoch
+        scheduled_sampling_start=0.0,  # No teacher forcing in later stages
+        scheduled_sampling_end=0.0,
+        scheduled_sampling_anneal_epochs=0,
+        resume_checkpoint=trainer_s1.best_model_path,
+        load_optimizer=False,
         stage_name="stage2"
     )
     trainer_s2.train()
     
-    # Clear GPU cache between stages
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory after Stage 2: {torch.cuda.memory_allocated()/1e9:.2f}GB")
     
-    # === STAGE 3: Unfreeze BARTpho encoder last layers ===
+    # === STAGE 3 ===
     print("\n[STAGE 3/4] Unfreezing BARTpho encoder last 6 layers...")
     unfreeze_last_n_layers(model.bartpho.model.encoder, "BARTpho Encoder", n_layers=6)
     
-    trainer_s3 = VQATrainer(
+    trainer_s3 = AutoregressiveCOTTrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -926,38 +988,35 @@ def main():
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
         num_epochs=12,
-        learning_rate=CONFIG['learning_rate'] * 0.5,  # Increased from 0.3x to learn faster
+        learning_rate=CONFIG['learning_rate'] * 0.5,
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
         max_grad_norm=CONFIG['max_grad_norm'],
         alpha_reasoning=CONFIG['alpha_reasoning'],
         alpha_answer=CONFIG['alpha_answer'],
-        alpha_quality=CONFIG['alpha_quality'],
         label_smoothing=CONFIG['label_smoothing'],
         use_amp=CONFIG['use_amp'],
         patience=CONFIG['patience'],
         log_steps=CONFIG['log_steps'],
-        eval_steps=CONFIG['eval_steps'],
-        save_steps=CONFIG['save_steps'],
-        use_wandb=CONFIG['use_wandb'],
+        scheduled_sampling_start=0.0,
+        scheduled_sampling_end=0.0,
+        scheduled_sampling_anneal_epochs=0,
         resume_checkpoint=trainer_s2.best_model_path,
-        load_optimizer=False,  # Stage transition - model weights only
+        load_optimizer=False,
         stage_name="stage3"
     )
     trainer_s3.train()
     
-    # Clear GPU cache between stages
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        print(f"[INFO] GPU Memory after Stage 3: {torch.cuda.memory_allocated()/1e9:.2f}GB")
     
-    # === STAGE 4: Full fine-tuning ===
-    print("\n[STAGE 4/4] Full fine-tuning (all layers unfrozen)...")
+    # === STAGE 4 ===
+    print("\n[STAGE 4/4] Full fine-tuning...")
     unfreeze_module(model.vision_encoder, "DINOv2")
     unfreeze_module(model.bartpho.model.encoder, "BARTpho Encoder")
     unfreeze_last_n_layers(model.bartpho.model.decoder, "BARTpho Decoder", n_layers=6)
     
-    trainer_s4 = VQATrainer(
+    trainer_s4 = AutoregressiveCOTTrainer(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -965,27 +1024,26 @@ def main():
         batch_size=CONFIG['batch_size'],
         gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
         num_epochs=15,
-        learning_rate=CONFIG['learning_rate'] * 0.2,  # Increased from 0.1x for better final tuning
+        learning_rate=CONFIG['learning_rate'] * 0.2,
         weight_decay=CONFIG['weight_decay'],
         warmup_ratio=CONFIG['warmup_ratio'],
         max_grad_norm=CONFIG['max_grad_norm'],
         alpha_reasoning=CONFIG['alpha_reasoning'],
         alpha_answer=CONFIG['alpha_answer'],
-        alpha_quality=CONFIG['alpha_quality'],
         label_smoothing=CONFIG['label_smoothing'],
         use_amp=CONFIG['use_amp'],
         patience=CONFIG['patience'],
         log_steps=CONFIG['log_steps'],
-        eval_steps=CONFIG['eval_steps'],
-        save_steps=CONFIG['save_steps'],
-        use_wandb=CONFIG['use_wandb'],
+        scheduled_sampling_start=0.0,
+        scheduled_sampling_end=0.0,
+        scheduled_sampling_anneal_epochs=0,
         resume_checkpoint=trainer_s3.best_model_path,
-        load_optimizer=False,  # Stage transition - model weights only
+        load_optimizer=False,
         stage_name="stage4"
     )
     trainer_s4.train()
     
-    print("\n[INFO] Training completed successfully!")
+    print("\n[INFO] Training completed!")
     print(f"[INFO] Final best model: {trainer_s4.best_model_path}")
 
 
