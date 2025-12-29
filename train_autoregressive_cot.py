@@ -338,6 +338,18 @@ class AutoregressiveCOTTrainer:
             else:
                 # New progressive checkpoint
                 self.load_checkpoint(resume_checkpoint, load_optimizer=load_opt)
+        else:
+            # No checkpoint - create scheduler and init CSV logger
+            self.init_csv_logger()
+            remaining_epochs = self.num_epochs - self.current_epoch
+            num_training_steps = len(self.train_loader) * remaining_epochs // self.gradient_accumulation_steps
+            num_warmup_steps = int(num_training_steps * self.warmup_ratio)
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps
+            )
+            print(f"[INFO] Scheduler: {remaining_epochs} epochs, {num_training_steps} steps, {num_warmup_steps} warmup")
         
         print(f"\n[INFO] Autoregressive COT Trainer initialized")
         print(f"  Stage: {stage_name}")
@@ -472,9 +484,9 @@ class AutoregressiveCOTTrainer:
         self.init_csv_logger()
         
         # Create scheduler AFTER loading checkpoint (based on remaining epochs)
-        remaining_epochs = num_epochs - self.current_epoch
-        num_training_steps = len(self.train_loader) * remaining_epochs // gradient_accumulation_steps
-        num_warmup_steps = int(num_training_steps * warmup_ratio) if self.current_epoch == 0 else 0
+        remaining_epochs = self.num_epochs - self.current_epoch
+        num_training_steps = len(self.train_loader) * remaining_epochs // self.gradient_accumulation_steps
+        num_warmup_steps = int(num_training_steps * self.warmup_ratio) if self.current_epoch == 0 else 0
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=num_warmup_steps,
