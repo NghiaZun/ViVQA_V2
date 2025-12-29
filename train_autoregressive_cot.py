@@ -341,15 +341,14 @@ class AutoregressiveCOTTrainer:
         else:
             # No checkpoint - create scheduler and init CSV logger
             self.init_csv_logger()
-            remaining_epochs = self.num_epochs - self.current_epoch
-            num_training_steps = len(self.train_loader) * remaining_epochs // self.gradient_accumulation_steps
-            num_warmup_steps = int(num_training_steps * self.warmup_ratio)
+            total_steps = len(self.train_loader) * self.num_epochs // self.gradient_accumulation_steps
+            num_warmup_steps = int(total_steps * self.warmup_ratio)
             self.scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
                 num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps
+                num_training_steps=total_steps
             )
-            print(f"[INFO] Scheduler: {remaining_epochs} epochs, {num_training_steps} steps, {num_warmup_steps} warmup")
+            print(f"[INFO] Scheduler: {self.num_epochs} epochs, {total_steps} steps, {num_warmup_steps} warmup")
         
         print(f"\n[INFO] Autoregressive COT Trainer initialized")
         print(f"  Stage: {stage_name}")
@@ -483,17 +482,25 @@ class AutoregressiveCOTTrainer:
         # Initialize CSV logger AFTER loading checkpoint
         self.init_csv_logger()
         
-        # Create scheduler AFTER loading checkpoint (based on remaining epochs)
-        remaining_epochs = self.num_epochs - self.current_epoch
-        num_training_steps = len(self.train_loader) * remaining_epochs // self.gradient_accumulation_steps
-        num_warmup_steps = int(num_training_steps * self.warmup_ratio) if self.current_epoch == 0 else 0
+        # Create scheduler AFTER loading checkpoint
+        # Always use full training schedule, then fast-forward if resuming
+        total_steps = len(self.train_loader) * self.num_epochs // self.gradient_accumulation_steps
+        num_warmup_steps = int(total_steps * self.warmup_ratio)
         self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
+            num_training_steps=total_steps
         )
         
-        print(f"[INFO] Scheduler: {remaining_epochs} remaining epochs, {num_training_steps} steps, {num_warmup_steps} warmup")
+        # Fast-forward scheduler to current position if resuming
+        if self.current_epoch > 0:
+            steps_completed = len(self.train_loader) * self.current_epoch // self.gradient_accumulation_steps
+            for _ in range(steps_completed):
+                self.scheduler.step()
+            print(f"[INFO] Scheduler fast-forwarded {steps_completed} steps to match epoch {self.current_epoch}")
+        
+        remaining_epochs = self.num_epochs - self.current_epoch
+        print(f"[INFO] Scheduler: {remaining_epochs} remaining epochs, {total_steps} total steps, {num_warmup_steps} warmup")
     
     def handle_stage_transition(self, epoch):
         """Check and handle stage transitions based on epoch milestones"""
