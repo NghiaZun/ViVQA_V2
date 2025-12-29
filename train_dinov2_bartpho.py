@@ -361,30 +361,33 @@ class VQATrainer:
             
             # If checkpoint is from old stage system, need to manually set epoch
             if epoch_offset > 0:
-                # Load model weights only, then manually set the epoch
-                self.load_checkpoint(resume_checkpoint, load_optimizer=False, epoch_offset=0)
-                # Manually set the correct epoch based on checkpoint
-                try:
-                    checkpoint = torch.load(resume_checkpoint, map_location=self.device)
-                    checkpoint_epoch = checkpoint.get('epoch', 0)
-                    self.current_epoch = checkpoint_epoch + epoch_offset + 1  # Map to global epoch
-                    print(f"[INFO] Manually set global epoch: {self.current_epoch} (checkpoint epoch {checkpoint_epoch} + offset {epoch_offset} + 1)")
-                except:
-                    pass
+                # Load model weights only (without creating scheduler inside)
+                self.load_checkpoint_model_only(resume_checkpoint, epoch_offset)
             else:
-                # New progressive checkpoint - can load full state
-                self.load_checkpoint(resume_checkpoint, load_optimizer=load_opt, epoch_offset=epoch_offset)
-        else:
-            # No checkpoint - create scheduler and init CSV logger
-            self.init_csv_logger()
-            total_steps = len(self.train_loader) * self.num_epochs // self.gradient_accumulation_steps
-            num_warmup_steps = int(total_steps * self.warmup_ratio)
-            self.scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=total_steps
-            )
-            print(f"[INFO] Scheduler: {self.num_epochs} epochs, {total_steps} steps, {num_warmup_steps} warmup")
+                # New progressive checkpoint - can load full state (without creating scheduler inside)
+                self.load_checkpoint_model_only(resume_checkpoint, epoch_offset=0, load_optimizer=load_opt)
+        
+        # Initialize CSV logger
+        self.init_csv_logger()
+        
+        # Create scheduler AFTER loading checkpoint (so current_epoch is correct)
+        total_steps = len(self.train_loader) * self.num_epochs // self.gradient_accumulation_steps
+        num_warmup_steps = int(total_steps * self.warmup_ratio)
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=total_steps
+        )
+        
+        # Fast-forward scheduler to current position if resuming
+        if self.current_epoch > 0:
+            steps_completed = len(self.train_loader) * self.current_epoch // self.gradient_accumulation_steps
+            for _ in range(steps_completed):
+                self.scheduler.step()
+            print(f"[INFO] Scheduler fast-forwarded {steps_completed} steps to match epoch {self.current_epoch}")
+        
+        remaining_epochs = self.num_epochs - self.current_epoch
+        print(f"[INFO] Scheduler: {remaining_epochs} remaining epochs, {total_steps} total steps, {num_warmup_steps} warmup")
         
         # Note: scheduler is created AFTER checkpoint loading (see above)
         
@@ -472,6 +475,90 @@ class VQATrainer:
         # Also save latest checkpoint
         latest_path = self.output_dir / f'checkpoint_{self.stage_name}_latest.pt'
         torch.save(checkpoint, latest_path)
+    
+    def load_checkpoint_model_only(self, checkpoint_path, epoch_offset=0, load_optimizer=False):
+        """Load checkpoint without creating scheduler (scheduler created in __init__)
+        
+        Args:
+            checkpoint_path: Path to checkpoint file
+            epoch_offset: Offset to add to checkpoint epoch (for old stage-based checkpoints)
+            load_optimizer: If True, load optimizer state; if False, only load model weights
+        """
+        print(f"[INFO] Loading checkpoint from {checkpoint_path}...")
+        
+        # Check if file exists
+        if not os.path.exists(checkpoint_path):
+            print(f"[ERROR] Checkpoint file not found: {checkpoint_path}")
+            print(f"[INFO] Starting from scratch instead")
+            return
+        
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            print(f"[INFO] ✓ Checkpoint loaded successfully")
+            print(f"[INFO]   Checkpoint epoch: {checkpoint.get('epoch', 'N/A')}")
+            print(f"[INFO]   Checkpoint stage: {checkpoint.get('stage_name', 'N/A')}")
+            print(f"[INFO]   Checkpoint global_step: {checkpoint.get('global_step', 'N/A')}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load checkpoint: {e}")
+            print(f"[INFO] Starting from scratch instead")
+            return
+        
+        # Always load model weights
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"[INFO] ✓ Model weights loaded")
+        except Exception as e:
+            print(f"[ERROR] Failed to load model weights: {e}")
+            return
+        
+        if load_optimizer:
+            # Load optimizer state (for same-stage resume)
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                
+                # Map old epoch to new global epoch system
+                checkpoint_epoch = checkpoint['epoch']
+                mapped_epoch = checkpoint_epoch + epoch_offset
+                self.current_epoch = mapped_epoch + 1  # Start from next epoch
+                
+                # Keep global_step for tracking
+                self.global_step = checkpoint['global_step']
+                self.best_val_loss = checkpoint['best_val_loss']
+                self.patience_counter = checkpoint.get('patience_counter', 0)
+                
+                if self.scaler and 'scaler_state_dict' in checkpoint:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                
+                print(f"[INFO] ✓ Full state loaded (optimizer + scaler)")
+                if epoch_offset > 0:
+                    print(f"[INFO]   Checkpoint epoch {checkpoint_epoch} → Global epoch {mapped_epoch} (offset +{epoch_offset})")
+                print(f"[INFO]   Resuming from global epoch {self.current_epoch}")
+                print(f"[INFO]   Best val loss: {self.best_val_loss:.4f}")
+                print(f"[INFO]   Global step: {self.global_step}")
+                print(f"[INFO]   Patience counter: {self.patience_counter}")
+            except Exception as e:
+                print(f"[WARNING] Failed to load optimizer state: {e}")
+                print(f"[INFO] Continuing with fresh optimizer (starting from epoch 0)")
+                # Reset on failure
+                self.current_epoch = 0
+                self.global_step = 0
+                self.best_val_loss = float('inf')
+                self.patience_counter = 0
+        else:
+            # Only load model weights (for stage transition)
+            checkpoint_epoch = checkpoint.get('epoch', 0)
+            mapped_epoch = checkpoint_epoch + epoch_offset
+            self.current_epoch = mapped_epoch + 1  # Start from next epoch
+            
+            print(f"[INFO] ✓ Model-only load (fresh optimizer)")
+            if epoch_offset > 0:
+                print(f"[INFO]   Checkpoint epoch {checkpoint_epoch} → Global epoch {mapped_epoch} (offset +{epoch_offset})")
+            print(f"[INFO]   Resuming from global epoch {self.current_epoch}")
+            
+            # Reset training state for new stage
+            self.global_step = 0
+            self.best_val_loss = float('inf')
+            self.patience_counter = 0
     
     def load_checkpoint(self, checkpoint_path, load_optimizer=True, epoch_offset=0):
         """Load training state for resume
@@ -884,7 +971,7 @@ def main():
         'use_wandb': False,
         
         # Resume
-        'resume_from': '/kaggle/input/s2/transformers/default/1/checkpoint_stage2_latest.pt',
+        'resume_from': None,  # Set to None to train from scratch
     }
     
     print("="*70)

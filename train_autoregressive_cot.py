@@ -326,29 +326,33 @@ class AutoregressiveCOTTrainer:
                 load_opt = False
             
             if epoch_offset > 0:
-                # Old checkpoint - load model only, manually set epoch
-                self.load_checkpoint(resume_checkpoint, load_optimizer=False)
-                try:
-                    checkpoint = torch.load(resume_checkpoint, map_location=self.device)
-                    checkpoint_epoch = checkpoint.get('epoch', 0)
-                    self.current_epoch = checkpoint_epoch + epoch_offset + 1
-                    print(f"[INFO] Manually set global epoch: {self.current_epoch} (checkpoint epoch {checkpoint_epoch} + offset {epoch_offset} + 1)")
-                except:
-                    pass
+                # Old checkpoint - load model only (without creating scheduler inside)
+                self.load_checkpoint_model_only(resume_checkpoint, epoch_offset)
             else:
-                # New progressive checkpoint
-                self.load_checkpoint(resume_checkpoint, load_optimizer=load_opt)
-        else:
-            # No checkpoint - create scheduler and init CSV logger
-            self.init_csv_logger()
-            total_steps = len(self.train_loader) * self.num_epochs // self.gradient_accumulation_steps
-            num_warmup_steps = int(total_steps * self.warmup_ratio)
-            self.scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=total_steps
-            )
-            print(f"[INFO] Scheduler: {self.num_epochs} epochs, {total_steps} steps, {num_warmup_steps} warmup")
+                # New progressive checkpoint (without creating scheduler inside)
+                self.load_checkpoint_model_only(resume_checkpoint, epoch_offset=0, load_optimizer=load_opt)
+        
+        # Initialize CSV logger
+        self.init_csv_logger()
+        
+        # Create scheduler AFTER loading checkpoint (so current_epoch is correct)
+        total_steps = len(self.train_loader) * self.num_epochs // self.gradient_accumulation_steps
+        num_warmup_steps = int(total_steps * self.warmup_ratio)
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=total_steps
+        )
+        
+        # Fast-forward scheduler to current position if resuming
+        if self.current_epoch > 0:
+            steps_completed = len(self.train_loader) * self.current_epoch // self.gradient_accumulation_steps
+            for _ in range(steps_completed):
+                self.scheduler.step()
+            print(f"[INFO] Scheduler fast-forwarded {steps_completed} steps to match epoch {self.current_epoch}")
+        
+        remaining_epochs = self.num_epochs - self.current_epoch
+        print(f"[INFO] Scheduler: {remaining_epochs} remaining epochs, {total_steps} total steps, {num_warmup_steps} warmup")
         
         print(f"\n[INFO] Autoregressive COT Trainer initialized")
         print(f"  Stage: {stage_name}")
@@ -448,6 +452,51 @@ class AutoregressiveCOTTrainer:
                 print(f"[INFO] ✓ Emergency model weights saved")
             except:
                 print(f"[ERROR] Could not save emergency checkpoint")
+    
+    def load_checkpoint_model_only(self, checkpoint_path, epoch_offset=0, load_optimizer=False):
+        """Load checkpoint without creating scheduler (scheduler created in __init__)
+        
+        Args:
+            checkpoint_path: Path to checkpoint file
+            epoch_offset: Offset to add to checkpoint epoch (for old stage-based checkpoints)
+            load_optimizer: If True, load optimizer state; if False, only load model weights
+        """
+        print(f"[INFO] Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"[INFO] ✓ Model weights loaded")
+        
+        if load_optimizer:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                checkpoint_epoch = checkpoint['epoch']
+                mapped_epoch = checkpoint_epoch + epoch_offset
+                self.current_epoch = mapped_epoch + 1
+                self.global_step = checkpoint['global_step']
+                self.best_val_loss = checkpoint['best_val_loss']
+                self.patience_counter = checkpoint.get('patience_counter', 0)
+                
+                if self.scaler and 'scaler_state_dict' in checkpoint:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                
+                print(f"[INFO] ✓ Full state loaded")
+                if epoch_offset > 0:
+                    print(f"[INFO]   Checkpoint epoch {checkpoint_epoch} → Global epoch {mapped_epoch} (offset +{epoch_offset})")
+                print(f"[INFO]   Resuming from epoch {self.current_epoch}")
+            except Exception as e:
+                print(f"[WARNING] Failed to load optimizer: {e}")
+        else:
+            checkpoint_epoch = checkpoint.get('epoch', 0)
+            mapped_epoch = checkpoint_epoch + epoch_offset
+            self.current_epoch = mapped_epoch + 1
+            print(f"[INFO] ✓ Model-only load")
+            if epoch_offset > 0:
+                print(f"[INFO]   Checkpoint epoch {checkpoint_epoch} → Global epoch {mapped_epoch} (offset +{epoch_offset})")
+            print(f"[INFO]   Resuming from epoch {self.current_epoch}")
+            self.global_step = 0
+            self.best_val_loss = float('inf')
+            self.patience_counter = 0
     
     def load_checkpoint(self, checkpoint_path, load_optimizer=True):
         """Load checkpoint"""
