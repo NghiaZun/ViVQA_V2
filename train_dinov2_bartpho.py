@@ -121,6 +121,14 @@ class VQADistillationDataset(Dataset):
             return_tensors='pt'
         )
         
+        # CRITICAL FIX: Mask pad tokens as -100 for loss calculation
+        # This ensures CrossEntropyLoss ignores padding tokens
+        reasoning_labels = reasoning_enc['input_ids'][0].clone()
+        reasoning_labels[reasoning_enc['attention_mask'][0] == 0] = -100
+        
+        answer_labels = answer_enc['input_ids'][0].clone()
+        answer_labels[answer_enc['attention_mask'][0] == 0] = -100
+        
         return {
             'pixel_values': pixel_values,
             'input_ids': question_enc['input_ids'][0],
@@ -129,8 +137,8 @@ class VQADistillationDataset(Dataset):
             'reasoning_attention_mask': reasoning_enc['attention_mask'][0],
             'answer_input_ids': answer_enc['input_ids'][0],
             'answer_attention_mask': answer_enc['attention_mask'][0],
-            'labels': answer_enc['input_ids'][0],  # For evaluation
-            'reasoning_labels': reasoning_enc['input_ids'][0],  # For evaluation
+            'labels': answer_labels,  # Pad tokens masked as -100
+            'reasoning_labels': reasoning_labels,  # Pad tokens masked as -100
             'img_id': item.get('image_id', item.get('img_id', f"img_{idx}")),  # For evaluation
             'question': item['question'],  # For evaluation (already string)
         }

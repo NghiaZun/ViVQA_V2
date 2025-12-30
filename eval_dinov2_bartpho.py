@@ -131,8 +131,10 @@ def evaluate_model(
                 # Compute metrics if GT available (decode from labels)
                 if gt_answer_labels is not None:
                     has_gt = True
-                    # Decode GT answer from labels tensor
+                    # Decode GT answer from labels tensor (filter -100 padding)
                     answer_label_ids = gt_answer_labels[i] if gt_answer_labels.dim() > 1 else gt_answer_labels
+                    # Filter out -100 tokens (padding mask)
+                    answer_label_ids = answer_label_ids[answer_label_ids != -100]
                     gt_answer = model.tokenizer.decode(answer_label_ids.cpu().tolist(), skip_special_tokens=True)
                     result_row['gt_answer'] = gt_answer
                     
@@ -158,6 +160,8 @@ def evaluate_model(
                 # Decode GT reasoning if available
                 if gt_reasoning_labels is not None:
                     reasoning_label_ids = gt_reasoning_labels[i] if gt_reasoning_labels.dim() > 1 else gt_reasoning_labels
+                    # Filter out -100 tokens (padding mask)
+                    reasoning_label_ids = reasoning_label_ids[reasoning_label_ids != -100]
                     gt_reasoning = model.tokenizer.decode(reasoning_label_ids.cpu().tolist(), skip_special_tokens=True)
                     result_row['gt_reasoning'] = gt_reasoning
                 
