@@ -169,8 +169,8 @@ class ChainOfThoughtLoss(nn.Module):
         """
         Args:
             outputs: CoTOutput from model
-            reasoning_labels: [batch, seq_len]
-            answer_labels: [batch, seq_len]
+            reasoning_labels: [batch, seq_len] (with -100 for padding)
+            answer_labels: [batch, seq_len] (with -100 for padding)
         Returns:
             loss, loss_dict
         """
@@ -189,15 +189,21 @@ class ChainOfThoughtLoss(nn.Module):
         )
         
         # Quality loss: Calibrate confidence based on actual correctness
+        # Only compute on valid (non-padding) tokens
         quality_loss = 0.0
         if outputs.reasoning_confidence is not None:
-            # Compute accuracy for each sample (simplified: check if argmax matches)
-            reasoning_preds = reasoning_logits.argmax(dim=-1)
-            reasoning_correct = (reasoning_preds == reasoning_labels).float().mean(dim=1)  # [batch]
+            # Compute accuracy for each sample on VALID tokens only
+            reasoning_preds = reasoning_logits.argmax(dim=-1)  # [batch, seq_len]
+            
+            # Mask for valid tokens (not padding)
+            valid_mask = (reasoning_labels != -100).float()  # [batch, seq_len]
+            
+            # Accuracy per sample (only on valid tokens)
+            correct_mask = (reasoning_preds == reasoning_labels).float() * valid_mask  # [batch, seq_len]
+            num_valid_per_sample = valid_mask.sum(dim=1).clamp(min=1)  # [batch], avoid div by 0
+            reasoning_correct = correct_mask.sum(dim=1) / num_valid_per_sample  # [batch]
             
             # Target confidence = actual correctness
-            # If reasoning is correct, confidence should be high (1.0)
-            # If reasoning is wrong, confidence should be low (0.0)
             target_confidence = reasoning_correct
             
             # Calibration loss: confidence should match correctness
@@ -216,13 +222,19 @@ class ChainOfThoughtLoss(nn.Module):
         else:
             confidence_scale = 1.0
         
+        # Debug: Count valid tokens to detect padding ratio issues
+        reasoning_valid_ratio = (reasoning_labels != -100).float().mean().item()
+        answer_valid_ratio = (answer_labels != -100).float().mean().item()
+        
         return total_loss, {
             'reasoning_loss': reasoning_loss.item(),
             'answer_loss': answer_loss.item(),
             'quality_loss': quality_loss if isinstance(quality_loss, float) else quality_loss.item(),
             'confidence_scale': confidence_scale,
             'total_loss': total_loss.item(),
-            'unweighted_total': (reasoning_loss + answer_loss).item()
+            'unweighted_total': (reasoning_loss + answer_loss).item(),
+            'reasoning_valid_ratio': reasoning_valid_ratio,  # DEBUG
+            'answer_valid_ratio': answer_valid_ratio,  # DEBUG
         }
 
 
