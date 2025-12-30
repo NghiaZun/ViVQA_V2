@@ -687,6 +687,11 @@ class AutoregressiveCOTTrainer:
                         with torch.no_grad():
                             from transformers.modeling_outputs import BaseModelOutput
                             encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features.detach())
+                            
+                            # Temporarily disable gradient checkpointing for generation (allow caching)
+                            original_gc_state = self.model.bartpho.model.config.gradient_checkpointing
+                            self.model.bartpho.model.config.gradient_checkpointing = False
+                            
                             reasoning_generated = self.model.bartpho.generate(
                                 encoder_outputs=encoder_outputs_for_gen,
                                 max_length=96,
@@ -694,6 +699,7 @@ class AutoregressiveCOTTrainer:
                                 pad_token_id=self.model.tokenizer.pad_token_id,
                                 eos_token_id=self.model.tokenizer.eos_token_id,
                                 bos_token_id=self.model.tokenizer.bos_token_id,
+                                use_cache=True,  # Enable caching for faster generation
                             )
                             reasoning_gen_mask = (reasoning_generated != self.model.tokenizer.pad_token_id).long()
                             
@@ -703,8 +709,11 @@ class AutoregressiveCOTTrainer:
                                 attention_mask=reasoning_gen_mask,
                                 encoder_hidden_states=fused_features.detach(),
                                 return_dict=True,
-                                use_cache=False
+                                use_cache=True  # Enable caching
                             ).last_hidden_state
+                            
+                            # Restore gradient checkpointing state
+                            self.model.bartpho.model.config.gradient_checkpointing = original_gc_state
                         
                         # Step 3: Forward pass WITH GRADIENTS for loss computation
                         # Get reasoning logits for loss (using GT reasoning)
@@ -846,6 +855,11 @@ class AutoregressiveCOTTrainer:
                     # Step 2: Generate reasoning tokens (detached for generation)
                     from transformers.modeling_outputs import BaseModelOutput
                     encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features.detach())
+                    
+                    # Temporarily disable gradient checkpointing for generation (allow caching)
+                    original_gc_state = self.model.bartpho.model.config.gradient_checkpointing
+                    self.model.bartpho.model.config.gradient_checkpointing = False
+                    
                     reasoning_generated = self.model.bartpho.generate(
                         encoder_outputs=encoder_outputs_for_gen,
                         max_length=96,
@@ -853,10 +867,13 @@ class AutoregressiveCOTTrainer:
                         pad_token_id=self.model.tokenizer.pad_token_id,
                         eos_token_id=self.model.tokenizer.eos_token_id,
                         bos_token_id=self.model.tokenizer.bos_token_id,
+                        use_cache=True,  # Enable caching for faster generation
                     )
                     reasoning_gen_mask = (reasoning_generated != self.model.tokenizer.pad_token_id).long()
                     
                     # Step 3: Get reasoning logits (for loss) using GT reasoning
+                    # Restore gradient checkpointing for forward pass (but no gradients in validation)
+                    self.model.bartpho.model.config.gradient_checkpointing = original_gc_state
                     reasoning_logits, reasoning_hidden, _ = self.model.generate_reasoning(
                         fused_features=fused_features,
                         reasoning_input_ids=tensor_batch['reasoning_input_ids'],
@@ -869,7 +886,7 @@ class AutoregressiveCOTTrainer:
                         attention_mask=reasoning_gen_mask,
                         encoder_hidden_states=fused_features.detach(),
                         return_dict=True,
-                        use_cache=False
+                        use_cache=True  # Enable caching in validation
                     ).last_hidden_state
                     
                     # Step 5: Get answer logits using GENERATED reasoning (realistic)
