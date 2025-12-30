@@ -699,7 +699,7 @@ class AutoregressiveCOTTrainer:
                                 pad_token_id=self.model.tokenizer.pad_token_id,
                                 eos_token_id=self.model.tokenizer.eos_token_id,
                                 bos_token_id=self.model.tokenizer.bos_token_id,
-                                use_cache=True,  # Enable caching for faster generation
+                                use_cache=False,  # Enable caching for faster generation
                             )
                             reasoning_gen_mask = (reasoning_generated != self.model.tokenizer.pad_token_id).long()
                             
@@ -709,7 +709,7 @@ class AutoregressiveCOTTrainer:
                                 attention_mask=reasoning_gen_mask,
                                 encoder_hidden_states=fused_features.detach(),
                                 return_dict=True,
-                                use_cache=True  # Enable caching
+                                use_cache=False  # Enable caching
                             ).last_hidden_state
                             
                             # Restore gradient checkpointing state
@@ -867,7 +867,7 @@ class AutoregressiveCOTTrainer:
                         pad_token_id=self.model.tokenizer.pad_token_id,
                         eos_token_id=self.model.tokenizer.eos_token_id,
                         bos_token_id=self.model.tokenizer.bos_token_id,
-                        use_cache=True,  # Enable caching for faster generation
+                        use_cache=False,  # Enable caching for faster generation
                     )
                     reasoning_gen_mask = (reasoning_generated != self.model.tokenizer.pad_token_id).long()
                     
@@ -886,7 +886,7 @@ class AutoregressiveCOTTrainer:
                         attention_mask=reasoning_gen_mask,
                         encoder_hidden_states=fused_features.detach(),
                         return_dict=True,
-                        use_cache=True  # Enable caching in validation
+                        use_cache=False  # Enable caching in validation
                     ).last_hidden_state
                     
                     # Step 5: Get answer logits using GENERATED reasoning (realistic)
