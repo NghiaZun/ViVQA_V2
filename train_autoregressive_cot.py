@@ -1058,7 +1058,7 @@ def main():
     
     CONFIG = {
         # Paths
-        'train_json': '/kaggle/input/final/teacher_outputs_train.jsonl',
+        'train_json': '/kaggle/input/teacher-checkpoint-11k/teacher_outputs_train.jsonl',
         'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
         'output_dir': '/kaggle/working/checkpoints_autoregressive_cot',
         
@@ -1092,7 +1092,7 @@ def main():
         'log_steps': 10,
         
         # Resume
-        'resume_from': None,
+        'resume_from': "/kaggle/input/model/transformers/default/1/model/checkpoint_progressive_latest.pt",
     }
     
     print("="*70)
