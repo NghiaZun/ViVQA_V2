@@ -656,7 +656,7 @@ class AutoregressiveCOTTrainer:
             try:
                 with autocast('cuda', enabled=self.use_amp):
                     if use_teacher_forcing:
-                        # Teacher forcing: use ground truth reasoning
+                        # Teacher forcing: use ground truth reasoning (HYBRID - need 2 answer logits)
                         outputs = self.model(
                             pixel_values=tensor_batch['pixel_values'],
                             input_ids=tensor_batch['input_ids'],
@@ -667,7 +667,10 @@ class AutoregressiveCOTTrainer:
                             answer_attention_mask=tensor_batch['answer_attention_mask']
                         )
                         reasoning_logits = outputs.reasoning_logits
-                        answer_logits = outputs.answer_logits
+                        # For HYBRID loss: GT reasoning gives same logits for both gen and gt branches
+                        # (since we're using GT reasoning in both cases during teacher forcing)
+                        answer_logits_gen = outputs.answer_logits
+                        answer_logits_gt = outputs.answer_logits  # Same as gen in teacher forcing
                     else:
                         # FIX: Autoregressive generation - OPTIMIZED SINGLE ENCODE, DECODE TWICE
                         # Key insight: Share encoder computation, only decode twice (reasoning + answer)
