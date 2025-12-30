@@ -672,21 +672,21 @@ class AutoregressiveCOTTrainer:
                         answer_logits_gen = outputs.answer_logits
                         answer_logits_gt = outputs.answer_logits  # Same as gen in teacher forcing
                     else:
-                        # FIX: Autoregressive generation - OPTIMIZED SINGLE ENCODE, DECODE TWICE
-                        # Key insight: Share encoder computation, only decode twice (reasoning + answer)
+                        # FIX: Autoregressive generation - ENCODE WITH GRADIENTS, GENERATE WITHOUT
+                        # Key insight: Encode once with gradients, generate reasoning without gradients
                         
-                        # Step 1: Encode image + question ONCE (no gradients for generation)
+                        # Step 1: Encode image + question ONCE WITH GRADIENTS
+                        vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
+                        question_embeds = self.model.encode_text(
+                            input_ids=tensor_batch['input_ids'],
+                            attention_mask=tensor_batch['attention_mask']
+                        )
+                        fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
+                        
+                        # Step 2: Generate reasoning tokens WITHOUT gradients (generation step only)
                         with torch.no_grad():
-                            vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
-                            question_embeds = self.model.encode_text(
-                                input_ids=tensor_batch['input_ids'],
-                                attention_mask=tensor_batch['attention_mask']
-                            )
-                            fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
-                            
-                            # Generate reasoning tokens using fused features
                             from transformers.modeling_outputs import BaseModelOutput
-                            encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features)
+                            encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features.detach())
                             reasoning_generated = self.model.bartpho.generate(
                                 encoder_outputs=encoder_outputs_for_gen,
                                 max_length=96,
@@ -696,17 +696,8 @@ class AutoregressiveCOTTrainer:
                                 bos_token_id=self.model.tokenizer.bos_token_id,
                             )
                             reasoning_gen_mask = (reasoning_generated != self.model.tokenizer.pad_token_id).long()
-                        
-                        # Step 2: Forward pass WITH GRADIENTS (reuse encoder outputs)
-                        # Get reasoning logits for loss (using GT reasoning for teacher)
-                        reasoning_logits, reasoning_hidden, _ = self.model.generate_reasoning(
-                            fused_features=fused_features,
-                            reasoning_input_ids=tensor_batch['reasoning_input_ids'],
-                            reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
-                        )
-                        
-                        # Get generated reasoning hidden states for answer decoder context
-                        with torch.no_grad():
+                            
+                            # Get generated reasoning hidden states for answer decoder context
                             generated_reasoning_hidden = self.model.bartpho.model.decoder(
                                 input_ids=reasoning_generated,
                                 attention_mask=reasoning_gen_mask,
@@ -715,10 +706,18 @@ class AutoregressiveCOTTrainer:
                                 use_cache=False
                             ).last_hidden_state
                         
+                        # Step 3: Forward pass WITH GRADIENTS for loss computation
+                        # Get reasoning logits for loss (using GT reasoning)
+                        reasoning_logits, reasoning_hidden, _ = self.model.generate_reasoning(
+                            fused_features=fused_features,
+                            reasoning_input_ids=tensor_batch['reasoning_input_ids'],
+                            reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
+                        )
+                        
                         # Get answer logits using GENERATED reasoning as context (realistic)
                         answer_logits_gen, _ = self.model.generate_answer(
                             fused_features=fused_features,
-                            reasoning_hidden=generated_reasoning_hidden,
+                            reasoning_hidden=generated_reasoning_hidden.detach(),  # Detach to avoid gradients through generation
                             answer_input_ids=tensor_batch['answer_input_ids'],
                             answer_attention_mask=tensor_batch['answer_attention_mask']
                         )
@@ -835,7 +834,7 @@ class AutoregressiveCOTTrainer:
                 answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
                 
                 with autocast('cuda', enabled=self.use_amp):
-                    # FIX: Validation with OPTIMIZED SINGLE ENCODE, DECODE TWICE
+                    # Validation: Encode WITH gradients tracking, generate WITHOUT
                     # Step 1: Encode image + question ONCE
                     vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
                     question_embeds = self.model.encode_text(
@@ -844,9 +843,9 @@ class AutoregressiveCOTTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Step 2: Generate reasoning tokens
+                    # Step 2: Generate reasoning tokens (detached for generation)
                     from transformers.modeling_outputs import BaseModelOutput
-                    encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features)
+                    encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features.detach())
                     reasoning_generated = self.model.bartpho.generate(
                         encoder_outputs=encoder_outputs_for_gen,
                         max_length=96,
@@ -868,7 +867,7 @@ class AutoregressiveCOTTrainer:
                     generated_reasoning_hidden = self.model.bartpho.model.decoder(
                         input_ids=reasoning_generated,
                         attention_mask=reasoning_gen_mask,
-                        encoder_hidden_states=fused_features,
+                        encoder_hidden_states=fused_features.detach(),
                         return_dict=True,
                         use_cache=False
                     ).last_hidden_state
@@ -876,7 +875,7 @@ class AutoregressiveCOTTrainer:
                     # Step 5: Get answer logits using GENERATED reasoning (realistic)
                     answer_logits_gen, _ = self.model.generate_answer(
                         fused_features=fused_features,
-                        reasoning_hidden=generated_reasoning_hidden,
+                        reasoning_hidden=generated_reasoning_hidden.detach(),
                         answer_input_ids=tensor_batch['answer_input_ids'],
                         answer_attention_mask=tensor_batch['answer_attention_mask']
                     )
