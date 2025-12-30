@@ -226,6 +226,11 @@ class ChainOfThoughtLoss(nn.Module):
         reasoning_valid_ratio = (reasoning_labels != -100).float().mean().item()
         answer_valid_ratio = (answer_labels != -100).float().mean().item()
         
+        # Debug: Count valid tokens per sample
+        batch_size = reasoning_labels.size(0)
+        reasoning_valid_per_sample = (reasoning_labels != -100).float().sum(dim=1).mean().item()
+        answer_valid_per_sample = (answer_labels != -100).float().sum(dim=1).mean().item()
+        
         return total_loss, {
             'reasoning_loss': reasoning_loss.item(),
             'answer_loss': answer_loss.item(),
@@ -233,8 +238,10 @@ class ChainOfThoughtLoss(nn.Module):
             'confidence_scale': confidence_scale,
             'total_loss': total_loss.item(),
             'unweighted_total': (reasoning_loss + answer_loss).item(),
-            'reasoning_valid_ratio': reasoning_valid_ratio,  # DEBUG
-            'answer_valid_ratio': answer_valid_ratio,  # DEBUG
+            'reasoning_valid_ratio': reasoning_valid_ratio,  # DEBUG: % valid tokens globally
+            'answer_valid_ratio': answer_valid_ratio,  # DEBUG: % valid tokens globally
+            'reasoning_valid_per_sample': reasoning_valid_per_sample,  # DEBUG: avg valid tokens per sample
+            'answer_valid_per_sample': answer_valid_per_sample,  # DEBUG: avg valid tokens per sample
         }
 
 
@@ -805,6 +812,10 @@ class VQATrainer:
         loss_components = defaultdict(float)
         reasoning_confidences = []
         
+        # Sample predictions for debugging (first batch only)
+        sample_predictions = []
+        is_first_batch = True
+        
         progress_bar = tqdm(self.val_loader, desc="Evaluating")
         
         for batch in progress_bar:
@@ -839,6 +850,40 @@ class VQATrainer:
             # Collect reasoning confidences
             if outputs.reasoning_confidence is not None:
                 reasoning_confidences.extend(outputs.reasoning_confidence.cpu().numpy())
+            
+            # Sample predictions for debugging (first batch only)
+            if is_first_batch and epoch % 5 == 0:  # Every 5 epochs
+                reasoning_preds = outputs.reasoning_logits.argmax(dim=-1)[:3]  # First 3 samples
+                answer_preds = outputs.answer_logits.argmax(dim=-1)[:3]
+                
+                for i in range(min(3, reasoning_preds.size(0))):
+                    pred_reasoning = self.model.tokenizer.decode(reasoning_preds[i], skip_special_tokens=True)
+                    pred_answer = self.model.tokenizer.decode(answer_preds[i], skip_special_tokens=True)
+                    gt_reasoning = self.model.tokenizer.decode(reasoning_labels[i][reasoning_labels[i] != -100], skip_special_tokens=True)
+                    gt_answer = self.model.tokenizer.decode(answer_labels[i][answer_labels[i] != -100], skip_special_tokens=True)
+                    
+                    sample_predictions.append({
+                        'question': batch['question'][i] if i < len(batch['question']) else 'N/A',
+                        'gt_reasoning': gt_reasoning,
+                        'pred_reasoning': pred_reasoning,
+                        'gt_answer': gt_answer,
+                        'pred_answer': pred_answer,
+                    })
+                is_first_batch = False
+        
+        # Print sample predictions
+        if sample_predictions and epoch % 5 == 0:
+            print(f"\n{'='*70}")
+            print(f"SAMPLE PREDICTIONS (Epoch {epoch+1}):")
+            print(f"{'='*70}")
+            for i, sample in enumerate(sample_predictions):
+                print(f"\n[Sample {i+1}]")
+                print(f"Question: {sample['question']}")
+                print(f"GT Reasoning: {sample['gt_reasoning']}")
+                print(f"Pred Reasoning: {sample['pred_reasoning']}")
+                print(f"GT Answer: {sample['gt_answer']}")
+                print(f"Pred Answer: {sample['pred_answer']}")
+                print(f"-" * 70)
         
         # Average
         avg_loss = total_loss / len(self.val_loader)
