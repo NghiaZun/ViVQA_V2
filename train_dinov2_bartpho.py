@@ -177,8 +177,8 @@ class ChainOfThoughtLoss(nn.Module):
         """
         Args:
             outputs: CoTOutput from model
-            reasoning_labels: [batch, seq_len]
-            answer_labels: [batch, seq_len]
+            reasoning_labels: [batch, seq_len] (with -100 for padding)
+            answer_labels: [batch, seq_len] (with -100 for padding)
         Returns:
             loss, loss_dict
         """
@@ -197,15 +197,21 @@ class ChainOfThoughtLoss(nn.Module):
         )
         
         # Quality loss: Calibrate confidence based on actual correctness
+        # Only compute on valid (non-padding) tokens
         quality_loss = 0.0
         if outputs.reasoning_confidence is not None:
-            # Compute accuracy for each sample (simplified: check if argmax matches)
-            reasoning_preds = reasoning_logits.argmax(dim=-1)
-            reasoning_correct = (reasoning_preds == reasoning_labels).float().mean(dim=1)  # [batch]
+            # Compute accuracy for each sample on VALID tokens only
+            reasoning_preds = reasoning_logits.argmax(dim=-1)  # [batch, seq_len]
+            
+            # Mask for valid tokens (not padding)
+            valid_mask = (reasoning_labels != -100).float()  # [batch, seq_len]
+            
+            # Accuracy per sample (only on valid tokens)
+            correct_mask = (reasoning_preds == reasoning_labels).float() * valid_mask  # [batch, seq_len]
+            num_valid_per_sample = valid_mask.sum(dim=1).clamp(min=1)  # [batch], avoid div by 0
+            reasoning_correct = correct_mask.sum(dim=1) / num_valid_per_sample  # [batch]
             
             # Target confidence = actual correctness
-            # If reasoning is correct, confidence should be high (1.0)
-            # If reasoning is wrong, confidence should be low (0.0)
             target_confidence = reasoning_correct
             
             # Calibration loss: confidence should match correctness
@@ -224,13 +230,26 @@ class ChainOfThoughtLoss(nn.Module):
         else:
             confidence_scale = 1.0
         
+        # Debug: Count valid tokens to detect padding ratio issues
+        reasoning_valid_ratio = (reasoning_labels != -100).float().mean().item()
+        answer_valid_ratio = (answer_labels != -100).float().mean().item()
+        
+        # Debug: Count valid tokens per sample
+        batch_size = reasoning_labels.size(0)
+        reasoning_valid_per_sample = (reasoning_labels != -100).float().sum(dim=1).mean().item()
+        answer_valid_per_sample = (answer_labels != -100).float().sum(dim=1).mean().item()
+        
         return total_loss, {
             'reasoning_loss': reasoning_loss.item(),
             'answer_loss': answer_loss.item(),
             'quality_loss': quality_loss if isinstance(quality_loss, float) else quality_loss.item(),
             'confidence_scale': confidence_scale,
             'total_loss': total_loss.item(),
-            'unweighted_total': (reasoning_loss + answer_loss).item()
+            'unweighted_total': (reasoning_loss + answer_loss).item(),
+            'reasoning_valid_ratio': reasoning_valid_ratio,  # DEBUG: % valid tokens globally
+            'answer_valid_ratio': answer_valid_ratio,  # DEBUG: % valid tokens globally
+            'reasoning_valid_per_sample': reasoning_valid_per_sample,  # DEBUG: avg valid tokens per sample
+            'answer_valid_per_sample': answer_valid_per_sample,  # DEBUG: avg valid tokens per sample
         }
 
 
@@ -801,6 +820,10 @@ class VQATrainer:
         loss_components = defaultdict(float)
         reasoning_confidences = []
         
+        # Sample predictions for debugging (first batch only)
+        sample_predictions = []
+        is_first_batch = True
+        
         progress_bar = tqdm(self.val_loader, desc="Evaluating")
         
         for batch in progress_bar:
@@ -835,6 +858,40 @@ class VQATrainer:
             # Collect reasoning confidences
             if outputs.reasoning_confidence is not None:
                 reasoning_confidences.extend(outputs.reasoning_confidence.cpu().numpy())
+            
+            # Sample predictions for debugging (first batch only)
+            if is_first_batch and epoch % 5 == 0:  # Every 5 epochs
+                reasoning_preds = outputs.reasoning_logits.argmax(dim=-1)[:3]  # First 3 samples
+                answer_preds = outputs.answer_logits.argmax(dim=-1)[:3]
+                
+                for i in range(min(3, reasoning_preds.size(0))):
+                    pred_reasoning = self.model.tokenizer.decode(reasoning_preds[i], skip_special_tokens=True)
+                    pred_answer = self.model.tokenizer.decode(answer_preds[i], skip_special_tokens=True)
+                    gt_reasoning = self.model.tokenizer.decode(reasoning_labels[i][reasoning_labels[i] != -100], skip_special_tokens=True)
+                    gt_answer = self.model.tokenizer.decode(answer_labels[i][answer_labels[i] != -100], skip_special_tokens=True)
+                    
+                    sample_predictions.append({
+                        'question': batch['question'][i] if i < len(batch['question']) else 'N/A',
+                        'gt_reasoning': gt_reasoning,
+                        'pred_reasoning': pred_reasoning,
+                        'gt_answer': gt_answer,
+                        'pred_answer': pred_answer,
+                    })
+                is_first_batch = False
+        
+        # Print sample predictions
+        if sample_predictions and epoch % 5 == 0:
+            print(f"\n{'='*70}")
+            print(f"SAMPLE PREDICTIONS (Epoch {epoch+1}):")
+            print(f"{'='*70}")
+            for i, sample in enumerate(sample_predictions):
+                print(f"\n[Sample {i+1}]")
+                print(f"Question: {sample['question']}")
+                print(f"GT Reasoning: {sample['gt_reasoning']}")
+                print(f"Pred Reasoning: {sample['pred_reasoning']}")
+                print(f"GT Answer: {sample['gt_answer']}")
+                print(f"Pred Answer: {sample['pred_answer']}")
+                print(f"-" * 70)
         
         # Average
         avg_loss = total_loss / len(self.val_loader)
@@ -947,7 +1004,7 @@ def main():
     
     CONFIG = {
         # Paths
-        'train_json': '/kaggle/input/teacher-3-12/teacher_outputs_train.jsonl',
+        'train_json': '/kaggle/input/final/teacher_outputs_train.jsonl',
         'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
         'output_dir': '/kaggle/working/checkpoints_dinov2_bartpho',
         
@@ -979,7 +1036,7 @@ def main():
         'use_wandb': False,
         
         # Resume
-        'resume_from': None,  # Set to None to train from scratch
+        'resume_from': "/kaggle/input/dino/transformers/default/1/checkpoint_progressive_latest.pt",  # Set to None to train from scratch
     }
     
     print("="*70)

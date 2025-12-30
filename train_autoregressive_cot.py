@@ -143,53 +143,81 @@ class VQADistillationDataset(Dataset):
 
 class AutoregressiveCOTLoss(nn.Module):
     """
-    Loss for autoregressive CoT training
+    HYBRID Loss for autoregressive CoT training (OPTION 3)
     
-    Loss = α * L_reasoning + β * L_answer
+    Loss = α * L_reasoning_gt + β * L_answer_gen + γ * L_answer_gt
     
-    Both reasoning and answer are generated, then compared to ground truth
+    Components:
+    1. L_reasoning_gt: GT reasoning supervision (distillation from teacher)
+    2. L_answer_gen: Answer from GENERATED reasoning (realistic, aligns with inference)
+    3. L_answer_gt: Answer from GT reasoning (alignment reward, learns correlation)
+    
+    This combines:
+    - Strong reasoning supervision from teacher
+    - Realistic answer training with generated reasoning
+    - Quality reward signal from GT reasoning → answer correlation
     """
     
     def __init__(
         self, 
-        alpha_reasoning=0.6, 
-        alpha_answer=0.4,
+        alpha_reasoning=0.4,    # GT reasoning supervision
+        beta_answer_gen=0.4,    # Answer with generated reasoning (realistic)
+        gamma_answer_gt=0.2,    # Answer with GT reasoning (alignment)
         label_smoothing=0.0
     ):
         super().__init__()
         self.alpha_reasoning = alpha_reasoning
-        self.alpha_answer = alpha_answer
+        self.beta_answer_gen = beta_answer_gen
+        self.gamma_answer_gt = gamma_answer_gt
         self.criterion = nn.CrossEntropyLoss(
             ignore_index=-100, 
             label_smoothing=label_smoothing
         )
         
-    def forward(self, reasoning_logits, answer_logits, reasoning_labels, answer_labels):
+    def forward(self, reasoning_logits, answer_logits_gen, answer_logits_gt, reasoning_labels, answer_labels):
         """
+        HYBRID loss computation
+        
         Args:
-            reasoning_logits: [batch, reasoning_len, vocab]
-            answer_logits: [batch, answer_len, vocab]
+            reasoning_logits: [batch, reasoning_len, vocab] - from GT reasoning forward
+            answer_logits_gen: [batch, answer_len, vocab] - from GENERATED reasoning
+            answer_logits_gt: [batch, answer_len, vocab] - from GT reasoning
             reasoning_labels: [batch, reasoning_len]
             answer_labels: [batch, answer_len]
+            
+        Returns:
+            total_loss: scalar
+            loss_dict: dict with individual loss components
         """
-        # Reasoning loss
+        # 1. Reasoning loss - GT supervision
         reasoning_loss = self.criterion(
             reasoning_logits.view(-1, reasoning_logits.size(-1)),
             reasoning_labels.view(-1)
         )
         
-        # Answer loss
-        answer_loss = self.criterion(
-            answer_logits.view(-1, answer_logits.size(-1)),
+        # 2. Answer loss - Generated reasoning (realistic training)
+        answer_loss_gen = self.criterion(
+            answer_logits_gen.view(-1, answer_logits_gen.size(-1)),
+            answer_labels.view(-1)
+        )
+        
+        # 3. Answer loss - GT reasoning (alignment reward)
+        answer_loss_gt = self.criterion(
+            answer_logits_gt.view(-1, answer_logits_gt.size(-1)),
             answer_labels.view(-1)
         )
         
         # Total loss
-        total_loss = self.alpha_reasoning * reasoning_loss + self.alpha_answer * answer_loss
+        total_loss = (
+            self.alpha_reasoning * reasoning_loss + 
+            self.beta_answer_gen * answer_loss_gen + 
+            self.gamma_answer_gt * answer_loss_gt
+        )
         
         return total_loss, {
             'reasoning_loss': reasoning_loss.item(),
-            'answer_loss': answer_loss.item(),
+            'answer_loss_gen': answer_loss_gen.item(),
+            'answer_loss_gt': answer_loss_gt.item(),
             'total_loss': total_loss.item(),
         }
 
@@ -216,8 +244,9 @@ class AutoregressiveCOTTrainer:
         weight_decay=0.01,
         warmup_ratio=0.1,
         max_grad_norm=1.0,
-        alpha_reasoning=0.6,
-        alpha_answer=0.4,
+        alpha_reasoning=0.4,      # GT reasoning supervision
+        beta_answer_gen=0.4,      # Answer with generated reasoning
+        gamma_answer_gt=0.2,      # Answer with GT reasoning (alignment)
         label_smoothing=0.0,
         use_amp=True,
         patience=5,
@@ -255,9 +284,11 @@ class AutoregressiveCOTTrainer:
         self.stage_milestones = stage_milestones or {}
         self.base_learning_rate = learning_rate
         
-        # Scheduled sampling params
-        self.scheduled_sampling_start = scheduled_sampling_start
-        self.scheduled_sampling_end = scheduled_sampling_end
+        # Scheduled sampling params (FIX: Use generation ratio instead of teacher forcing)
+        # 0.0 = 0% generation (100% teacher forcing)
+        # 1.0 = 100% generation (0% teacher forcing)
+        self.generation_ratio_start = 1.0 - scheduled_sampling_start  # Invert for clarity
+        self.generation_ratio_end = 1.0 - scheduled_sampling_end
         self.scheduled_sampling_anneal_epochs = scheduled_sampling_anneal_epochs
         
         # Device
@@ -283,7 +314,8 @@ class AutoregressiveCOTTrainer:
         # Loss function
         self.criterion = AutoregressiveCOTLoss(
             alpha_reasoning=alpha_reasoning,
-            alpha_answer=alpha_answer,
+            beta_answer_gen=beta_answer_gen,
+            gamma_answer_gt=gamma_answer_gt,
             label_smoothing=label_smoothing
         )
         
@@ -371,10 +403,12 @@ class AutoregressiveCOTTrainer:
                 'epoch',
                 'train_loss',
                 'train_reasoning_loss',
-                'train_answer_loss',
+                'train_answer_loss_gen',
+                'train_answer_loss_gt',
                 'val_loss',
                 'val_reasoning_loss',
-                'val_answer_loss',
+                'val_answer_loss_gen',
+                'val_answer_loss_gt',
                 'learning_rate',
                 'teacher_forcing_ratio',
                 'patience_counter',
@@ -391,10 +425,12 @@ class AutoregressiveCOTTrainer:
                 epoch + 1,
                 train_components.get('total_loss', 0),
                 train_components.get('reasoning_loss', 0),
-                train_components.get('answer_loss', 0),
+                train_components.get('answer_loss_gen', 0),
+                train_components.get('answer_loss_gt', 0),
                 val_components.get('total_loss', 0),
                 val_components.get('reasoning_loss', 0),
-                val_components.get('answer_loss', 0),
+                val_components.get('answer_loss_gen', 0),
+                val_components.get('answer_loss_gt', 0),
                 f"{current_lr:.2e}",
                 f"{teacher_forcing_ratio:.3f}",
                 self.patience_counter,
@@ -402,14 +438,16 @@ class AutoregressiveCOTTrainer:
             ])
     
     def get_teacher_forcing_ratio(self, epoch):
-        """Get teacher forcing ratio for scheduled sampling"""
+        """Get generation ratio for scheduled sampling (FIX: Invert logic)"""
         if epoch >= self.scheduled_sampling_anneal_epochs:
-            return self.scheduled_sampling_end
+            generation_ratio = self.generation_ratio_end
+        else:
+            # Linear annealing from start to end
+            progress = epoch / self.scheduled_sampling_anneal_epochs
+            generation_ratio = self.generation_ratio_start + (self.generation_ratio_end - self.generation_ratio_start) * progress
         
-        # Linear annealing
-        progress = epoch / self.scheduled_sampling_anneal_epochs
-        ratio = self.scheduled_sampling_start + (self.scheduled_sampling_end - self.scheduled_sampling_start) * progress
-        return ratio
+        # Return teacher forcing ratio (inverse of generation ratio)
+        return 1.0 - generation_ratio
     
     def save_checkpoint(self, epoch, val_loss=None, is_best=False, force_save=False):
         """Save checkpoint with OOM safety"""
@@ -618,7 +656,7 @@ class AutoregressiveCOTTrainer:
             try:
                 with autocast('cuda', enabled=self.use_amp):
                     if use_teacher_forcing:
-                        # Teacher forcing: use ground truth reasoning
+                        # Teacher forcing: use ground truth reasoning (HYBRID - need 2 answer logits)
                         outputs = self.model(
                             pixel_values=tensor_batch['pixel_values'],
                             input_ids=tensor_batch['input_ids'],
@@ -629,55 +667,85 @@ class AutoregressiveCOTTrainer:
                             answer_attention_mask=tensor_batch['answer_attention_mask']
                         )
                         reasoning_logits = outputs.reasoning_logits
-                        answer_logits = outputs.answer_logits
+                        # For HYBRID loss: GT reasoning gives same logits for both gen and gt branches
+                        # (since we're using GT reasoning in both cases during teacher forcing)
+                        answer_logits_gen = outputs.answer_logits
+                        answer_logits_gt = outputs.answer_logits  # Same as gen in teacher forcing
                     else:
-                        # Autoregressive: generate reasoning first
-                        with torch.no_grad():  # No gradients for generation
-                            # First encode and fuse
-                            visual_features = self.model.encode_image(tensor_batch['pixel_values'])
-                            text_features = self.model.encode_text(
-                                tensor_batch['input_ids'],
-                                tensor_batch['attention_mask']
-                            )
-                            fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
-                            
-                            # Then generate reasoning using bartpho.generate
+                        # FIX: Autoregressive generation - ENCODE WITH GRADIENTS, GENERATE WITHOUT
+                        # Key insight: Encode once with gradients, generate reasoning without gradients
+                        
+                        # Step 1: Encode image + question ONCE WITH GRADIENTS
+                        vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
+                        question_embeds = self.model.encode_text(
+                            input_ids=tensor_batch['input_ids'],
+                            attention_mask=tensor_batch['attention_mask']
+                        )
+                        fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
+                        
+                        # Step 2: Generate reasoning tokens WITHOUT gradients (generation step only)
+                        with torch.no_grad():
                             from transformers.modeling_outputs import BaseModelOutput
-                            encoder_outputs_wrapped = BaseModelOutput(last_hidden_state=fused_features)
-                            reasoning_outputs = self.model.bartpho.generate(
-                                encoder_outputs=encoder_outputs_wrapped,
+                            encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features.detach())
+                            
+                            # Temporarily disable gradient checkpointing for generation (allow caching)
+                            original_gc_state = self.model.bartpho.model.config.gradient_checkpointing
+                            self.model.bartpho.model.config.gradient_checkpointing = False
+                            
+                            reasoning_generated = self.model.bartpho.generate(
+                                encoder_outputs=encoder_outputs_for_gen,
                                 max_length=96,
-                                num_beams=1,  # Greedy for memory efficiency
+                                num_beams=1,  # Greedy for speed
                                 pad_token_id=self.model.tokenizer.pad_token_id,
                                 eos_token_id=self.model.tokenizer.eos_token_id,
                                 bos_token_id=self.model.tokenizer.bos_token_id,
+                                use_cache=False,  # Enable caching for faster generation
                             )
-                            # Detach to save memory
-                            reasoning_outputs = reasoning_outputs.detach()
-                            fused_features = fused_features.detach()
-                            visual_features = None
-                            text_features = None
+                            reasoning_gen_mask = (reasoning_generated != self.model.tokenizer.pad_token_id).long()
+                            
+                            # Get generated reasoning hidden states for answer decoder context
+                            generated_reasoning_hidden = self.model.bartpho.model.decoder(
+                                input_ids=reasoning_generated,
+                                attention_mask=reasoning_gen_mask,
+                                encoder_hidden_states=fused_features.detach(),
+                                return_dict=True,
+                                use_cache=False  # Enable caching
+                            ).last_hidden_state
+                            
+                            # Restore gradient checkpointing state
+                            self.model.bartpho.model.config.gradient_checkpointing = original_gc_state
                         
-                        # Clear cache after generation
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                        # Step 3: Forward pass WITH GRADIENTS for loss computation
+                        # Get reasoning logits for loss (using GT reasoning)
+                        reasoning_logits, reasoning_hidden, _ = self.model.generate_reasoning(
+                            fused_features=fused_features,
+                            reasoning_input_ids=tensor_batch['reasoning_input_ids'],
+                            reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
+                        )
                         
-                        # Forward pass with generated reasoning
-                        reasoning_forward = self.model(
-                            pixel_values=tensor_batch['pixel_values'],
-                            input_ids=tensor_batch['input_ids'],
-                            attention_mask=tensor_batch['attention_mask'],
-                            reasoning_input_ids=reasoning_outputs,
-                            reasoning_attention_mask=(reasoning_outputs != self.model.tokenizer.pad_token_id).long(),
+                        # Get answer logits using GENERATED reasoning as context (realistic)
+                        answer_logits_gen, _ = self.model.generate_answer(
+                            fused_features=fused_features,
+                            reasoning_hidden=generated_reasoning_hidden.detach(),  # Detach to avoid gradients through generation
                             answer_input_ids=tensor_batch['answer_input_ids'],
                             answer_attention_mask=tensor_batch['answer_attention_mask']
                         )
-                        reasoning_logits = reasoning_forward.reasoning_logits
-                        answer_logits = reasoning_forward.answer_logits
+                        
+                        # Get answer logits using GT reasoning as context (alignment reward)
+                        answer_logits_gt, _ = self.model.generate_answer(
+                            fused_features=fused_features,
+                            reasoning_hidden=reasoning_hidden,  # GT reasoning hidden from above
+                            answer_input_ids=tensor_batch['answer_input_ids'],
+                            answer_attention_mask=tensor_batch['answer_attention_mask']
+                        )
+                        
+                        # Clean up
+                        del vision_embeds, question_embeds, encoder_outputs_for_gen
+                        del reasoning_generated, reasoning_gen_mask, generated_reasoning_hidden
                     
-                    # Compute loss
+                    # Compute HYBRID loss (3 components)
                     loss, loss_dict = self.criterion(
-                        reasoning_logits, answer_logits, 
+                        reasoning_logits, answer_logits_gen, answer_logits_gt,
                         reasoning_labels, answer_labels
                     )
                     loss = loss / self.gradient_accumulation_steps
@@ -687,9 +755,14 @@ class AutoregressiveCOTTrainer:
                     print(f"\n[WARNING] OOM at step {step}! Saving checkpoint and clearing cache...")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    # Save emergency checkpoint
-                    self.save_checkpoint(epoch, force_save=True)
-                    # Skip this batch
+                    # Save emergency checkpoint with full error info
+                    try:
+                        self.save_checkpoint(epoch, force_save=True)
+                        print(f"[INFO] ✓ Emergency checkpoint saved successfully")
+                    except Exception as save_err:
+                        print(f"[ERROR] Failed to save emergency checkpoint: {save_err}")
+                    # Skip this batch and continue training
+                    self.optimizer.zero_grad()
                     continue
                 else:
                     raise e
@@ -725,8 +798,8 @@ class AutoregressiveCOTTrainer:
                 print(f"\n[INFO] Saving periodic checkpoint at step {self.global_step}...")
                 self.save_checkpoint(epoch, force_save=True)
             
-            # Aggressive cache clearing for autoregressive generation
-            if (step + 1) % self.gradient_accumulation_steps == 0:
+            # Memory cleanup every few steps
+            if (step + 1) % 5 == 0:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
@@ -749,7 +822,7 @@ class AutoregressiveCOTTrainer:
     
     @torch.no_grad()
     def validate(self, epoch):
-        """Validate with full generation (memory-efficient)"""
+        """Validate with autoregressive generation (FIX: Single forward pass)"""
         self.model.eval()
         total_loss = 0
         loss_components = defaultdict(float)
@@ -770,45 +843,77 @@ class AutoregressiveCOTTrainer:
                 answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
                 
                 with autocast('cuda', enabled=self.use_amp):
-                    # Encode and fuse first
-                    visual_features = self.model.encode_image(tensor_batch['pixel_values'])
-                    text_features = self.model.encode_text(
-                        tensor_batch['input_ids'],
-                        tensor_batch['attention_mask']
+                    # Validation: Encode WITH gradients tracking, generate WITHOUT
+                    # Step 1: Encode image + question ONCE
+                    vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
+                    question_embeds = self.model.encode_text(
+                        input_ids=tensor_batch['input_ids'],
+                        attention_mask=tensor_batch['attention_mask']
                     )
-                    fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
+                    fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Generate reasoning using bartpho.generate
+                    # Step 2: Generate reasoning tokens (detached for generation)
                     from transformers.modeling_outputs import BaseModelOutput
-                    encoder_outputs_wrapped = BaseModelOutput(last_hidden_state=fused_features)
-                    reasoning_outputs = self.model.bartpho.generate(
-                        encoder_outputs=encoder_outputs_wrapped,
+                    encoder_outputs_for_gen = BaseModelOutput(last_hidden_state=fused_features.detach())
+                    
+                    # Temporarily disable gradient checkpointing for generation (allow caching)
+                    original_gc_state = self.model.bartpho.model.config.gradient_checkpointing
+                    self.model.bartpho.model.config.gradient_checkpointing = False
+                    
+                    reasoning_generated = self.model.bartpho.generate(
+                        encoder_outputs=encoder_outputs_for_gen,
                         max_length=96,
                         num_beams=1,
                         pad_token_id=self.model.tokenizer.pad_token_id,
                         eos_token_id=self.model.tokenizer.eos_token_id,
                         bos_token_id=self.model.tokenizer.bos_token_id,
+                        use_cache=False,  # Enable caching for faster generation
+                    )
+                    reasoning_gen_mask = (reasoning_generated != self.model.tokenizer.pad_token_id).long()
+                    
+                    # Step 3: Get reasoning logits (for loss) using GT reasoning
+                    # Restore gradient checkpointing for forward pass (but no gradients in validation)
+                    self.model.bartpho.model.config.gradient_checkpointing = original_gc_state
+                    reasoning_logits, reasoning_hidden, _ = self.model.generate_reasoning(
+                        fused_features=fused_features,
+                        reasoning_input_ids=tensor_batch['reasoning_input_ids'],
+                        reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
                     )
                     
-                    # Clear cache after generation
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    # Step 4: Get generated reasoning hidden states for answer context
+                    generated_reasoning_hidden = self.model.bartpho.model.decoder(
+                        input_ids=reasoning_generated,
+                        attention_mask=reasoning_gen_mask,
+                        encoder_hidden_states=fused_features.detach(),
+                        return_dict=True,
+                        use_cache=False  # Enable caching in validation
+                    ).last_hidden_state
                     
-                    # Forward pass to get logits
-                    outputs = self.model(
-                        pixel_values=tensor_batch['pixel_values'],
-                        input_ids=tensor_batch['input_ids'],
-                        attention_mask=tensor_batch['attention_mask'],
-                        reasoning_input_ids=reasoning_outputs,
-                        reasoning_attention_mask=(reasoning_outputs != self.model.tokenizer.pad_token_id).long(),
+                    # Step 5: Get answer logits using GENERATED reasoning (realistic)
+                    answer_logits_gen, _ = self.model.generate_answer(
+                        fused_features=fused_features,
+                        reasoning_hidden=generated_reasoning_hidden.detach(),
                         answer_input_ids=tensor_batch['answer_input_ids'],
                         answer_attention_mask=tensor_batch['answer_attention_mask']
                     )
                     
+                    # Step 6: Get answer logits using GT reasoning (alignment)
+                    answer_logits_gt, _ = self.model.generate_answer(
+                        fused_features=fused_features,
+                        reasoning_hidden=reasoning_hidden,
+                        answer_input_ids=tensor_batch['answer_input_ids'],
+                        answer_attention_mask=tensor_batch['answer_attention_mask']
+                    )
+                    
+                    # Compute HYBRID loss
                     loss, loss_dict = self.criterion(
-                        outputs.reasoning_logits, outputs.answer_logits,
+                        reasoning_logits, answer_logits_gen, answer_logits_gt,
                         reasoning_labels, answer_labels
                     )
+                    
+                    # Clean up
+                    del vision_embeds, question_embeds, fused_features, encoder_outputs_for_gen
+                    del reasoning_generated, reasoning_gen_mask, generated_reasoning_hidden
                 
                 total_loss += loss.item()
                 for k, v in loss_dict.items():
@@ -868,29 +973,22 @@ class AutoregressiveCOTTrainer:
                 else:
                     raise e
             
-            # Validate (skip if not validation epoch)
-            should_validate = (epoch + 1) % self.validate_every_n_epochs == 0
-            
-            if should_validate:
-                try:
-                    val_loss, val_components = self.validate(epoch)
-                    
-                    print(f"\n[VALIDATION] Loss: {val_loss:.4f}")
-                    for k, v in val_components.items():
-                        print(f"  {k}: {v:.4f}")
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        print(f"\n[WARNING] OOM during validation! Skipping validation this epoch.")
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        val_loss = float('inf')
-                        val_components = {'reasoning_loss': 0, 'answer_loss': 0, 'total_loss': 0}
-                    else:
-                        raise e
-            else:
-                print(f"\n[INFO] Skipping validation (every {self.validate_every_n_epochs} epochs)")
-                val_loss = self.best_val_loss  # Use previous best
-                val_components = {'reasoning_loss': 0, 'answer_loss': 0, 'total_loss': 0}
+            # Validate (FIX: Always validate to avoid missing best model)
+            try:
+                val_loss, val_components = self.validate(epoch)
+                
+                print(f"\n[VALIDATION] Loss: {val_loss:.4f}")
+                for k, v in val_components.items():
+                    print(f"  {k}: {v:.4f}")
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"\n[WARNING] OOM during validation! Skipping validation this epoch.")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    val_loss = float('inf')
+                    val_components = {'reasoning_loss': 0, 'answer_loss': 0, 'total_loss': 0}
+                else:
+                    raise e
             
             # Save best
             is_best = False
@@ -960,7 +1058,7 @@ def main():
     
     CONFIG = {
         # Paths
-        'train_json': '/kaggle/input/teacher-3-12/teacher_outputs_train.jsonl',
+        'train_json': '/kaggle/input/final/teacher_outputs_train.jsonl',
         'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
         'output_dir': '/kaggle/working/checkpoints_autoregressive_cot',
         
@@ -969,23 +1067,24 @@ def main():
         'random_seed': 42,
         
         # Training
-        'batch_size': 1,
-        'gradient_accumulation_steps': 64,
+        'batch_size': 2,  # FIX: Increased from 1 for stability
+        'gradient_accumulation_steps': 32,  # FIX: Adjusted to maintain effective batch size of 64
         'num_epochs': 54,
         'learning_rate': 3e-5,
         'weight_decay': 0.01,
         'warmup_ratio': 0.1,
         'max_grad_norm': 1.0,
         
-        # Loss weights
-        'alpha_reasoning': 0.6,
-        'alpha_answer': 0.4,
+        # Loss weights (HYBRID - Option 3)
+        'alpha_reasoning': 0.4,     # GT reasoning supervision
+        'beta_answer_gen': 0.4,     # Answer with generated reasoning (realistic)
+        'gamma_answer_gt': 0.2,     # Answer with GT reasoning (alignment)
         'label_smoothing': 0.0,
         
         # Scheduled sampling
-        'scheduled_sampling_start': 1.0,  # Start with 100% teacher forcing
-        'scheduled_sampling_end': 0.0,    # End with 0% teacher forcing (full generation)
-        'scheduled_sampling_anneal_epochs': 10,  # Anneal over first 10 epochs
+        'scheduled_sampling_start': 0.0,  # FIX: Start with 0% teacher forcing (100% generation)
+        'scheduled_sampling_end': 0.0,    # End with 0% teacher forcing
+        'scheduled_sampling_anneal_epochs': 10,  # Not used since start == end
         
         # Advanced
         'use_amp': True,
@@ -1103,7 +1202,8 @@ def main():
         warmup_ratio=CONFIG['warmup_ratio'],
         max_grad_norm=CONFIG['max_grad_norm'],
         alpha_reasoning=CONFIG['alpha_reasoning'],
-        alpha_answer=CONFIG['alpha_answer'],
+        beta_answer_gen=CONFIG['beta_answer_gen'],
+        gamma_answer_gt=CONFIG['gamma_answer_gt'],
         label_smoothing=CONFIG['label_smoothing'],
         use_amp=CONFIG['use_amp'],
         patience=CONFIG['patience'],
