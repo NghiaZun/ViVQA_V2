@@ -72,12 +72,14 @@ class VQADistillationDataset(Dataset):
         return len(self.data)
     
     def augment_image(self, image):
-        """Image augmentation"""
+        """Strong image augmentation - Learn from train_old.py"""
         import torchvision.transforms as T
         aug = T.Compose([
-            T.RandomHorizontalFlip(p=0.3),
-            T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-            T.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+            T.RandomHorizontalFlip(p=0.5),  # 🔥 Increased from 0.3
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.15),  # 🔥 Stronger
+            T.RandomRotation(degrees=10),  # 🔥 Added rotation
+            T.RandomResizedCrop(224, scale=(0.85, 1.0)),  # 🔥 Added crop
+            T.RandomGrayscale(p=0.1),  # 🔥 Added grayscale
         ])
         return aug(image)
     
@@ -1070,21 +1072,21 @@ def main():
         'batch_size': 2,  # FIX: Increased from 1 for stability
         'gradient_accumulation_steps': 32,  # FIX: Adjusted to maintain effective batch size of 64
         'num_epochs': 54,
-        'learning_rate': 3e-5,
-        'weight_decay': 0.01,
-        'warmup_ratio': 0.1,
-        'max_grad_norm': 1.0,
+        'learning_rate': 2e-5,  # 🔥 FIX: Reduced from 3e-5 (more conservative, stable training)
+        'weight_decay': 0.03,  # 🔥 FIX: Increased from 0.01 to 0.03 (stronger regularization)
+        'warmup_ratio': 0.15,  # 🔥 FIX: Increased from 0.1 (smoother warmup)
+        'max_grad_norm': 0.5,  # 🔥 FIX: Reduced from 1.0 to 0.5 (learn from train_old.py)
         
         # Loss weights (HYBRID - Option 3)
         'alpha_reasoning': 0.4,     # GT reasoning supervision
         'beta_answer_gen': 0.4,     # Answer with generated reasoning (realistic)
         'gamma_answer_gt': 0.2,     # Answer with GT reasoning (alignment)
-        'label_smoothing': 0.0,
+        'label_smoothing': 0.15,    # 🔥 FIX REPETITION: Learn from train_old.py (was 0.0)
         
         # Scheduled sampling
         'scheduled_sampling_start': 0.0,  # FIX: Start with 0% teacher forcing (100% generation)
-        'scheduled_sampling_end': 0.0,    # End with 0% teacher forcing
-        'scheduled_sampling_anneal_epochs': 10,  # Not used since start == end
+        'scheduled_sampling_end': 0.3,    # 🔥 FIX: End with 30% teacher forcing (help diversity)
+        'scheduled_sampling_anneal_epochs': 10,  # Gradually increase generation ratio
         
         # Advanced
         'use_amp': True,
@@ -1129,7 +1131,7 @@ def main():
         image_dir=CONFIG['image_dir'],
         vision_processor=model.vision_processor,
         tokenizer=model.tokenizer,
-        augment=False
+        augment=False  # Will create augmented version for training later
     )
     
     # Split
@@ -1145,16 +1147,18 @@ def main():
     
     print(f"[INFO] Train: {len(train_dataset)} | Val: {len(val_dataset)}")
     
-    # Create augmented train dataset
+    # Create augmented train dataset (STRONG augmentation for better generalization)
+    print("[INFO] Creating augmented training dataset with STRONG augmentation...")
     train_dataset_aug = VQADistillationDataset(
         json_path=CONFIG['train_json'],
         image_dir=CONFIG['image_dir'],
         vision_processor=model.vision_processor,
         tokenizer=model.tokenizer,
-        augment=True
+        augment=True  # 🔥 STRONG augmentation: flip, color jitter, rotation, crop, grayscale
     )
     from torch.utils.data import Subset
     train_dataset = Subset(train_dataset_aug, train_dataset.indices)
+    print(f"[INFO] ✓ Training dataset ready with augmentation")
     
     # ===== STAGED TRAINING WITH AUTOMATIC UNFREEZING =====
     print("\n" + "="*70)
