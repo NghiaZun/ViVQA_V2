@@ -29,6 +29,7 @@ import numpy as np
 from pathlib import Path
 import random
 from collections import defaultdict
+import argparse
 
 # Import model
 from model_dinov2_bartpho import DINOv2BARTphoVQA, count_parameters
@@ -1058,35 +1059,66 @@ def unfreeze_last_n_layers(module, name, n_layers=2):
 def main():
     """Main training with autoregressive CoT"""
     
+    # ============================================================================
+    # ARGUMENT PARSER
+    # ============================================================================
+    parser = argparse.ArgumentParser(description='Autoregressive CoT Training for DINOv2 + BARTpho VQA')
+    
+    # Paths
+    parser.add_argument('--train_json', type=str, 
+                        default='/kaggle/input/teacher-checkpoint-11k/teacher_outputs_train.jsonl',
+                        help='Path to training JSON file')
+    parser.add_argument('--image_dir', type=str,
+                        default='/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
+                        help='Path to images directory')
+    parser.add_argument('--output_dir', type=str,
+                        default='/kaggle/working/checkpoints_autoregressive_cot',
+                        help='Output directory for checkpoints')
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='Path to checkpoint to resume from (e.g., checkpoints/checkpoint_progressive_latest.pt)')
+    
+    # Training hyperparameters
+    parser.add_argument('--batch_size', type=int, default=2,
+                        help='Batch size per GPU')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=32,
+                        help='Gradient accumulation steps')
+    parser.add_argument('--num_epochs', type=int, default=54,
+                        help='Total number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=2e-5,
+                        help='Learning rate')
+    
+    args = parser.parse_args()
+    
+    # Convert args to CONFIG dict
     CONFIG = {
         # Paths
-        'train_json': '/kaggle/input/teacher-checkpoint-11k/teacher_outputs_train.jsonl',
-        'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
-        'output_dir': '/kaggle/working/checkpoints_autoregressive_cot',
+        'train_json': args.train_json,
+        'image_dir': args.image_dir,
+        'output_dir': args.output_dir,
         
         # Data
         'val_split': 0.1,
         'random_seed': 42,
         
         # Training
-        'batch_size': 2,  # FIX: Increased from 1 for stability
-        'gradient_accumulation_steps': 32,  # FIX: Adjusted to maintain effective batch size of 64
-        'num_epochs': 54,
-        'learning_rate': 2e-5,  # 🔥 FIX: Reduced from 3e-5 (more conservative, stable training)
-        'weight_decay': 0.03,  # 🔥 FIX: Increased from 0.01 to 0.03 (stronger regularization)
-        'warmup_ratio': 0.15,  # 🔥 FIX: Increased from 0.1 (smoother warmup)
-        'max_grad_norm': 0.5,  # 🔥 FIX: Reduced from 1.0 to 0.5 (learn from train_old.py)
+        'batch_size': args.batch_size,
+        'gradient_accumulation_steps': args.gradient_accumulation_steps,
+        'num_epochs': args.num_epochs,
+        'learning_rate': args.learning_rate,
+        'weight_decay': 0.03,
+        'warmup_ratio': 0.15,
+        'max_grad_norm': 0.5,
         
         # Loss weights (HYBRID - Option 3)
-        'alpha_reasoning': 0.4,     # GT reasoning supervision
-        'beta_answer_gen': 0.4,     # Answer with generated reasoning (realistic)
-        'gamma_answer_gt': 0.2,     # Answer with GT reasoning (alignment)
-        'label_smoothing': 0.15,    # 🔥 FIX REPETITION: Learn from train_old.py (was 0.0)
+        'alpha_reasoning': 0.4,
+        'beta_answer_gen': 0.4,
+        'gamma_answer_gt': 0.2,
+        'label_smoothing': 0.15,
         
         # Scheduled sampling
-        'scheduled_sampling_start': 0.0,  # FIX: Start with 0% teacher forcing (100% generation)
-        'scheduled_sampling_end': 0.3,    # 🔥 FIX: End with 30% teacher forcing (help diversity)
-        'scheduled_sampling_anneal_epochs': 10,  # Gradually increase generation ratio
+        'scheduled_sampling_start': 0.0,
+        'scheduled_sampling_end': 0.3,
+        'scheduled_sampling_anneal_epochs': 10,
         
         # Advanced
         'use_amp': True,
@@ -1094,7 +1126,7 @@ def main():
         'log_steps': 10,
         
         # Resume
-        'resume_from': None,
+        'resume_from': args.resume_from,
     }
     
     print("="*70)
