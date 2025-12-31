@@ -1094,7 +1094,7 @@ def main():
         'log_steps': 10,
         
         # Resume
-        'resume_from': "/kaggle/input/model/transformers/default/1/model/checkpoint_progressive_latest.pt",
+        'resume_from': None,
     }
     
     print("="*70)
@@ -1119,6 +1119,12 @@ def main():
         use_reasoning_quality_check=False,  # Not used in autoregressive training
         gradient_checkpointing=True
     )
+    
+    # Training mode indication
+    if CONFIG['resume_from'] is not None:
+        print(f"[INFO] 🔄 Resuming training from checkpoint: {CONFIG['resume_from']}")
+    else:
+        print("[INFO] 🆕 Starting training from scratch (no checkpoint provided)")
     
     total_params, trainable_params = count_parameters(model)
     print(f"[INFO] Total params: {total_params/1e6:.1f}M")
