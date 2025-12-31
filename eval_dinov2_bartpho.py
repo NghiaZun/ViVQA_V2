@@ -95,9 +95,11 @@ def evaluate_model(
                 attention_mask=batch['attention_mask'],
                 max_reasoning_len=128,
                 max_answer_len=32,
-                num_beams=4,  # Use beam search for better quality
-                repetition_penalty=1.2,
-                length_penalty=1.0
+                num_beams=4,
+                repetition_penalty=2.0,  # 🔥 Tăng từ 1.2 → 2.0 để ngăn repetition
+                length_penalty=0.8,      # 🔥 Giảm từ 1.0 → 0.8 để ưu tiên câu ngắn hơn
+                no_repeat_ngram_size=3,  # 🔥 Thêm: không lặp lại 3-gram
+                early_stopping=True      # 🔥 Thêm: dừng sớm
             )
             
             # Check if we have ground truth (from VQADistillationDataset)

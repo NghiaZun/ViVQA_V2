@@ -141,8 +141,10 @@ def evaluate_autoregressive_cot(
                 max_reasoning_len=max_reasoning_len,
                 max_answer_len=max_answer_len,
                 num_beams=num_beams,
-                repetition_penalty=1.2,
-                length_penalty=1.0
+                repetition_penalty=2.0,  # 🔥 Tăng từ 1.2 → 2.0 để ngăn repetition
+                length_penalty=0.8,      # 🔥 Giảm từ 1.0 → 0.8 để ưu tiên câu ngắn hơn
+                no_repeat_ngram_size=3,  # 🔥 Thêm: không lặp lại 3-gram
+                early_stopping=True      # 🔥 Thêm: dừng sớm khi đủ beam candidates
             )
             
             # Check if we have ground truth

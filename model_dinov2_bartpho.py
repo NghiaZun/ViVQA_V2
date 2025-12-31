@@ -475,7 +475,12 @@ class DINOv2BARTphoVQA(nn.Module):
         max_answer_len=32,
         num_beams=4,
         repetition_penalty=1.2,
-        length_penalty=1.0
+        length_penalty=1.0,
+        no_repeat_ngram_size=0,     # 🔥 Thêm: ngăn lặp n-gram
+        early_stopping=True,         # 🔥 Thêm: dừng sớm
+        temperature=1.0,             # 🔥 Thêm: control randomness
+        top_k=50,                    # 🔥 Thêm: top-k sampling
+        top_p=1.0                    # 🔥 Thêm: nucleus sampling
     ):
         """
         Inference mode: Generate reasoning → answer using lm_head
@@ -495,6 +500,11 @@ class DINOv2BARTphoVQA(nn.Module):
             num_beams: Beam search width
             repetition_penalty: Penalty for repetition (default 1.2)
             length_penalty: Length penalty (default 1.0)
+            no_repeat_ngram_size: Ngăn lặp n-gram (0 = tắt, 2-3 recommended)
+            early_stopping: Dừng sớm khi đủ beam candidates
+            temperature: Temperature for sampling (1.0 = no change)
+            top_k: Top-k sampling (50 = reasonable)
+            top_p: Nucleus sampling (1.0 = tắt)
         Returns:
             reasoning_text: List[str]
             answer_text: List[str]
@@ -516,7 +526,11 @@ class DINOv2BARTphoVQA(nn.Module):
             num_beams=num_beams,
             repetition_penalty=repetition_penalty,
             length_penalty=length_penalty,
-            early_stopping=True,
+            no_repeat_ngram_size=no_repeat_ngram_size,  # 🔥 Pass through
+            early_stopping=early_stopping,              # 🔥 Pass through
+            temperature=temperature,                     # 🔥 Pass through
+            top_k=top_k,                                 # 🔥 Pass through
+            top_p=top_p,                                 # 🔥 Pass through
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             bos_token_id=self.tokenizer.bos_token_id,
@@ -546,7 +560,11 @@ class DINOv2BARTphoVQA(nn.Module):
             num_beams=num_beams,
             repetition_penalty=repetition_penalty,
             length_penalty=length_penalty,
-            early_stopping=True,
+            no_repeat_ngram_size=no_repeat_ngram_size,  # 🔥 Pass through
+            early_stopping=early_stopping,              # 🔥 Pass through
+            temperature=temperature,                     # 🔥 Pass through
+            top_k=top_k,                                 # 🔥 Pass through
+            top_p=top_p,                                 # 🔥 Pass through
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             bos_token_id=self.tokenizer.bos_token_id,
