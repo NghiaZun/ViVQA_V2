@@ -750,6 +750,8 @@ class ImplicitReasoningTrainer:
             val_loss_detached = None
             if (epoch + 1) % self.detach_test_every == 0:
                 print(f"\n[DETACH TEST] Testing if reasoning is useful...")
+                
+                # Test on validation set
                 val_losses_detached = self.validate(epoch, test_detach=True)
                 val_loss_detached = val_losses_detached['answer']
                 
@@ -761,10 +763,15 @@ class ImplicitReasoningTrainer:
                 print(f"  Answer loss (detached): {val_loss_detached:.4f}")
                 print(f"  Degradation: +{answer_drop:.4f} ({answer_drop_pct:+.2f}%)")
                 
-                if answer_drop > 0.01:
+                # More lenient threshold if loss is very low (overfitting)
+                if val_losses['answer'] < 0.1:
+                    print(f"  ⚠️ Val loss too low ({val_losses['answer']:.4f}) - possible overfitting")
+                    print(f"     Detach test may not be reliable at this loss level")
+                elif answer_drop > 0.01:
                     print(f"  ✅ Reasoning IS useful! (answer degrades without it)")
                 else:
                     print(f"  ⚠️ Reasoning NOT useful (answer doesn't need it)")
+                    print(f"     This could indicate reasoning collapse - monitor closely")
             
             # Save best
             is_best = False

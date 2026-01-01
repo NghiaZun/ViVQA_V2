@@ -183,9 +183,16 @@ def test_2_shuffle_labels(model, loader, device):
             answer_labels.view(-1)
         )
         
-        # Test 2B: Shuffled labels (random permutation)
+        # Test 2B: Shuffled labels (FIXED: shuffle tokens, not batch)
         batch_size = answer_labels.size(0)
-        shuffled_labels = answer_labels[torch.randperm(batch_size)]
+        shuffled_labels = answer_labels.clone()
+        for i in range(batch_size):
+            # Shuffle tokens for each sample
+            seq_len = (shuffled_labels[i] != -100).sum()  # Non-padding length
+            if seq_len > 1:
+                valid_indices = torch.arange(seq_len)
+                shuffled_indices = valid_indices[torch.randperm(seq_len)]
+                shuffled_labels[i, :seq_len] = shuffled_labels[i, shuffled_indices]
         
         loss_shuffled = criterion(
             answer_logits.view(-1, answer_logits.size(-1)),
