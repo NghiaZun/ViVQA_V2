@@ -458,15 +458,16 @@ class ImplicitReasoningTrainer:
                         answer_labels.view(-1)
                     )
                     
-                    # REGULARIZATION: Variance regularization
+                    # REGULARIZATION: Variance regularization (DISABLED - causes loss spike)
                     # Encourage reasoning hidden to have diverse representations
-                    reasoning_var = reasoning_hidden.var(dim=1).mean()  # variance across seq_len
-                    var_reg_loss = -torch.log(reasoning_var + 1e-8)  # negative log encourages high variance
+                    # reasoning_var = reasoning_hidden.var(dim=1).mean()
+                    # var_reg_loss = -torch.log(reasoning_var + 1e-8)
+                    var_reg_loss = 0.0  # DISABLED
                     
                     # Combined loss with annealed α_reasoning
                     loss = (alpha_reasoning * reasoning_loss + 
                            self.alpha_answer * answer_loss +
-                           0.01 * var_reg_loss)  # Small weight for regularization
+                           0.01 * var_reg_loss)  # Will be 0
                     loss = loss / self.gradient_accumulation_steps
                     
             except RuntimeError as e:

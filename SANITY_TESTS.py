@@ -278,6 +278,18 @@ def run_all_tests():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
+    
+    # ⚠️ CRITICAL: Load trained checkpoint!
+    checkpoint_path = '/kaggle/working/checkpoints_implicit_reasoning/best_model.pt'
+    try:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✅ Loaded trained model (epoch {checkpoint['epoch']+1})")
+    except FileNotFoundError:
+        print("⚠️  WARNING: No checkpoint found! Testing with UNTRAINED model")
+        print("   → Results may not be meaningful")
+    
     model.eval()
     
     # Load dataset (small sample for testing)
