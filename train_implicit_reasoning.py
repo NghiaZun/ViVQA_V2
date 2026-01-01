@@ -809,7 +809,7 @@ def main():
     parser = argparse.ArgumentParser(description='Implicit Reasoning Training')
     
     parser.add_argument('--train_json', type=str, 
-                        default='/kaggle/input/teacher-checkpoint-11k/teacher_outputs_train.jsonl')
+                        default='/kaggle/input/teacher/teacher_outputs_train.jsonl')
     parser.add_argument('--image_dir', type=str,
                         default='/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train')
     parser.add_argument('--output_dir', type=str,
