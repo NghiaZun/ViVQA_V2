@@ -280,7 +280,7 @@ def run_all_tests():
     model = model.to(device)
     
     # ⚠️ CRITICAL: Load trained checkpoint!
-    checkpoint_path = '/kaggle/working/checkpoints_implicit_reasoning/best_model.pt'
+    checkpoint_path = '/kaggle/input/test/transformers/default/1/best_model.pt'
     try:
         print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
