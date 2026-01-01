@@ -142,9 +142,7 @@ def main():
         print(f"    - Epochs: {config['num_epochs']}")
         print(f"    - LR: {config['learning_rate']:.0e}")
         print(f"    - Alpha: {config['alpha_start']}→{config['alpha_end']}")
-    
-    input("\nPress Enter to start training (Ctrl+C to cancel)...")
-    
+        
     resume_checkpoint = None
     
     for stage_num in [1, 2, 3]:
