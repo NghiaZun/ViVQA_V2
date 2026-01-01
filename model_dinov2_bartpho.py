@@ -220,7 +220,8 @@ class DINOv2BARTphoVQA(nn.Module):
         num_heads=16,  # 1024 dim ÷ 16 heads = 64 (BARTpho standard)
         dropout=0.1,
         use_reasoning_quality_check=True,
-        gradient_checkpointing=True
+        gradient_checkpointing=True,
+        reasoning_bottleneck_tokens=None  # None = no bottleneck, 4-8 = compress reasoning
     ):
         super().__init__()
         
@@ -265,7 +266,25 @@ class DINOv2BARTphoVQA(nn.Module):
                 dropout=dropout
             )
         
-        # === 6. USE BARTPHO's LM_HEAD ===
+        # === 6. REASONING BOTTLENECK (optional) ===
+        # Compress reasoning hidden từ [B, T, 1024] → [B, k, 1024]
+        # Giúp reasoning trừu tượng hơn, không chỉ copy fused_features
+        self.reasoning_bottleneck_tokens = reasoning_bottleneck_tokens
+        if reasoning_bottleneck_tokens is not None:
+            print(f"[INFO] Using reasoning bottleneck: {reasoning_bottleneck_tokens} tokens")
+            # Learned query tokens (similar to Perceiver/BLIP Q-Former)
+            self.reasoning_queries = nn.Parameter(
+                torch.randn(1, reasoning_bottleneck_tokens, bart_hidden_dim)
+            )
+            self.reasoning_bottleneck_attn = nn.MultiheadAttention(
+                embed_dim=bart_hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.reasoning_bottleneck_norm = nn.LayerNorm(bart_hidden_dim)
+        
+        # === 7. USE BARTPHO's LM_HEAD ===
         # Use pretrained lm_head for both reasoning and answer
         # Different encoder contexts → different outputs despite same head
         # Reasoning: condition on fused_features
@@ -365,6 +384,21 @@ class DINOv2BARTphoVQA(nn.Module):
         reasoning_hidden = decoder_outputs.last_hidden_state  # [batch, target_len, 1024]
         reasoning_logits = self.bartpho.lm_head(reasoning_hidden)  # [batch, target_len, vocab_size]
         
+        # BOTTLENECK: Compress reasoning hidden if enabled
+        if self.reasoning_bottleneck_tokens is not None:
+            batch_size = reasoning_hidden.size(0)
+            # Expand queries: [1, k, 1024] → [batch, k, 1024]
+            queries = self.reasoning_queries.expand(batch_size, -1, -1)
+            
+            # Cross-attention: queries attend to reasoning_hidden
+            compressed, _ = self.reasoning_bottleneck_attn(
+                query=queries,
+                key=reasoning_hidden,
+                value=reasoning_hidden
+            )
+            reasoning_hidden = self.reasoning_bottleneck_norm(compressed)
+            # Now reasoning_hidden: [batch, k, 1024] where k << T
+        
         # Quality check
         reasoning_confidence = None
         if self.use_quality_check:
@@ -377,29 +411,35 @@ class DINOv2BARTphoVQA(nn.Module):
         fused_features,
         reasoning_hidden,
         answer_input_ids=None,
-        answer_attention_mask=None
+        answer_attention_mask=None,
+        use_reasoning_only=True
     ):
         """
         Generate answer conditioned on reasoning
         
         Args:
-            fused_features: [batch, seq_len, 1024] - encoder output
+            fused_features: [batch, seq_len, 1024] - encoder output (image+question)
             reasoning_hidden: [batch, reason_len, 1024] - reasoning context
             answer_input_ids: [batch, target_len] - teacher forcing labels
             answer_attention_mask: [batch, target_len]
+            use_reasoning_only: If True, answer ONLY uses reasoning_hidden (no shortcut)
         Returns:
             answer_logits: [batch, target_len, vocab_size]
             answer_hidden: [batch, target_len, 1024]
         """
-        # Concatenate fused features và reasoning as encoder output
-        # Ý tưởng: Answer should attend to both image+question AND reasoning
-        enhanced_encoder_output = torch.cat([fused_features, reasoning_hidden], dim=1)
+        # FIX: Answer must DEPEND on reasoning_hidden, not bypass it!
+        if use_reasoning_only:
+            # Answer ONLY uses reasoning hidden (forces dependency)
+            encoder_hidden_states = reasoning_hidden
+        else:
+            # Old behavior: concatenate both (allows shortcut → reasoning ignored!)
+            encoder_hidden_states = torch.cat([fused_features, reasoning_hidden], dim=1)
         
         # Decoder forward pass for answer
         decoder_outputs = self.bartpho.model.decoder(
             input_ids=answer_input_ids,
             attention_mask=answer_attention_mask,
-            encoder_hidden_states=enhanced_encoder_output,
+            encoder_hidden_states=encoder_hidden_states,
             return_dict=True,
             use_cache=False
         )

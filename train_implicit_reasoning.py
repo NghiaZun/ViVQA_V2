@@ -385,10 +385,17 @@ class ImplicitReasoningTrainer:
                         reasoning_labels.view(-1)
                     )
                     
+                    # REGULARIZATION: Random detach reasoning hidden (10-20%)
+                    # Prevent reasoning from collapsing to identity/passthrough
+                    if random.random() < 0.15:  # 15% detach rate
+                        reasoning_hidden_for_answer = reasoning_hidden.detach()
+                    else:
+                        reasoning_hidden_for_answer = reasoning_hidden
+                    
                     # Step 2: Answer conditioned on reasoning hidden
                     answer_logits, _ = self.model.generate_answer(
                         fused_features=fused_features,
-                        reasoning_hidden=reasoning_hidden,  # Use reasoning hidden!
+                        reasoning_hidden=reasoning_hidden_for_answer,  # Use reasoning hidden!
                         answer_input_ids=tensor_batch['answer_input_ids'],
                         answer_attention_mask=tensor_batch['answer_attention_mask']
                     )
@@ -398,9 +405,15 @@ class ImplicitReasoningTrainer:
                         answer_labels.view(-1)
                     )
                     
+                    # REGULARIZATION: Variance regularization
+                    # Encourage reasoning hidden to have diverse representations
+                    reasoning_var = reasoning_hidden.var(dim=1).mean()  # variance across seq_len
+                    var_reg_loss = -torch.log(reasoning_var + 1e-8)  # negative log encourages high variance
+                    
                     # Combined loss with annealed α_reasoning
                     loss = (alpha_reasoning * reasoning_loss + 
-                           self.alpha_answer * answer_loss)
+                           self.alpha_answer * answer_loss +
+                           0.01 * var_reg_loss)  # Small weight for regularization
                     loss = loss / self.gradient_accumulation_steps
                     
             except RuntimeError as e:
@@ -653,6 +666,8 @@ def main():
                         help='Final weight for reasoning loss')
     parser.add_argument('--detach_test_every', type=int, default=5,
                         help='Test reasoning utility every N epochs')
+    parser.add_argument('--reasoning_bottleneck', type=int, default=None,
+                        help='Compress reasoning to k tokens (e.g., 6). None = no compression')
     
     args = parser.parse_args()
     
@@ -698,11 +713,14 @@ def main():
         bartpho_model_name='vinai/bartpho-syllable',
         num_cross_attn_layers=3,
         use_reasoning_quality_check=False,
-        gradient_checkpointing=True
+        gradient_checkpointing=True,
+        reasoning_bottleneck_tokens=args.reasoning_bottleneck  # NEW: bottleneck
     )
     
     total_params, trainable_params = count_parameters(model)
     print(f"[INFO] Total params: {total_params/1e6:.1f}M")
+    if args.reasoning_bottleneck:
+        print(f"[INFO] Reasoning bottleneck: {args.reasoning_bottleneck} tokens")
     print(f"[INFO] Trainable params: {trainable_params/1e6:.1f}M")
     
     # Dataset
