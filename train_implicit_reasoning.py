@@ -274,12 +274,20 @@ class ImplicitReasoningTrainer:
             writer.writerow([
                 'epoch', 'train_loss', 'train_reasoning_loss', 'train_answer_loss',
                 'val_loss', 'val_reasoning_loss', 'val_answer_loss',
+                'val_answer_gen', 'gen_gap', 'gen_gap_pct',
                 'val_loss_detached', 'answer_drop_pct',
                 'learning_rate', 'alpha_reasoning', 'patience_counter', 'is_best'
             ])
     
-    def log_to_csv(self, epoch, train_losses, val_losses, alpha_reasoning, val_loss_detached=None, is_best=False):
+    def log_to_csv(self, epoch, train_losses, val_losses, alpha_reasoning, val_gen_losses=None, val_loss_detached=None, is_best=False):
         current_lr = self.scheduler.get_last_lr()[0]
+        
+        # Calculate generation gap
+        gen_gap = 0.0
+        gen_gap_pct = 0.0
+        if val_gen_losses is not None:
+            gen_gap = val_gen_losses['answer'] - val_losses['answer']
+            gen_gap_pct = (gen_gap / val_losses['answer']) * 100 if val_losses['answer'] > 0 else 0
         
         # Calculate answer drop if detach test was run
         answer_drop_pct = 0.0
@@ -296,6 +304,9 @@ class ImplicitReasoningTrainer:
                 f"{val_losses['total']:.4f}",
                 f"{val_losses['reasoning']:.4f}",
                 f"{val_losses['answer']:.4f}",
+                f"{val_gen_losses['answer']:.4f}" if val_gen_losses else "",
+                f"{gen_gap:.4f}" if val_gen_losses else "",
+                f"{gen_gap_pct:.2f}%" if val_gen_losses else "",
                 f"{val_loss_detached:.4f}" if val_loss_detached else "",
                 f"{answer_drop_pct:.2f}%" if val_loss_detached else "",
                 f"{current_lr:.2e}",
@@ -332,6 +343,48 @@ class ImplicitReasoningTrainer:
                 torch.cuda.empty_cache()
         except Exception as e:
             print(f"[ERROR] Failed to save checkpoint: {e}")
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Load checkpoint để resume training"""
+        try:
+            print(f"\n[INFO] Loading checkpoint from {checkpoint_path}...")
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model weights
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"[INFO] ✓ Model weights loaded")
+            
+            # Load optimizer
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"[INFO] ✓ Optimizer state loaded")
+            
+            # Load scheduler
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print(f"[INFO] ✓ Scheduler state loaded")
+            
+            # Load training state
+            self.current_epoch = checkpoint['epoch'] + 1
+            self.global_step = checkpoint['global_step']
+            self.best_val_loss = checkpoint['best_val_loss']
+            self.patience_counter = checkpoint['patience_counter']
+            
+            # Load scaler if using AMP
+            if self.scaler and 'scaler_state_dict' in checkpoint:
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                print(f"[INFO] ✓ AMP scaler loaded")
+            
+            print(f"[INFO] ✓ Resume from epoch {self.current_epoch}")
+            print(f"[INFO] ✓ Best val loss: {self.best_val_loss:.4f}")
+            print(f"[INFO] ✓ Global step: {self.global_step}")
+            
+            del checkpoint
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to load checkpoint: {e}")
+            return False
     
     def train_epoch(self, epoch):
         """
@@ -576,13 +629,98 @@ class ImplicitReasoningTrainer:
         else:
             return {'total': float('inf'), 'reasoning': 0, 'answer': 0}
     
+    @torch.no_grad()
+    def validate_generation(self, epoch):
+        """
+        TRUE VALIDATION: Generate reasoning autoregressively (no teacher forcing)
+        
+        This gives REAL performance estimate for inference.
+        Expected to be MUCH worse than validate() with teacher forcing.
+        """
+        self.model.eval()
+        total_loss = 0
+        answer_loss_sum = 0
+        num_batches = 0
+        
+        # Compute current α_reasoning for consistency
+        progress = epoch / max(self.num_epochs - 1, 1)
+        alpha_reasoning = self.alpha_reasoning_start + progress * (self.alpha_reasoning_end - self.alpha_reasoning_start)
+        
+        progress_bar = tqdm(self.val_loader, desc="Evaluating (GENERATION - TRUE VAL)")
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            try:
+                tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
+                               if torch.is_tensor(v)}
+                
+                answer_labels = tensor_batch['answer_input_ids'].clone()
+                answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
+                
+                with autocast('cuda', enabled=self.use_amp):
+                    # Encode
+                    vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
+                    question_embeds = self.model.encode_text(
+                        input_ids=tensor_batch['input_ids'],
+                        attention_mask=tensor_batch['attention_mask']
+                    )
+                    fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
+                    
+                    # Generate reasoning AUTOREGRESSIVELY (NO teacher forcing!)
+                    reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
+                        fused_features=fused_features,
+                        max_length=96,
+                        num_beams=1,  # Greedy for speed
+                        temperature=1.0,
+                        repetition_penalty=1.2
+                    )
+                    
+                    # Answer conditioned on GENERATED reasoning
+                    answer_logits, _ = self.model.generate_answer(
+                        fused_features=fused_features,
+                        reasoning_hidden=reasoning_hidden,
+                        answer_input_ids=tensor_batch['answer_input_ids'],
+                        answer_attention_mask=tensor_batch['answer_attention_mask']
+                    )
+                    
+                    answer_loss = self.criterion(
+                        answer_logits.view(-1, answer_logits.size(-1)),
+                        answer_labels.view(-1)
+                    )
+                    
+                    # Only track answer loss (reasoning loss not comparable since no GT)
+                    loss = answer_loss
+                
+                total_loss += loss.item()
+                answer_loss_sum += answer_loss.item()
+                num_batches += 1
+                
+                if (batch_idx + 1) % 10 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
+        
+        if num_batches > 0:
+            return {
+                'total': total_loss / num_batches,
+                'answer': answer_loss_sum / num_batches
+            }
+        else:
+            return {'total': float('inf'), 'answer': 0}
+    
     def train(self):
         """Main training loop"""
         print(f"\n{'='*70}")
         print(f"IMPLICIT REASONING TRAINING")
         print(f"{'='*70}\n")
         
-        for epoch in range(self.num_epochs):
+        for epoch in range(self.current_epoch, self.num_epochs):
             # Train
             train_losses, alpha_reasoning = self.train_epoch(epoch)
             print(f"\n[EPOCH {epoch+1}] Train Loss: {train_losses['total']:.4f} [α_r={alpha_reasoning:.3f}]")
@@ -591,9 +729,21 @@ class ImplicitReasoningTrainer:
             
             # Validate (normal)
             val_losses = self.validate(epoch, test_detach=False)
-            print(f"[VALIDATION] Loss: {val_losses['total']:.4f}")
+            print(f"[VALIDATION - Teacher Forcing] Loss: {val_losses['total']:.4f}")
             print(f"  Reasoning: {val_losses['reasoning']:.4f}")
             print(f"  Answer: {val_losses['answer']:.4f}")
+            
+            # TRUE VALIDATION: Autoregressive generation every epoch
+            print(f"\n[TRUE VALIDATION - Generation]")
+            val_gen_losses = self.validate_generation(epoch)
+            print(f"  Answer loss (generated reasoning): {val_gen_losses['answer']:.4f}")
+            gap = val_gen_losses['answer'] - val_losses['answer']
+            gap_pct = (gap / val_losses['answer']) * 100 if val_losses['answer'] > 0 else 0
+            print(f"  Gap vs teacher forcing: +{gap:.4f} ({gap_pct:+.2f}%)")
+            if gap > 1.0:
+                print(f"  ⚠️ Large gap - reasoning generation quality needs improvement")
+            else:
+                print(f"  ✅ Small gap - reasoning transfers well to generation")
             
             # Detach test every N epochs
             val_loss_detached = None
@@ -630,7 +780,7 @@ class ImplicitReasoningTrainer:
             self.save_checkpoint(epoch, val_losses['total'], is_best=False)
             
             # Log
-            self.log_to_csv(epoch, train_losses, val_losses, alpha_reasoning, val_loss_detached, is_best)
+            self.log_to_csv(epoch, train_losses, val_losses, alpha_reasoning, val_gen_losses, val_loss_detached, is_best)
             
             # Early stopping
             if self.patience_counter >= self.patience:
@@ -668,6 +818,8 @@ def main():
                         help='Test reasoning utility every N epochs')
     parser.add_argument('--reasoning_bottleneck', type=int, default=None,
                         help='Compress reasoning to k tokens (e.g., 6). None = no compression')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume training from')
     
     args = parser.parse_args()
     
@@ -767,6 +919,12 @@ def main():
         log_steps=CONFIG['log_steps'],
         detach_test_every=CONFIG['detach_test_every'],
     )
+    
+    # Resume training if checkpoint provided
+    if args.resume:
+        success = trainer.load_checkpoint(args.resume)
+        if not success:
+            print("[WARNING] Failed to load checkpoint. Starting fresh training...")
     
     trainer.train()
     

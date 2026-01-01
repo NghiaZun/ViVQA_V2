@@ -406,6 +406,69 @@ class DINOv2BARTphoVQA(nn.Module):
         
         return reasoning_logits, reasoning_hidden, reasoning_confidence
     
+    def generate_reasoning_autoregressive(
+        self,
+        fused_features,
+        max_length=96,
+        num_beams=1,
+        temperature=1.0,
+        top_p=0.9,
+        repetition_penalty=1.2
+    ):
+        """
+        Generate reasoning autoregressively (NO teacher forcing)
+        Used for TRUE validation/inference
+        
+        Args:
+            fused_features: [batch, seq_len, 1024] - encoder output
+            max_length: Max reasoning length
+            num_beams: Beam search width (1 = greedy)
+            temperature: Sampling temperature
+            top_p: Nucleus sampling
+            repetition_penalty: Anti-repetition
+        Returns:
+            reasoning_ids: [batch, gen_len] - generated tokens
+            reasoning_hidden: [batch, gen_len, 1024] - hidden states
+        """
+        batch_size = fused_features.size(0)
+        device = fused_features.device
+        
+        # Generate reasoning tokens
+        reasoning_ids = self.bartpho.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=fused_features),
+            max_length=max_length,
+            num_beams=num_beams,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            do_sample=(num_beams == 1 and temperature > 0),
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            use_cache=True
+        )
+        
+        # Get hidden states by running decoder again
+        # (generate() doesn't return hidden states)
+        decoder_outputs = self.bartpho.model.decoder(
+            input_ids=reasoning_ids,
+            encoder_hidden_states=fused_features,
+            return_dict=True,
+            use_cache=False
+        )
+        reasoning_hidden = decoder_outputs.last_hidden_state
+        
+        # Apply bottleneck if enabled
+        if self.reasoning_bottleneck_tokens is not None:
+            queries = self.reasoning_queries.expand(batch_size, -1, -1)
+            compressed, _ = self.reasoning_bottleneck_attn(
+                query=queries,
+                key=reasoning_hidden,
+                value=reasoning_hidden
+            )
+            reasoning_hidden = self.reasoning_bottleneck_norm(compressed)
+        
+        return reasoning_ids, reasoning_hidden
+    
     def generate_answer(
         self,
         fused_features,
