@@ -283,7 +283,7 @@ def run_all_tests():
     # Load dataset (small sample for testing)
     print("Loading dataset (100 samples)...")
     full_dataset = ImplicitReasoningDataset(
-        json_path='/kaggle/input/teacher-checkpoint-11k/teacher_outputs_train.jsonl',
+        json_path='/kaggle/input/teacher/teacher_outputs_train.jsonl',
         image_dir='/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
         vision_processor=model.vision_processor,
         tokenizer=model.tokenizer,
