@@ -584,9 +584,9 @@ class ImplicitReasoningTrainer:
                         reasoning_labels.view(-1)
                     )
                     
-                    # DETACH TEST: If testing, detach reasoning hidden
+                    # DETACH TEST: If testing, ZERO OUT reasoning hidden (not just detach!)
                     if test_detach:
-                        reasoning_hidden = reasoning_hidden.detach()
+                        reasoning_hidden = torch.zeros_like(reasoning_hidden)
                     
                     # Answer
                     answer_logits, _ = self.model.generate_answer(

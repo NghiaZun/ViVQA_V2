@@ -108,12 +108,12 @@ def main():
             'output_dir': '/kaggle/working/stage2_main',
             'batch_size': 4,
             'grad_accum': 16,
-            'num_epochs': 20,  # Will train from epoch 5 → 20 (15 more epochs)
-            'learning_rate': 2e-5,
-            'alpha_start': 0.5,
-            'alpha_end': 0.2,  # Anneal
-            'detach_test_every': 3,
-            'reasoning_bottleneck': None,
+            'num_epochs': 15,  # Will train from epoch 5 → 15 (10 more epochs)
+            'learning_rate': 5e-5,  # INCREASED to break out of local minima
+            'alpha_start': 0.75,  # INCREASED to force reasoning learning
+            'alpha_end': 0.5,  # Higher minimum alpha
+            'detach_test_every': 2,  # Test more frequently
+            'reasoning_bottleneck': 384,  # Force information compression
         },
         3: {
             'name': 'FINE-TUNING',
