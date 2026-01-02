@@ -25,15 +25,15 @@ def get_latest_checkpoint(output_dir):
     """Get latest checkpoint from a directory"""
     output_dir = Path(output_dir)
     
-    # Try best model first
-    best_model = output_dir / 'best_model.pt'
-    if best_model.exists():
-        return str(best_model)
-    
-    # Try latest checkpoint
+    # Try latest checkpoint first (contains most recent training state)
     latest_checkpoint = output_dir / 'checkpoint_latest.pt'
     if latest_checkpoint.exists():
         return str(latest_checkpoint)
+    
+    # Fallback to best model if latest doesn't exist
+    best_model = output_dir / 'best_model.pt'
+    if best_model.exists():
+        return str(best_model)
     
     return None
 
