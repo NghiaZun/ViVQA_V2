@@ -631,6 +631,112 @@ class ImplicitReasoningTrainer:
             return {'total': float('inf'), 'reasoning': 0, 'answer': 0}
     
     @torch.no_grad()
+    def validate_full_generation(self, num_samples=5):
+        """
+        FULL GENERATION TEST: Generate both reasoning AND answer
+        
+        This shows how model actually performs in real inference:
+        1. Generate reasoning autoregressively (no teacher forcing)
+        2. Generate answer autoregressively (no teacher forcing)
+        3. Show actual outputs to see quality
+        """
+        self.model.eval()
+        
+        print("\n" + "="*70)
+        print("FULL GENERATION TEST (True Inference)")
+        print("="*70)
+        
+        samples_shown = 0
+        for batch in self.val_loader:
+            if samples_shown >= num_samples:
+                break
+            
+            tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
+                           if torch.is_tensor(v)}
+            
+            batch_size = tensor_batch['pixel_values'].size(0)
+            
+            for i in range(min(batch_size, num_samples - samples_shown)):
+                try:
+                    # Encode image + question
+                    vision_embeds = self.model.encode_image(tensor_batch['pixel_values'][i:i+1])
+                    question_embeds = self.model.encode_text(
+                        input_ids=tensor_batch['input_ids'][i:i+1],
+                        attention_mask=tensor_batch['attention_mask'][i:i+1]
+                    )
+                    fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
+                    
+                    # STEP 1: Generate reasoning (autoregressive) using model's method
+                    generated_reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
+                        fused_features=fused_features,
+                        max_length=96,
+                        num_beams=1,
+                        temperature=1.0,
+                        repetition_penalty=1.2
+                    )
+                    
+                    # STEP 2: Generate answer (autoregressive, conditioned on reasoning)
+                    # Use BARTpho's generate with reasoning_hidden as encoder output
+                    from transformers.modeling_outputs import BaseModelOutput
+                    answer_outputs = self.model.bartpho.generate(
+                        encoder_outputs=BaseModelOutput(last_hidden_state=reasoning_hidden),
+                        max_length=32,
+                        num_beams=1,
+                        do_sample=False,
+                        pad_token_id=self.model.tokenizer.pad_token_id,
+                        eos_token_id=self.model.tokenizer.eos_token_id,
+                    )
+                    
+                    # Decode
+                    question_text = self.model.tokenizer.decode(
+                        tensor_batch['input_ids'][i], 
+                        skip_special_tokens=True
+                    )
+                    
+                    generated_reasoning_text = self.model.tokenizer.decode(
+                        generated_reasoning_ids[0],
+                        skip_special_tokens=True
+                    )
+                    
+                    generated_answer_text = self.model.tokenizer.decode(
+                        answer_outputs[0],
+                        skip_special_tokens=True
+                    )
+                    
+                    gt_reasoning_text = self.model.tokenizer.decode(
+                        tensor_batch['reasoning_input_ids'][i],
+                        skip_special_tokens=True
+                    )
+                    
+                    gt_answer_text = self.model.tokenizer.decode(
+                        tensor_batch['answer_input_ids'][i],
+                        skip_special_tokens=True
+                    )
+                    
+                    # Print
+                    print(f"\n[Sample {samples_shown + 1}]")
+                    print(f"Question: {question_text}")
+                    print(f"\nGT Reasoning: {gt_reasoning_text}")
+                    print(f"Generated Reasoning: {generated_reasoning_text}")
+                    print(f"\nGT Answer: {gt_answer_text}")
+                    print(f"Generated Answer: {generated_answer_text}")
+                    print("-" * 70)
+                    
+                    samples_shown += 1
+                    
+                except Exception as e:
+                    print(f"[ERROR] Failed to generate sample {samples_shown + 1}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+                
+                if samples_shown >= num_samples:
+                    break
+        
+        print("\n" + "="*70)
+        return samples_shown
+    
+    @torch.no_grad()
     def validate_generation(self, epoch):
         """
         TRUE VALIDATION: Generate reasoning autoregressively (no teacher forcing)
@@ -745,6 +851,10 @@ class ImplicitReasoningTrainer:
                 print(f"  ⚠️ Large gap - reasoning generation quality needs improvement")
             else:
                 print(f"  ✅ Small gap - reasoning transfers well to generation")
+            
+            # FULL GENERATION: Show actual outputs every 5 epochs
+            if (epoch + 1) % 5 == 0:
+                self.validate_full_generation(num_samples=3)
             
             # Detach test every N epochs
             val_loss_detached = None
