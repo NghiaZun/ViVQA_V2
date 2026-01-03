@@ -1053,7 +1053,7 @@ def main():
     # Freeze vision encoder if requested (for Stage 1)
     if args.freeze_vision:
         print("\n[INFO] 🔒 FREEZING DINOv2 Vision Encoder (Stage 1 mode)")
-        for param in model.vision_model.parameters():
+        for param in model.vision_encoder.parameters():
             param.requires_grad = False
         print(f"[INFO] Vision encoder params frozen")
     else:
