@@ -12,6 +12,12 @@ SOTA training với full features:
 Target: 70%+ accuracy trên ViVQA
 """
 
+import warnings
+warnings.filterwarnings(
+    'ignore', 
+    message='.*Caching is incompatible with gradient checkpointing.*'
+)
+
 import os
 import json
 import csv

@@ -13,6 +13,12 @@ Flow:
 3. Loss: L = α * L_reasoning + β * L_answer
 """
 
+import warnings
+warnings.filterwarnings(
+    'ignore', 
+    message='.*Caching is incompatible with gradient checkpointing.*'
+)
+
 import os
 import json
 import csv

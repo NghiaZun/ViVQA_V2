@@ -238,6 +238,7 @@ class DINOv2BARTphoVQA(nn.Module):
         # === 2. LANGUAGE MODEL: BARTpho (Encoder + Decoder) ===
         # Note: BARTpho trên HuggingFace là mBART architecture
         self.bartpho = MBartForConditionalGeneration.from_pretrained(bartpho_model_name)
+        self.bartpho.config.use_cache = False  # Disable cache for training
         self.tokenizer = AutoTokenizer.from_pretrained(bartpho_model_name)
         bart_hidden_dim = self.bartpho.config.d_model  # 1024 for large
         
@@ -444,7 +445,7 @@ class DINOv2BARTphoVQA(nn.Module):
             do_sample=(num_beams == 1 and temperature > 0),
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
-            use_cache=True
+            use_cache=False
         )
         
         # Get hidden states by running decoder again
@@ -637,6 +638,7 @@ class DINOv2BARTphoVQA(nn.Module):
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             bos_token_id=self.tokenizer.bos_token_id,
+            use_cache=False,
         )
         
         reasoning_text = self.tokenizer.batch_decode(reasoning_outputs, skip_special_tokens=True)
@@ -671,6 +673,7 @@ class DINOv2BARTphoVQA(nn.Module):
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             bos_token_id=self.tokenizer.bos_token_id,
+            use_cache=False,
         )
         
         answer_text = self.tokenizer.batch_decode(answer_outputs, skip_special_tokens=True)
