@@ -1,12 +1,17 @@
 """
-AUTO STAGED TRAINING: Run all 3 stages automatically
-=====================================================
-Script này sẽ chạy tự động cả 3 stages:
-- Stage 1: Warmup (5 epochs)
-- Stage 2: Main (15 epochs) 
-- Stage 3: Fine-tune (10 epochs)
+AUTO STAGED TRAINING: 2-Stage Training with Scheduled Sampling
+==============================================================
+Script chạy tự động 2 stages:
+- Stage 1: Freeze DINOv2, train fusion + decoders (epochs 0-9)
+- Stage 2: Unfreeze all, end-to-end fine-tune (epochs 10-19)
 
-Mỗi stage sẽ resume từ checkpoint của stage trước!
+Scheduled Sampling curriculum chạy xuyên suốt cả 2 stages:
+  Phase 1 (0-2): Foundation - 0% generated
+  Phase 2 (3-6): Exposure - 0→30% generated  
+  Phase 3 (7-11): Robustness - 30→50% generated
+  Phase 4 (12+): Refinement - 50→60% generated
+
+Mỗi stage resume từ checkpoint của stage trước!
 """
 
 import subprocess
@@ -57,6 +62,13 @@ def run_stage(stage_num, stage_config, resume_from=None):
         '--detach_test_every', str(stage_config['detach_test_every']),
     ]
     
+    # Add freeze_vision flag if specified
+    if stage_config.get('freeze_vision', False):
+        cmd.append('--freeze_vision')
+        print(f"[INFO] 🔒 Vision encoder will be FROZEN")
+    else:
+        print(f"[INFO] 🔓 All parameters will be trainable")
+    
     # Add resume if checkpoint exists
     if resume_from and check_checkpoint_exists(resume_from):
         cmd.extend(['--resume', resume_from])
@@ -87,45 +99,47 @@ def main():
     """Run all 3 stages automatically"""
     
     # ========================================================================
-    # CONFIGURATION FOR ALL STAGES
+    # 2-STAGE CONFIGURATION with SCHEDULED SAMPLING
+    # ========================================================================
+    # Stage 1: Freeze vision, train fusion + decoders
+    #   - Epochs 0-9 (10 epochs)
+    #   - Higher LR (5e-5) for faster convergence
+    #   - Scheduled sampling: Phase 1-2 (0% → 30%)
+    #   - Alpha: 0.75 → 0.60 (high reasoning weight)
+    #
+    # Stage 2: Unfreeze all, end-to-end fine-tune  
+    #   - Epochs 10-19 (10 epochs)
+    #   - Lower LR (2e-5) for stability
+    #   - Scheduled sampling: Phase 3-4 (30% → 60%)
+    #   - Alpha: 0.60 → 0.50 (balanced weights)
     # ========================================================================
     
     STAGES = {
         1: {
-            'name': 'WARMUP',
-            'output_dir': '/kaggle/working/stage1_warmup',
+            'name': 'STAGE 1: Freeze Vision + Train Fusion/Decoders',
+            'output_dir': '/kaggle/working/stage1_freeze_vision',
             'batch_size': 4,
             'grad_accum': 16,
-            'num_epochs': 5,
-            'learning_rate': 1e-5,
-            'alpha_start': 0.5,
-            'alpha_end': 0.5,  # Fixed alpha
-            'detach_test_every': 1,  # Test every epoch
-            'reasoning_bottleneck': None,
-        },
-        2: {
-            'name': 'MAIN TRAINING',
-            'output_dir': '/kaggle/working/stage2_main',
-            'batch_size': 4,
-            'grad_accum': 16,
-            'num_epochs': 15,  # Will train from epoch 5 → 15 (10 more epochs)
-            'learning_rate': 5e-5,  # INCREASED to break out of local minima
-            'alpha_start': 0.75,  # INCREASED to force reasoning learning
-            'alpha_end': 0.5,  # Higher minimum alpha
-            'detach_test_every': 2,  # Test more frequently
-            'reasoning_bottleneck': 384,  # Force information compression
-        },
-        3: {
-            'name': 'FINE-TUNING',
-            'output_dir': '/kaggle/working/stage3_finetune',
-            'batch_size': 4,
-            'grad_accum': 16,
-            'num_epochs': 30,  # Will train from epoch 20 → 30 (10 more epochs)
-            'learning_rate': 5e-6,
-            'alpha_start': 0.2,
-            'alpha_end': 0.1,  # Anneal
+            'num_epochs': 10,  # Epochs 0-9
+            'learning_rate': 5e-5,  # Higher LR since vision frozen
+            'alpha_start': 0.75,  # High reasoning weight
+            'alpha_end': 0.60,
             'detach_test_every': 2,
             'reasoning_bottleneck': None,
+            'freeze_vision': True,  # 🔒 KEY: Freeze DINOv2
+        },
+        2: {
+            'name': 'STAGE 2: Unfreeze All + End-to-End Fine-tune',
+            'output_dir': '/kaggle/working/stage2_finetune_all',
+            'batch_size': 4,
+            'grad_accum': 16,
+            'num_epochs': 20,  # Will train from epoch 10 → 19 (10 more epochs)
+            'learning_rate': 2e-5,  # Lower LR for stability
+            'alpha_start': 0.60,  # Balanced weights
+            'alpha_end': 0.50,
+            'detach_test_every': 2,
+            'reasoning_bottleneck': None,
+            'freeze_vision': False,  # 🔓 KEY: Unfreeze all
         }
     }
     
@@ -134,18 +148,24 @@ def main():
     # ========================================================================
     
     print("="*80)
-    print("AUTO STAGED TRAINING - DINOv2 + BARTpho Implicit Reasoning")
+    print("2-STAGE TRAINING - DINOv2 + BARTpho Implicit Reasoning")
     print("="*80)
+    print("\nScheduled Sampling Curriculum (20 epochs total):")
+    print("  Phase 1 (epochs 0-2):  Foundation - 0% generated")
+    print("  Phase 2 (epochs 3-6):  Exposure - 0→30% generated")
+    print("  Phase 3 (epochs 7-11): Robustness - 30→50% generated")
+    print("  Phase 4 (epochs 12+):  Refinement - 50→60% generated")
     print("\nStages to run:")
     for stage_num, config in STAGES.items():
         print(f"  Stage {stage_num}: {config['name']}")
         print(f"    - Epochs: {config['num_epochs']}")
         print(f"    - LR: {config['learning_rate']:.0e}")
         print(f"    - Alpha: {config['alpha_start']}→{config['alpha_end']}")
+        print(f"    - Vision: {'🔒 Frozen' if config.get('freeze_vision') else '🔓 Trainable'}")
         
     resume_checkpoint = None
     
-    for stage_num in [1, 2, 3]:
+    for stage_num in [1, 2]:
         config = STAGES[stage_num]
         
         # Run stage
@@ -161,7 +181,7 @@ def main():
             print(f"[INFO] Will resume Stage {stage_num + 1} from: {resume_checkpoint}")
         else:
             print(f"[WARNING] No checkpoint found in {config['output_dir']}")
-            if stage_num < 3:
+            if stage_num < 2:
                 print(f"[WARNING] Stage {stage_num + 1} will start fresh!")
     
     # ========================================================================
@@ -169,7 +189,7 @@ def main():
     # ========================================================================
     
     print("\n" + "="*80)
-    print("🎉 ALL STAGES COMPLETED SUCCESSFULLY! 🎉")
+    print("🎉 ALL 2 STAGES COMPLETED SUCCESSFULLY! 🎉")
     print("="*80)
     print("\nFinal checkpoints:")
     for stage_num, config in STAGES.items():
@@ -177,8 +197,9 @@ def main():
         if checkpoint:
             print(f"  Stage {stage_num}: {checkpoint}")
     
-    print("\n[INFO] Run SANITY_TESTS.py on final checkpoint to validate!")
-    print(f"[INFO] Best model: {STAGES[3]['output_dir']}/best_model.pt")
+    print("\n[INFO] Run eval_dinov2_bartpho.py on final checkpoint to evaluate!")
+    print(f"[INFO] Best model: {STAGES[2]['output_dir']}/best_model.pt")
+    print(f"[INFO] Latest checkpoint: {STAGES[2]['output_dir']}/checkpoint_latest.pt")
 
 
 if __name__ == '__main__':

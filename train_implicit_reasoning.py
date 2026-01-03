@@ -276,10 +276,10 @@ class ImplicitReasoningTrainer:
                 'val_loss', 'val_reasoning_loss', 'val_answer_loss',
                 'val_answer_gen', 'gen_gap', 'gen_gap_pct',
                 'val_loss_detached', 'answer_drop_pct',
-                'learning_rate', 'alpha_reasoning', 'patience_counter', 'is_best'
+                'learning_rate', 'alpha_reasoning', 'gen_prob', 'phase', 'patience_counter', 'is_best'
             ])
     
-    def log_to_csv(self, epoch, train_losses, val_losses, alpha_reasoning, val_gen_losses=None, val_loss_detached=None, is_best=False):
+    def log_to_csv(self, epoch, train_losses, val_losses, alpha_reasoning, gen_prob, phase, val_gen_losses=None, val_loss_detached=None, is_best=False):
         current_lr = self.scheduler.get_last_lr()[0]
         
         # Calculate generation gap
@@ -311,6 +311,8 @@ class ImplicitReasoningTrainer:
                 f"{answer_drop_pct:.2f}%" if val_loss_detached else "",
                 f"{current_lr:.2e}",
                 f"{alpha_reasoning:.3f}",
+                f"{gen_prob:.1%}",
+                phase,
                 self.patience_counter,
                 1 if is_best else 0
             ])
@@ -388,11 +390,17 @@ class ImplicitReasoningTrainer:
     
     def train_epoch(self, epoch):
         """
-        Train one epoch with implicit reasoning
+        Train one epoch with implicit reasoning + BALANCED SCHEDULED SAMPLING
         
-        Key: 1 forward pass, but with 2 losses:
+        Key: 
         1. Reasoning loss (hidden state supervision) - ANNEALED
         2. Answer loss (conditioned on reasoning hidden)
+        3. BALANCED SCHEDULED SAMPLING: Research-backed curriculum
+           Based on Bengio et al. (2015) & Lamb et al. (2016)
+           - Phase 1 (0-2): Foundation (0% generated)
+           - Phase 2 (3-6): Exposure (0→30% generated)
+           - Phase 3 (7-11): Robustness (30→50% generated)
+           - Phase 4 (12+): Refinement (50→60% generated)
         """
         self.model.train()
         total_loss = 0
@@ -403,7 +411,28 @@ class ImplicitReasoningTrainer:
         progress = epoch / max(self.num_epochs - 1, 1)
         alpha_reasoning = self.alpha_reasoning_start + progress * (self.alpha_reasoning_end - self.alpha_reasoning_start)
         
-        progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs} [α_r={alpha_reasoning:.3f}]")
+        # BALANCED SCHEDULED SAMPLING with 4-phase curriculum
+        if epoch < 3:
+            # Phase 1: Foundation - Learn perfect GT distribution
+            use_generated_prob = 0.0
+            phase = "Foundation"
+        elif epoch < 7:
+            # Phase 2: First Exposure - Gentle ramp (7.5% per epoch)
+            use_generated_prob = 0.30 * ((epoch - 3) / 4)
+            phase = "Exposure"
+        elif epoch < 12:
+            # Phase 3: Building Robustness - Steady increase (4% per epoch)
+            use_generated_prob = 0.30 + 0.20 * ((epoch - 7) / 5)
+            phase = "Robustness"
+        else:
+            # Phase 4: Refinement - Cap at 60% for stability
+            remaining_epochs = max(self.num_epochs - 12, 1)
+            use_generated_prob = 0.50 + 0.10 * ((epoch - 12) / remaining_epochs)
+            use_generated_prob = min(use_generated_prob, 0.60)
+            phase = "Refinement"
+        
+        progress_bar = tqdm(self.train_loader, 
+                           desc=f"Epoch {epoch+1}/{self.num_epochs} [{phase}] [α_r={alpha_reasoning:.3f}, gen={use_generated_prob:.1%}]")
         
         for step, batch in enumerate(progress_bar):
             tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
@@ -426,8 +455,8 @@ class ImplicitReasoningTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Step 1: Reasoning hidden (supervised by GT reasoning)
-                    reasoning_logits, reasoning_hidden, _ = self.model.generate_reasoning(
+                    # Step 1: ALWAYS compute reasoning with GT (for reasoning loss)
+                    reasoning_logits, reasoning_hidden_gt, _ = self.model.generate_reasoning(
                         fused_features=fused_features,
                         reasoning_input_ids=tensor_batch['reasoning_input_ids'],
                         reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
@@ -438,17 +467,30 @@ class ImplicitReasoningTrainer:
                         reasoning_labels.view(-1)
                     )
                     
-                    # REGULARIZATION: Random detach reasoning hidden (10-20%)
-                    # Prevent reasoning from collapsing to identity/passthrough
-                    if random.random() < 0.15:  # 15% detach rate
-                        reasoning_hidden_for_answer = reasoning_hidden.detach()
+                    # Step 2: SCHEDULED SAMPLING - decide GT or generated
+                    if random.random() < use_generated_prob:
+                        # Use GENERATED reasoning (no teacher forcing!)
+                        with torch.no_grad():  # Don't backprop through generation
+                            generated_ids, reasoning_hidden_gen = self.model.generate_reasoning_autoregressive(
+                                fused_features=fused_features,
+                                max_length=96,
+                                num_beams=1,
+                                temperature=1.0,
+                                repetition_penalty=1.2
+                            )
+                        reasoning_hidden_for_answer = reasoning_hidden_gen
                     else:
-                        reasoning_hidden_for_answer = reasoning_hidden
+                        # Use GT reasoning (teacher forcing)
+                        # Random detach 15% to prevent overfitting
+                        if random.random() < 0.15:
+                            reasoning_hidden_for_answer = reasoning_hidden_gt.detach()
+                        else:
+                            reasoning_hidden_for_answer = reasoning_hidden_gt
                     
-                    # Step 2: Answer conditioned on reasoning hidden
+                    # Step 3: Answer conditioned on reasoning hidden
                     answer_logits, _ = self.model.generate_answer(
                         fused_features=fused_features,
-                        reasoning_hidden=reasoning_hidden_for_answer,  # Use reasoning hidden!
+                        reasoning_hidden=reasoning_hidden_for_answer,
                         answer_input_ids=tensor_batch['answer_input_ids'],
                         answer_attention_mask=tensor_batch['answer_attention_mask']
                     )
@@ -529,7 +571,7 @@ class ImplicitReasoningTrainer:
             'total': total_loss / n,
             'reasoning': reasoning_loss_sum / n,
             'answer': answer_loss_sum / n
-        }, alpha_reasoning
+        }, alpha_reasoning, use_generated_prob, phase
     
     @torch.no_grad()
     def validate(self, epoch, test_detach=False):
@@ -739,10 +781,10 @@ class ImplicitReasoningTrainer:
     @torch.no_grad()
     def validate_generation(self, epoch):
         """
-        TRUE VALIDATION: Generate reasoning autoregressively (no teacher forcing)
+        TRUE VALIDATION: Generate BOTH reasoning AND answer autoregressively
         
         This gives REAL performance estimate for inference.
-        Expected to be MUCH worse than validate() with teacher forcing.
+        NO teacher forcing - pure generation!
         """
         self.model.eval()
         total_loss = 0
@@ -772,7 +814,7 @@ class ImplicitReasoningTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Generate reasoning AUTOREGRESSIVELY (NO teacher forcing!)
+                    # STEP 1: Generate reasoning AUTOREGRESSIVELY (NO teacher forcing!)
                     reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
                         fused_features=fused_features,
                         max_length=96,
@@ -781,20 +823,39 @@ class ImplicitReasoningTrainer:
                         repetition_penalty=1.2
                     )
                     
-                    # Answer conditioned on GENERATED reasoning
-                    answer_logits, _ = self.model.generate_answer(
-                        fused_features=fused_features,
-                        reasoning_hidden=reasoning_hidden,
-                        answer_input_ids=tensor_batch['answer_input_ids'],
-                        answer_attention_mask=tensor_batch['answer_attention_mask']
+                    # STEP 2: Generate answer AUTOREGRESSIVELY (NO teacher forcing!)
+                    # Use BARTpho's generate with reasoning_hidden as encoder
+                    from transformers.modeling_outputs import BaseModelOutput
+                    generated_answer_ids = self.model.bartpho.generate(
+                        encoder_outputs=BaseModelOutput(last_hidden_state=reasoning_hidden),
+                        max_length=32,
+                        num_beams=1,
+                        do_sample=False,
+                        pad_token_id=self.model.tokenizer.pad_token_id,
+                        eos_token_id=self.model.tokenizer.eos_token_id,
                     )
+                    
+                    # STEP 3: Forward pass with generated answer to compute loss
+                    # Need to get logits from generated tokens to compare with GT
+                    decoder_outputs = self.model.bartpho.model.decoder(
+                        input_ids=generated_answer_ids,
+                        encoder_hidden_states=reasoning_hidden,
+                        return_dict=True,
+                        use_cache=False
+                    )
+                    answer_logits = self.model.bartpho.lm_head(decoder_outputs.last_hidden_state)
+                    
+                    # Compute loss between generated logits and GT labels
+                    # Align lengths: take minimum of generated and GT
+                    min_len = min(generated_answer_ids.size(1), answer_labels.size(1))
+                    answer_logits_aligned = answer_logits[:, :min_len, :]
+                    answer_labels_aligned = answer_labels[:, :min_len]
                     
                     answer_loss = self.criterion(
-                        answer_logits.view(-1, answer_logits.size(-1)),
-                        answer_labels.view(-1)
+                        answer_logits_aligned.reshape(-1, answer_logits_aligned.size(-1)),
+                        answer_labels_aligned.reshape(-1)
                     )
                     
-                    # Only track answer loss (reasoning loss not comparable since no GT)
                     loss = answer_loss
                 
                 total_loss += loss.item()
@@ -829,8 +890,8 @@ class ImplicitReasoningTrainer:
         
         for epoch in range(self.current_epoch, self.num_epochs):
             # Train
-            train_losses, alpha_reasoning = self.train_epoch(epoch)
-            print(f"\n[EPOCH {epoch+1}] Train Loss: {train_losses['total']:.4f} [α_r={alpha_reasoning:.3f}]")
+            train_losses, alpha_reasoning, gen_prob, phase = self.train_epoch(epoch)
+            print(f"\n[EPOCH {epoch+1}] [{phase} Phase] Train Loss: {train_losses['total']:.4f} [α_r={alpha_reasoning:.3f}, gen={gen_prob:.1%}]")
             print(f"  Reasoning: {train_losses['reasoning']:.4f}")
             print(f"  Answer: {train_losses['answer']:.4f}")
             
@@ -898,7 +959,7 @@ class ImplicitReasoningTrainer:
             self.save_checkpoint(epoch, val_losses['total'], is_best=False)
             
             # Log
-            self.log_to_csv(epoch, train_losses, val_losses, alpha_reasoning, val_gen_losses, val_loss_detached, is_best)
+            self.log_to_csv(epoch, train_losses, val_losses, alpha_reasoning, gen_prob, phase, val_gen_losses, val_loss_detached, is_best)
             
             # Early stopping
             if self.patience_counter >= self.patience:
@@ -936,6 +997,8 @@ def main():
                         help='Test reasoning utility every N epochs')
     parser.add_argument('--reasoning_bottleneck', type=int, default=None,
                         help='Compress reasoning to k tokens (e.g., 6). None = no compression')
+    parser.add_argument('--freeze_vision', action='store_true',
+                        help='Freeze DINOv2 vision encoder (for Stage 1 training)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume training from')
     
@@ -986,6 +1049,15 @@ def main():
         gradient_checkpointing=True,
         reasoning_bottleneck_tokens=args.reasoning_bottleneck  # NEW: bottleneck
     )
+    
+    # Freeze vision encoder if requested (for Stage 1)
+    if args.freeze_vision:
+        print("\n[INFO] 🔒 FREEZING DINOv2 Vision Encoder (Stage 1 mode)")
+        for param in model.vision_model.parameters():
+            param.requires_grad = False
+        print(f"[INFO] Vision encoder params frozen")
+    else:
+        print("\n[INFO] 🔓 All parameters trainable (Stage 2 mode)")
     
     total_params, trainable_params = count_parameters(model)
     print(f"[INFO] Total params: {total_params/1e6:.1f}M")
