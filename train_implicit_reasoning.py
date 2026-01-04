@@ -910,12 +910,12 @@ class ImplicitReasoningTrainer:
                     reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
                     
                     # Forward pass
-                    decoder_outputs = self.model.bartpho.model.decoder(
+                    decoder_outputs = self.model.reasoning_decoder(
                         input_ids=reasoning_ids,
                         encoder_hidden_states=fused_features,
                         return_dict=True
                     )
-                    logits = self.model.bartpho.lm_head(decoder_outputs.last_hidden_state)
+                    logits = self.model.lm_head(decoder_outputs.last_hidden_state)
                     
                     # Align lengths
                     min_len = min(reasoning_ids.size(1), reasoning_labels.size(1))
@@ -1001,14 +1001,14 @@ class ImplicitReasoningTrainer:
                     
                     # Generate answer
                     from transformers.modeling_outputs import BaseModelOutput
-                    answer_outputs = self.model.bartpho.generate(
-                        encoder_outputs=BaseModelOutput(last_hidden_state=reasoning_hidden),
+                    # Use answer decoder's generate method via model.generate_answer_autoregressive
+                    answer_outputs, _ = self.model.generate_answer_autoregressive(
+                        fused_features=fused_features,
+                        reasoning_hidden=reasoning_hidden,
                         max_length=32,
                         num_beams=3,
                         temperature=0.7,
-                        repetition_penalty=1.5,
-                        pad_token_id=self.model.tokenizer.pad_token_id,
-                        eos_token_id=self.model.tokenizer.eos_token_id,
+                        repetition_penalty=1.5
                     )
                     
                     # Decode
