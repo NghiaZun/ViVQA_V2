@@ -1162,8 +1162,6 @@ def main():
                         help='Total epochs (20 for feature extraction, 30 for full finetuning)')
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--alpha_reasoning', type=float, default=0.4)
-    parser.add_argument('--foundation_epochs', type=int, default=5)
-    parser.add_argument('--max_gen_prob', type=float, default=0.40)
     parser.add_argument('--reasoning_bottleneck', type=int, default=None)
     parser.add_argument('--freeze_pretrained', action='store_true',
                         help='Freeze all pretrained weights (encoder + decoders), only train heads')
@@ -1264,8 +1262,8 @@ def main():
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
         alpha_reasoning=args.alpha_reasoning,
-        foundation_epochs=args.foundation_epochs,
-        max_gen_prob=args.max_gen_prob,
+        # Use default 3-stage params (optimized for feature extraction):
+        # alignment_epochs=3, language_tuning_epochs=10, full_finetuning_epochs=20
         unfreeze_after_epoch=args.unfreeze_after_epoch,
     )
     
