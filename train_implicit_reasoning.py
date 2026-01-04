@@ -171,14 +171,26 @@ class ImplicitReasoningDataset(Dataset):
         return len(self.data)
     
     def augment_image(self, image):
+        """Augment PIL image before vision processor"""
         import torchvision.transforms as T
-        aug = T.Compose([
-            T.RandomHorizontalFlip(p=0.5),
-            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.15),
-            T.RandomRotation(degrees=10),
-            T.RandomResizedCrop(224, scale=(0.85, 1.0)),
-        ])
-        return aug(image)
+        import torchvision.transforms.functional as TF
+        import random
+        
+        # Random horizontal flip
+        if random.random() > 0.5:
+            image = TF.hflip(image)
+        
+        # Random color jitter
+        if random.random() > 0.3:
+            jitter = T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1)
+            image = jitter(image)
+        
+        # Random rotation (small angle)
+        if random.random() > 0.5:
+            angle = random.uniform(-10, 10)
+            image = TF.rotate(image, angle)
+        
+        return image
     
     def __getitem__(self, idx):
         item = self.data[idx]
@@ -287,14 +299,15 @@ class GenerationQualityTracker:
         return quality
     
     def is_improving(self):
-        """Check if quality is improving"""
+        """Check if quality is improving (perplexity should DECREASE)"""
         if len(self.history['perplexity']) < 2:
             return True
         
         recent = self.history['perplexity'][-1]
         prev = self.history['perplexity'][-2]
         
-        return recent <= prev * 1.1  # Allow 10% increase
+        # Perplexity lower is better, allow 10% degradation tolerance
+        return recent <= prev * 1.1  # recent ≤ prev means improving/stable
 
 
 # ============================================================================
@@ -543,8 +556,8 @@ class ImplicitReasoningTrainer:
                 return self.current_gen_prob, "Stage 2: LANGUAGE TUNING (Holding)"
             
             # Quality good → increase gradually
-            epochs_in_stage = epoch - self.alignment_epochs + 1
-            target_prob = min(self.stage2_ceiling, epochs_in_stage * 0.02)  # 2% per epoch
+            epochs_in_stage = epoch - self.alignment_epochs  # 0-indexed
+            target_prob = min(self.stage2_ceiling, (epochs_in_stage + 1) * 0.02)  # 2% per epoch
             
             # Smooth increase
             new_prob = min(self.current_gen_prob + 0.02, target_prob, self.stage2_ceiling)
@@ -561,8 +574,8 @@ class ImplicitReasoningTrainer:
                 return new_prob, "Stage 3: FULL FINETUNING (Decreasing)"
             
             # Quality good → increase to ceiling
-            epochs_in_stage = epoch - self.language_tuning_epochs + 1
-            target_prob = min(self.stage3_ceiling, floor + epochs_in_stage * 0.02)
+            epochs_in_stage = epoch - self.language_tuning_epochs  # 0-indexed
+            target_prob = min(self.stage3_ceiling, floor + (epochs_in_stage + 1) * 0.02)
             
             # Smooth increase
             new_prob = min(self.current_gen_prob + 0.02, target_prob, self.stage3_ceiling)
@@ -640,6 +653,7 @@ class ImplicitReasoningTrainer:
     def train_epoch(self, epoch, gen_prob):
         """Train one epoch with given gen_prob"""
         self.model.train()
+        self.optimizer.zero_grad()  # Initialize clean state
         total_loss = 0
         reasoning_loss_sum = 0
         answer_loss_sum = 0
@@ -687,9 +701,9 @@ class ImplicitReasoningTrainer:
                             _, reasoning_hidden_gen = self.model.generate_reasoning_autoregressive(
                                 fused_features=fused_features,
                                 max_length=96,
-                                num_beams=3,  # 🔥 FIX: beam search
-                                temperature=0.7,  # 🔥 FIX: lower temp
-                                repetition_penalty=1.5  # 🔥 FIX: stronger penalty
+                                num_beams=1,  # Greedy decoding
+                                temperature=0.7,  # Lower temp for quality
+                                repetition_penalty=1.5  # Stronger penalty
                             )
                         reasoning_hidden_for_answer = reasoning_hidden_gen
                     else:
@@ -900,32 +914,26 @@ class ImplicitReasoningTrainer:
                     reasoning_ids, _ = self.model.generate_reasoning_autoregressive(
                         fused_features=fused_features,
                         max_length=96,
-                        num_beams=3,
+                        num_beams=1,
                         temperature=0.7,
                         repetition_penalty=1.5
                     )
                     
-                    # Compute perplexity
+                    # Compute perplexity using GT reasoning (teacher forcing)
                     reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
                     reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
                     
-                    # Forward pass
-                    decoder_outputs = self.model.reasoning_decoder(
-                        input_ids=reasoning_ids,
-                        encoder_hidden_states=fused_features,
-                        return_dict=True
+                    # Forward pass with GT reasoning_input_ids (not generated!)
+                    reasoning_logits, _, _ = self.model.generate_reasoning(
+                        fused_features=fused_features,
+                        reasoning_input_ids=tensor_batch['reasoning_input_ids'],
+                        reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
                     )
-                    logits = self.model.lm_head(decoder_outputs.last_hidden_state)
-                    
-                    # Align lengths
-                    min_len = min(reasoning_ids.size(1), reasoning_labels.size(1))
-                    logits_aligned = logits[:, :min_len, :]
-                    labels_aligned = reasoning_labels[:, :min_len]
                     
                     # Compute loss (for perplexity)
                     loss = self.criterion(
-                        logits_aligned.reshape(-1, logits_aligned.size(-1)),
-                        labels_aligned.reshape(-1)
+                        reasoning_logits.reshape(-1, reasoning_logits.size(-1)),
+                        reasoning_labels.reshape(-1)
                     )
                     
                     ppl = torch.exp(loss).item()
@@ -943,6 +951,10 @@ class ImplicitReasoningTrainer:
                         total_samples += 1
                         if total_samples >= num_samples:
                             break
+                
+                # Break outer loop if reached num_samples
+                if total_samples >= num_samples:
+                    break
                 
             except Exception as e:
                 print(f"[WARNING] Error in quality measurement: {e}")
@@ -994,22 +1006,41 @@ class ImplicitReasoningTrainer:
                     reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
                         fused_features=fused_features,
                         max_length=96,
-                        num_beams=3,
+                        num_beams=1,
                         temperature=0.7,
                         repetition_penalty=1.5
                     )
                     
-                    # Generate answer
-                    from transformers.modeling_outputs import BaseModelOutput
-                    # Use answer decoder's generate method via model.generate_answer_autoregressive
-                    answer_outputs, _ = self.model.generate_answer_autoregressive(
-                        fused_features=fused_features,
-                        reasoning_hidden=reasoning_hidden,
-                        max_length=32,
-                        num_beams=3,
-                        temperature=0.7,
-                        repetition_penalty=1.5
+                    # Generate answer using answer_decoder
+                    answer_ids = torch.full(
+                        (1, 1),
+                        self.model.tokenizer.bos_token_id,
+                        dtype=torch.long,
+                        device=self.device
                     )
+                    
+                    # Autoregressive generation for answer
+                    for _ in range(31):  # max 32 tokens
+                        decoder_outputs = self.model.answer_decoder(
+                            input_ids=answer_ids,
+                            encoder_hidden_states=reasoning_hidden,
+                            return_dict=True,
+                            use_cache=False
+                        )
+                        
+                        hidden = decoder_outputs.last_hidden_state[:, -1, :]
+                        logits = self.model.lm_head(hidden)
+                        
+                        # Apply temperature and repetition penalty
+                        logits = logits / 0.7
+                        for token_id in set(answer_ids[0].tolist()):
+                            logits[0, token_id] /= 1.5
+                        
+                        next_token = logits.argmax(dim=-1, keepdim=True)
+                        answer_ids = torch.cat([answer_ids, next_token], dim=1)
+                        
+                        if next_token.item() == self.model.tokenizer.eos_token_id:
+                            break
                     
                     # Decode
                     question_text = self.model.tokenizer.decode(
@@ -1023,7 +1054,7 @@ class ImplicitReasoningTrainer:
                     )
                     
                     generated_answer_text = self.model.tokenizer.decode(
-                        answer_outputs[0],
+                        answer_ids[0],
                         skip_special_tokens=True
                     )
                     
