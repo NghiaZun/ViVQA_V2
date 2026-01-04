@@ -1,20 +1,115 @@
 """
-IMPLICIT REASONING TRAINING: DINOv2 + BARTpho VQA
-==================================================
-Training với implicit reasoning (hidden-state based):
-✅ Reasoning là hidden states, KHÔNG generate text
-✅ Answer được condition trên reasoning hidden states
-✅ 1 forward pass (nhanh như direct answer)
-✅ Có reasoning capability nhưng không bias tokens
+IMPLICIT REASONING TRAINING - 3-Stage Curriculum with Separate Decoders
+========================================================================
 
-Flow:
-1. Encode: Image + Question → Fused Features
-2. Reasoning Hidden: Fused → Reasoning Decoder → Hidden States (NO TEXT!)
-3. Answer: Reasoning Hidden → Answer Decoder → Answer Text
+ARCHITECTURE:
+=============
+SEPARATE DECODERS:
+  - Reasoning Decoder: specialized for explanatory generation
+  - Answer Decoder: specialized for concise answers
+  - No task confusion between tasks!
 
-Key difference:
-- Autoregressive CoT: Generate reasoning TEXT → slow, token bias
-- Implicit Reasoning: Generate reasoning HIDDEN → fast, no bias!
+2 TRAINING MODES:
+=================
+
+MODE 1: FEATURE EXTRACTION (Recommended)
+-----------------------------------------
+Flag: --freeze_pretrained
+
+FROZEN (87% of model):
+  - Vision Encoder
+  - Text Encoder
+  - Reasoning Decoder
+  - Answer Decoder
+
+TRAINABLE (13% - only heads):
+  - Vision Projection
+  - Cross-Attention Fusion
+  - LM Head
+
+Benefits:
+  - Preserve pretrained knowledge
+  - Fast training (2x faster)
+  - Less memory (7-8GB)
+  - No catastrophic forgetting
+
+MODE 2: FULL FINETUNING (Aggressive)
+--------------------------------------
+Flag: --freeze_vision
+
+Stage 1-2: Vision frozen, train decoders (595M)
+Stage 3: Full end-to-end (681M)
+
+Benefits:
+  - Max performance potential
+Risks:
+  - May overfit on small data
+  - May lose pretrained knowledge
+
+
+3-STAGE CURRICULUM:
+===================
+
+STAGE 1 (Epochs 0-4): ALIGNMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STAGE 1 (Epochs 0-2): ALIGNMENT
+Duration:  3 epochs (reduced for frozen pretrained)
+Gen_prob:  0% (HARD LOCKED - no generation)
+Quality:   Not measured (teacher forcing only)
+Strategy:  Pure alignment learning
+
+Goal: Learn cross-modal fusion without generation pressure
+      Both decoders receive ground truth targets
+      Quick alignment since pretrained weights already good
+
+STAGE 2 (Epochs 3-9): LANGUAGE TUNING
+Duration:  7 epochs (reduced - pretrained decoder already knows)
+Gen_prob:  0% to 20% (CEILING at 20%)
+Quality:   Active gating
+
+Gating Logic:
+  IF quality_score > 0.6 AND improving:
+    INCREASE gen_prob (+3% per epoch for faster ramp)
+  ELSE:
+    HOLD gen_prob (wait for quality)
+  
+  Hard ceiling: max(gen_prob) = 20%
+
+Goal: Adapt pretrained generation to task style
+      Build robustness to self-generation
+
+STAGE 3 (Epochs 10-19): REFINEMENT
+Duration:  10 epochs (reduced - only tuning heads)
+Gen_prob:  20% to 40% (FLOOR at 20%, CEILING at 40%)
+Quality:   Active gating with DECREASE on drop
+
+Gating Logic:
+  IF quality_score > 0.6 AND improving:
+    INCREASE gen_prob (+2% per epoch)
+  ELIF quality_score < 0.6 OR degrading:
+    DECREASE gen_prob (-2%, min=20%)
+  ELSE:
+    HOLD gen_prob
+  
+  Hard floor: min(gen_prob) = 20% (from Stage 2)
+  Hard ceiling: max(gen_prob) = 40%
+
+Goal: Polish generation quality with task-specific heads
+      Max robustness without collapse
+
+USAGE:
+======
+# MODE 1: Feature Extraction (Recommended - 20 epochs)
+python train_implicit_reasoning.py \
+  --freeze_pretrained \
+  --num_epochs 20 \
+  --learning_rate 5e-4
+
+# MODE 2: Full Finetuning (Aggressive - 30 epochs)  
+python train_implicit_reasoning.py \
+  --freeze_vision \
+  --num_epochs 30 \
+  --learning_rate 2e-5
 """
 
 import os
@@ -39,7 +134,7 @@ from model_dinov2_bartpho import DINOv2BARTphoVQA, count_parameters
 
 
 # ============================================================================
-# 1. DATASET
+# 1. DATASET (unchanged)
 # ============================================================================
 
 class ImplicitReasoningDataset(Dataset):
@@ -107,7 +202,7 @@ class ImplicitReasoningDataset(Dataset):
             return_tensors='pt'
         )
         
-        # Tokenize reasoning (for supervision)
+        # Tokenize reasoning
         reasoning_enc = self.tokenizer(
             item.get('reasoning', item.get('teacher_reasoning', '')),
             max_length=self.max_reasoning_len,
@@ -140,23 +235,75 @@ class ImplicitReasoningDataset(Dataset):
 
 
 # ============================================================================
-# 2. IMPLICIT REASONING TRAINER
+# 2. GENERATION QUALITY METRICS
+# ============================================================================
+
+class GenerationQualityTracker:
+    """Track generation quality to guide scheduled sampling"""
+    
+    def __init__(self, window_size=3):
+        self.window_size = window_size
+        self.history = {
+            'perplexity': [],
+            'non_empty_rate': [],
+            'avg_length': [],
+        }
+    
+    def update(self, metrics):
+        """Update with new metrics"""
+        for key, value in metrics.items():
+            if key in self.history:
+                self.history[key].append(value)
+                # Keep only last N
+                if len(self.history[key]) > self.window_size:
+                    self.history[key].pop(0)
+    
+    def get_quality_score(self):
+        """
+        Return quality score [0, 1]
+        - 1.0 = excellent (ready for more generated)
+        - 0.0 = poor (stay with GT)
+        """
+        if not self.history['perplexity']:
+            return 0.0
+        
+        # Average recent perplexity
+        avg_ppl = np.mean(self.history['perplexity'])
+        non_empty = np.mean(self.history['non_empty_rate'])
+        avg_len = np.mean(self.history['avg_length'])
+        
+        # Quality criteria:
+        # - Perplexity < 20 (good), < 10 (excellent)
+        # - Non-empty > 0.95 (most generations are valid)
+        # - Avg length > 10 tokens (not degenerate)
+        
+        ppl_score = max(0, 1 - (avg_ppl / 30))  # 30+ ppl = 0, 0 ppl = 1
+        empty_score = non_empty
+        length_score = min(1.0, avg_len / 20)  # 20+ tokens = 1
+        
+        # Weighted average
+        quality = 0.5 * ppl_score + 0.3 * empty_score + 0.2 * length_score
+        
+        return quality
+    
+    def is_improving(self):
+        """Check if quality is improving"""
+        if len(self.history['perplexity']) < 2:
+            return True
+        
+        recent = self.history['perplexity'][-1]
+        prev = self.history['perplexity'][-2]
+        
+        return recent <= prev * 1.1  # Allow 10% increase
+
+
+# ============================================================================
+# 3. IMPROVED TRAINER
 # ============================================================================
 
 class ImplicitReasoningTrainer:
     """
-    Trainer với implicit reasoning
-    
-    Key idea:
-    - Reasoning decoder generates HIDDEN STATES (supervised by GT reasoning)
-    - Answer decoder uses reasoning hidden as context
-    - Only 1 forward pass (like direct answer)
-    - But has reasoning capability!
-    
-    FIX:
-    1. Detach test mỗi epoch → chứng minh reasoning có ích
-    2. Anneal α_reasoning → giảm dần từ 0.5 → 0.1 để tránh overfit text
-    3. Learned reasoning prefix → inference strategy rõ ràng
+    Trainer với validation-guided scheduled sampling
     """
     
     def __init__(
@@ -172,15 +319,22 @@ class ImplicitReasoningTrainer:
         weight_decay=0.01,
         warmup_ratio=0.1,
         max_grad_norm=1.0,
-        alpha_reasoning_start=0.5,
-        alpha_reasoning_end=0.1,
+        alpha_reasoning=0.4,  # Fixed weight, không anneal
         alpha_answer=0.6,
         label_smoothing=0.1,
         use_amp=True,
-        patience=5,
+        patience=7,  # Increased patience
         log_steps=10,
         save_steps=100,
-        detach_test_every=5,
+        # NEW: 3-Stage curriculum params (optimized for feature extraction)
+        alignment_epochs=3,      # Stage 1: Pure alignment (reduced for frozen pretrained)
+        language_tuning_epochs=10,  # End of Stage 2: Language tuning (reduced)
+        full_finetuning_epochs=20,  # End of Stage 3: Full finetuning (reduced)
+        stage2_ceiling=0.20,     # Max gen_prob in Stage 2
+        stage3_ceiling=0.40,     # Max gen_prob in Stage 3
+        quality_threshold=0.6,   # Minimum quality to increase gen_prob
+        # NEW: 2-stage training
+        unfreeze_after_epoch=None,  # Auto-unfreeze vision after N epochs
     ):
         self.model = model
         self.train_dataset = train_dataset
@@ -200,12 +354,25 @@ class ImplicitReasoningTrainer:
         self.patience = patience
         self.log_steps = log_steps
         self.save_steps = save_steps
-        self.detach_test_every = detach_test_every
         
-        # Annealing α_reasoning: start high → end low
-        self.alpha_reasoning_start = alpha_reasoning_start
-        self.alpha_reasoning_end = alpha_reasoning_end
+        # Loss weights (fixed)
+        self.alpha_reasoning = alpha_reasoning
         self.alpha_answer = alpha_answer
+        
+        # 3-Stage curriculum params
+        self.alignment_epochs = alignment_epochs
+        self.language_tuning_epochs = language_tuning_epochs
+        self.full_finetuning_epochs = full_finetuning_epochs
+        self.stage2_ceiling = stage2_ceiling
+        self.stage3_ceiling = stage3_ceiling
+        self.quality_threshold = quality_threshold
+        
+        # 2-stage training
+        self.unfreeze_after_epoch = unfreeze_after_epoch
+        self.vision_frozen = self._check_vision_frozen()
+        
+        # Quality tracker
+        self.quality_tracker = GenerationQualityTracker(window_size=3)
         
         # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -258,75 +425,165 @@ class ImplicitReasoningTrainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.patience_counter = 0
+        self.current_gen_prob = 0.0
         
         # CSV logger
         self.csv_log_path = self.output_dir / 'training_log.csv'
         self.init_csv_logger()
         
-        print(f"\n[INFO] Implicit Reasoning Trainer initialized")
-        print(f"  Effective batch size: {batch_size * gradient_accumulation_steps}")
-        print(f"  Loss weights: α_reasoning={alpha_reasoning_start}→{alpha_reasoning_end}, α_answer={alpha_answer}")
-        print(f"  Detach test every {detach_test_every} epochs")
+        print(f"\n[INFO] Improved Implicit Reasoning Trainer initialized")
+        print(f"  3-Stage Curriculum:")
+        print(f"    Stage 1 (0-{alignment_epochs-1}): ALIGNMENT [gen_prob=0%, hard lock]")
+        print(f"    Stage 2 ({alignment_epochs}-{language_tuning_epochs-1}): LANGUAGE TUNING [gen_prob=0→{stage2_ceiling*100:.0f}%, ceiling]")
+        print(f"    Stage 3 ({language_tuning_epochs}-{full_finetuning_epochs-1}): FULL FINETUNING [gen_prob={stage2_ceiling*100:.0f}→{stage3_ceiling*100:.0f}%, ceiling]")
+        print(f"  Quality threshold: {quality_threshold}")
+        if self.vision_frozen:
+            print(f"  🔒 Vision encoder: FROZEN (Stage 1+2)")
+            if unfreeze_after_epoch:
+                print(f"     Will unfreeze at epoch {unfreeze_after_epoch} (Stage 3)")
+        else:
+            print(f"  🔓 Vision encoder: TRAINABLE (Stage 3)")
+    
+    def _check_vision_frozen(self):
+        """Check if vision encoder is frozen"""
+        for param in self.model.vision_encoder.parameters():
+            if param.requires_grad:
+                return False
+        return True
+    
+    def _unfreeze_vision_encoder(self):
+        """Unfreeze vision encoder for Stage 3"""
+        print(f"\n{'='*70}")
+        print(f"🔓 STAGE 3: UNFREEZING VISION ENCODER")
+        print(f"{'='*70}")
+        
+        for param in self.model.vision_encoder.parameters():
+            param.requires_grad = True
+        
+        self.vision_frozen = False
+        
+        # Recount trainable params
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"[INFO] Trainable params after unfreeze: {trainable_params/1e6:.1f}M")
+        
+        # Update optimizer to include vision params
+        self.optimizer = torch.optim.AdamW(
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=self.learning_rate * 0.5,  # Lower LR for Stage 3
+            weight_decay=self.weight_decay,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        print(f"[INFO] ✓ Optimizer updated with vision encoder parameters")
+        print(f"[INFO] ✓ Learning rate reduced to {self.learning_rate * 0.5:.2e} for Stage 3")
     
     def init_csv_logger(self):
         with open(self.csv_log_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
-                'epoch', 'train_loss', 'train_reasoning_loss', 'train_answer_loss',
+                'epoch', 'phase', 'gen_prob', 'quality_score',
+                'train_loss', 'train_reasoning_loss', 'train_answer_loss',
                 'val_loss', 'val_reasoning_loss', 'val_answer_loss',
-                'val_answer_gen', 'gen_gap', 'gen_gap_pct',
-                'val_loss_detached', 'answer_drop_pct',
-                'learning_rate', 'alpha_reasoning', 'gen_prob', 'phase', 'patience_counter', 'is_best'
+                'gen_perplexity', 'gen_non_empty_rate', 'gen_avg_length',
+                'learning_rate', 'patience_counter', 'is_best'
             ])
     
-    def log_to_csv(self, epoch, train_losses, val_losses, alpha_reasoning, gen_prob, phase, val_gen_losses=None, val_loss_detached=None, is_best=False):
+    def log_to_csv(self, epoch, phase, gen_prob, quality_score, train_losses, val_losses, gen_metrics, is_best=False):
         current_lr = self.scheduler.get_last_lr()[0]
-        
-        # Calculate generation gap
-        gen_gap = 0.0
-        gen_gap_pct = 0.0
-        if val_gen_losses is not None:
-            gen_gap = val_gen_losses['answer'] - val_losses['answer']
-            gen_gap_pct = (gen_gap / val_losses['answer']) * 100 if val_losses['answer'] > 0 else 0
-        
-        # Calculate answer drop if detach test was run
-        answer_drop_pct = 0.0
-        if val_loss_detached is not None and val_losses['answer'] > 0:
-            answer_drop_pct = ((val_loss_detached - val_losses['answer']) / val_losses['answer']) * 100
         
         with open(self.csv_log_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([
                 epoch + 1,
+                phase,
+                f"{gen_prob:.3f}",
+                f"{quality_score:.3f}",
                 f"{train_losses['total']:.4f}",
                 f"{train_losses['reasoning']:.4f}",
                 f"{train_losses['answer']:.4f}",
                 f"{val_losses['total']:.4f}",
                 f"{val_losses['reasoning']:.4f}",
                 f"{val_losses['answer']:.4f}",
-                f"{val_gen_losses['answer']:.4f}" if val_gen_losses else "",
-                f"{gen_gap:.4f}" if val_gen_losses else "",
-                f"{gen_gap_pct:.2f}%" if val_gen_losses else "",
-                f"{val_loss_detached:.4f}" if val_loss_detached else "",
-                f"{answer_drop_pct:.2f}%" if val_loss_detached else "",
+                f"{gen_metrics.get('perplexity', 0):.2f}",
+                f"{gen_metrics.get('non_empty_rate', 0):.3f}",
+                f"{gen_metrics.get('avg_length', 0):.1f}",
                 f"{current_lr:.2e}",
-                f"{alpha_reasoning:.3f}",
-                f"{gen_prob:.1%}",
-                phase,
                 self.patience_counter,
                 1 if is_best else 0
             ])
     
+    def compute_gen_prob(self, epoch, quality_score):
+        """
+        3-Stage Quality-Gated Scheduled Sampling
+        
+        Stage 1 (0-4): ALIGNMENT
+          - gen_prob = 0% (HARD LOCK)
+          - No quality check
+          - Pure teacher forcing
+        
+        Stage 2 (5-14): LANGUAGE TUNING
+          - gen_prob: 0% → 20% (CEILING)
+          - Quality-gated: increase only if quality > 0.6
+          - +2% per epoch when quality good
+        
+        Stage 3 (15-29): FULL FINETUNING
+          - gen_prob: 20% → 40% (FLOOR 20%, CEILING 40%)
+          - Quality-gated: increase/decrease based on quality
+          - Can decrease to 20% floor if quality drops
+        """
+        # Stage 1: ALIGNMENT (hard lock at 0%)
+        if epoch < self.alignment_epochs:
+            return 0.0, "Stage 1: ALIGNMENT"
+        
+        # Stage 2: LANGUAGE TUNING
+        elif epoch < self.language_tuning_epochs:
+            # Quality gate
+            if quality_score < self.quality_threshold:
+                # Quality not good → hold
+                return self.current_gen_prob, "Stage 2: LANGUAGE TUNING (Holding)"
+            
+            # Quality good → increase gradually
+            epochs_in_stage = epoch - self.alignment_epochs + 1
+            target_prob = min(self.stage2_ceiling, epochs_in_stage * 0.02)  # 2% per epoch
+            
+            # Smooth increase
+            new_prob = min(self.current_gen_prob + 0.02, target_prob, self.stage2_ceiling)
+            return new_prob, "Stage 2: LANGUAGE TUNING (Growing)"
+        
+        # Stage 3: FULL FINETUNING
+        else:
+            # Start from Stage 2 floor (20%)
+            floor = self.stage2_ceiling
+            
+            if quality_score < self.quality_threshold:
+                # Quality drop → DECREASE (but respect floor)
+                new_prob = max(floor, self.current_gen_prob - 0.02)
+                return new_prob, "Stage 3: FULL FINETUNING (Decreasing)"
+            
+            # Quality good → increase to ceiling
+            epochs_in_stage = epoch - self.language_tuning_epochs + 1
+            target_prob = min(self.stage3_ceiling, floor + epochs_in_stage * 0.02)
+            
+            # Smooth increase
+            new_prob = min(self.current_gen_prob + 0.02, target_prob, self.stage3_ceiling)
+            
+            if new_prob >= self.stage3_ceiling:
+                return self.stage3_ceiling, "Stage 3: FULL FINETUNING (Ceiling)"
+            else:
+                return new_prob, "Stage 3: FULL FINETUNING (Growing)"
+    
     def save_checkpoint(self, epoch, val_loss=None, is_best=False):
         try:
             checkpoint = {
-                'epoch': epoch,
+                'epoch': epoch + 1,  # Save NEXT epoch to train (so resume doesn't skip or repeat)
                 'global_step': self.global_step,
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'best_val_loss': self.best_val_loss,
                 'patience_counter': self.patience_counter,
+                'current_gen_prob': self.current_gen_prob,
+                'quality_tracker': self.quality_tracker.history,
             }
             
             if self.scaler:
@@ -347,37 +604,29 @@ class ImplicitReasoningTrainer:
             print(f"[ERROR] Failed to save checkpoint: {e}")
     
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint để resume training"""
+        """Load checkpoint to resume training"""
         try:
             print(f"\n[INFO] Loading checkpoint from {checkpoint_path}...")
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             
-            # Load model weights
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"[INFO] ✓ Model weights loaded")
-            
-            # Load optimizer
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            print(f"[INFO] ✓ Optimizer state loaded")
-            
-            # Load scheduler
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            print(f"[INFO] ✓ Scheduler state loaded")
             
-            # Load training state
-            self.current_epoch = checkpoint['epoch'] + 1
+            self.current_epoch = checkpoint['epoch']  # Epoch already +1 when saved
             self.global_step = checkpoint['global_step']
             self.best_val_loss = checkpoint['best_val_loss']
             self.patience_counter = checkpoint['patience_counter']
+            self.current_gen_prob = checkpoint.get('current_gen_prob', 0.0)
             
-            # Load scaler if using AMP
+            if 'quality_tracker' in checkpoint:
+                self.quality_tracker.history = checkpoint['quality_tracker']
+            
             if self.scaler and 'scaler_state_dict' in checkpoint:
                 self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                print(f"[INFO] ✓ AMP scaler loaded")
             
             print(f"[INFO] ✓ Resume from epoch {self.current_epoch}")
-            print(f"[INFO] ✓ Best val loss: {self.best_val_loss:.4f}")
-            print(f"[INFO] ✓ Global step: {self.global_step}")
+            print(f"[INFO] ✓ Current gen_prob: {self.current_gen_prob:.1%}")
             
             del checkpoint
             if torch.cuda.is_available():
@@ -388,51 +637,15 @@ class ImplicitReasoningTrainer:
             print(f"[ERROR] Failed to load checkpoint: {e}")
             return False
     
-    def train_epoch(self, epoch):
-        """
-        Train one epoch with implicit reasoning + BALANCED SCHEDULED SAMPLING
-        
-        Key: 
-        1. Reasoning loss (hidden state supervision) - ANNEALED
-        2. Answer loss (conditioned on reasoning hidden)
-        3. BALANCED SCHEDULED SAMPLING: Research-backed curriculum
-           Based on Bengio et al. (2015) & Lamb et al. (2016)
-           - Phase 1 (0-2): Foundation (0% generated)
-           - Phase 2 (3-6): Exposure (0→30% generated)
-           - Phase 3 (7-11): Robustness (30→50% generated)
-           - Phase 4 (12+): Refinement (50→60% generated)
-        """
+    def train_epoch(self, epoch, gen_prob):
+        """Train one epoch with given gen_prob"""
         self.model.train()
         total_loss = 0
         reasoning_loss_sum = 0
         answer_loss_sum = 0
         
-        # Anneal α_reasoning: linear decay
-        progress = epoch / max(self.num_epochs - 1, 1)
-        alpha_reasoning = self.alpha_reasoning_start + progress * (self.alpha_reasoning_end - self.alpha_reasoning_start)
-        
-        # BALANCED SCHEDULED SAMPLING with 4-phase curriculum
-        if epoch < 3:
-            # Phase 1: Foundation - Learn perfect GT distribution
-            use_generated_prob = 0.0
-            phase = "Foundation"
-        elif epoch < 7:
-            # Phase 2: First Exposure - Gentle ramp (7.5% per epoch)
-            use_generated_prob = 0.30 * ((epoch - 3) / 4)
-            phase = "Exposure"
-        elif epoch < 12:
-            # Phase 3: Building Robustness - Steady increase (4% per epoch)
-            use_generated_prob = 0.30 + 0.20 * ((epoch - 7) / 5)
-            phase = "Robustness"
-        else:
-            # Phase 4: Refinement - Cap at 60% for stability
-            remaining_epochs = max(self.num_epochs - 12, 1)
-            use_generated_prob = 0.50 + 0.10 * ((epoch - 12) / remaining_epochs)
-            use_generated_prob = min(use_generated_prob, 0.60)
-            phase = "Refinement"
-        
         progress_bar = tqdm(self.train_loader, 
-                           desc=f"Epoch {epoch+1}/{self.num_epochs} [{phase}] [α_r={alpha_reasoning:.3f}, gen={use_generated_prob:.1%}]")
+                           desc=f"Epoch {epoch+1}/{self.num_epochs} [gen={gen_prob:.1%}]")
         
         for step, batch in enumerate(progress_bar):
             tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
@@ -447,7 +660,7 @@ class ImplicitReasoningTrainer:
             
             try:
                 with autocast('cuda', enabled=self.use_amp):
-                    # Encode image + question
+                    # Encode
                     vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
                     question_embeds = self.model.encode_text(
                         input_ids=tensor_batch['input_ids'],
@@ -455,7 +668,7 @@ class ImplicitReasoningTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Step 1: ALWAYS compute reasoning with GT (for reasoning loss)
+                    # Step 1: Reasoning loss (ALWAYS from GT)
                     reasoning_logits, reasoning_hidden_gt, _ = self.model.generate_reasoning(
                         fused_features=fused_features,
                         reasoning_input_ids=tensor_batch['reasoning_input_ids'],
@@ -467,27 +680,23 @@ class ImplicitReasoningTrainer:
                         reasoning_labels.view(-1)
                     )
                     
-                    # Step 2: SCHEDULED SAMPLING - decide GT or generated
-                    if random.random() < use_generated_prob:
-                        # Use GENERATED reasoning (no teacher forcing!)
-                        with torch.no_grad():  # Don't backprop through generation
-                            generated_ids, reasoning_hidden_gen = self.model.generate_reasoning_autoregressive(
+                    # Step 2: Scheduled sampling
+                    if random.random() < gen_prob:
+                        # Use generated reasoning
+                        with torch.no_grad():
+                            _, reasoning_hidden_gen = self.model.generate_reasoning_autoregressive(
                                 fused_features=fused_features,
                                 max_length=96,
-                                num_beams=1,
-                                temperature=1.0,
-                                repetition_penalty=1.2
+                                num_beams=3,  # 🔥 FIX: beam search
+                                temperature=0.7,  # 🔥 FIX: lower temp
+                                repetition_penalty=1.5  # 🔥 FIX: stronger penalty
                             )
                         reasoning_hidden_for_answer = reasoning_hidden_gen
                     else:
-                        # Use GT reasoning (teacher forcing)
-                        # Random detach 15% to prevent overfitting
-                        if random.random() < 0.15:
-                            reasoning_hidden_for_answer = reasoning_hidden_gt.detach()
-                        else:
-                            reasoning_hidden_for_answer = reasoning_hidden_gt
+                        # Use GT reasoning
+                        reasoning_hidden_for_answer = reasoning_hidden_gt
                     
-                    # Step 3: Answer conditioned on reasoning hidden
+                    # Step 3: Answer
                     answer_logits, _ = self.model.generate_answer(
                         fused_features=fused_features,
                         reasoning_hidden=reasoning_hidden_for_answer,
@@ -500,16 +709,9 @@ class ImplicitReasoningTrainer:
                         answer_labels.view(-1)
                     )
                     
-                    # REGULARIZATION: Variance regularization (DISABLED - causes loss spike)
-                    # Encourage reasoning hidden to have diverse representations
-                    # reasoning_var = reasoning_hidden.var(dim=1).mean()
-                    # var_reg_loss = -torch.log(reasoning_var + 1e-8)
-                    var_reg_loss = 0.0  # DISABLED
-                    
-                    # Combined loss with annealed α_reasoning
-                    loss = (alpha_reasoning * reasoning_loss + 
-                           self.alpha_answer * answer_loss +
-                           0.01 * var_reg_loss)  # Will be 0
+                    # Combined loss
+                    loss = (self.alpha_reasoning * reasoning_loss + 
+                           self.alpha_answer * answer_loss)
                     loss = loss / self.gradient_accumulation_steps
                     
             except RuntimeError as e:
@@ -528,7 +730,7 @@ class ImplicitReasoningTrainer:
             else:
                 loss.backward()
             
-            # Update weights
+            # Update
             if (step + 1) % self.gradient_accumulation_steps == 0:
                 if self.use_amp:
                     self.scaler.unscale_(self.optimizer)
@@ -571,28 +773,18 @@ class ImplicitReasoningTrainer:
             'total': total_loss / n,
             'reasoning': reasoning_loss_sum / n,
             'answer': answer_loss_sum / n
-        }, alpha_reasoning, use_generated_prob, phase
+        }
     
     @torch.no_grad()
-    def validate(self, epoch, test_detach=False):
-        """
-        Validate
-        
-        Args:
-            test_detach: If True, detach reasoning hidden to test if it's useful
-        """
+    def validate(self, epoch):
+        """Standard validation"""
         self.model.eval()
         total_loss = 0
         reasoning_loss_sum = 0
         answer_loss_sum = 0
         num_batches = 0
         
-        # Compute current α_reasoning for consistency
-        progress = epoch / max(self.num_epochs - 1, 1)
-        alpha_reasoning = self.alpha_reasoning_start + progress * (self.alpha_reasoning_end - self.alpha_reasoning_start)
-        
-        desc = "Evaluating (DETACHED)" if test_detach else "Evaluating"
-        progress_bar = tqdm(self.val_loader, desc=desc)
+        progress_bar = tqdm(self.val_loader, desc="Evaluating")
         
         for batch_idx, batch in enumerate(progress_bar):
             try:
@@ -614,7 +806,7 @@ class ImplicitReasoningTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Reasoning hidden
+                    # Reasoning
                     reasoning_logits, reasoning_hidden, _ = self.model.generate_reasoning(
                         fused_features=fused_features,
                         reasoning_input_ids=tensor_batch['reasoning_input_ids'],
@@ -625,10 +817,6 @@ class ImplicitReasoningTrainer:
                         reasoning_logits.view(-1, reasoning_logits.size(-1)),
                         reasoning_labels.view(-1)
                     )
-                    
-                    # DETACH TEST: If testing, ZERO OUT reasoning hidden (not just detach!)
-                    if test_detach:
-                        reasoning_hidden = torch.zeros_like(reasoning_hidden)
                     
                     # Answer
                     answer_logits, _ = self.model.generate_answer(
@@ -643,7 +831,7 @@ class ImplicitReasoningTrainer:
                         answer_labels.view(-1)
                     )
                     
-                    loss = (alpha_reasoning * reasoning_loss + 
+                    loss = (self.alpha_reasoning * reasoning_loss + 
                            self.alpha_answer * answer_loss)
                 
                 total_loss += loss.item()
@@ -673,19 +861,113 @@ class ImplicitReasoningTrainer:
             return {'total': float('inf'), 'reasoning': 0, 'answer': 0}
     
     @torch.no_grad()
-    def validate_full_generation(self, num_samples=5):
+    def measure_generation_quality(self, num_samples=50):
         """
-        FULL GENERATION TEST: Generate both reasoning AND answer
+        Measure generation quality for curriculum guidance
         
-        This shows how model actually performs in real inference:
-        1. Generate reasoning autoregressively (no teacher forcing)
-        2. Generate answer autoregressively (no teacher forcing)
-        3. Show actual outputs to see quality
+        Metrics:
+        - Perplexity: Lower = better text modeling
+        - Non-empty rate: % of non-empty generations
+        - Avg length: Average token count
         """
         self.model.eval()
         
+        perplexities = []
+        non_empty_count = 0
+        lengths = []
+        total_samples = 0
+        
+        for batch_idx, batch in enumerate(self.val_loader):
+            if total_samples >= num_samples:
+                break
+            
+            try:
+                tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
+                               if torch.is_tensor(v)}
+                
+                batch_size = tensor_batch['pixel_values'].size(0)
+                
+                with autocast('cuda', enabled=self.use_amp):
+                    # Encode
+                    vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
+                    question_embeds = self.model.encode_text(
+                        input_ids=tensor_batch['input_ids'],
+                        attention_mask=tensor_batch['attention_mask']
+                    )
+                    fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
+                    
+                    # Generate reasoning
+                    reasoning_ids, _ = self.model.generate_reasoning_autoregressive(
+                        fused_features=fused_features,
+                        max_length=96,
+                        num_beams=3,
+                        temperature=0.7,
+                        repetition_penalty=1.5
+                    )
+                    
+                    # Compute perplexity
+                    reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
+                    reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
+                    
+                    # Forward pass
+                    decoder_outputs = self.model.bartpho.model.decoder(
+                        input_ids=reasoning_ids,
+                        encoder_hidden_states=fused_features,
+                        return_dict=True
+                    )
+                    logits = self.model.bartpho.lm_head(decoder_outputs.last_hidden_state)
+                    
+                    # Align lengths
+                    min_len = min(reasoning_ids.size(1), reasoning_labels.size(1))
+                    logits_aligned = logits[:, :min_len, :]
+                    labels_aligned = reasoning_labels[:, :min_len]
+                    
+                    # Compute loss (for perplexity)
+                    loss = self.criterion(
+                        logits_aligned.reshape(-1, logits_aligned.size(-1)),
+                        labels_aligned.reshape(-1)
+                    )
+                    
+                    ppl = torch.exp(loss).item()
+                    perplexities.append(ppl)
+                    
+                    # Check non-empty
+                    for i in range(batch_size):
+                        text = self.model.tokenizer.decode(reasoning_ids[i], skip_special_tokens=True)
+                        if len(text.strip()) > 0:
+                            non_empty_count += 1
+                            lengths.append(len(text.split()))
+                        else:
+                            lengths.append(0)
+                        
+                        total_samples += 1
+                        if total_samples >= num_samples:
+                            break
+                
+            except Exception as e:
+                print(f"[WARNING] Error in quality measurement: {e}")
+                continue
+        
+        if not perplexities:
+            return {
+                'perplexity': 999.0,
+                'non_empty_rate': 0.0,
+                'avg_length': 0.0
+            }
+        
+        return {
+            'perplexity': np.mean(perplexities),
+            'non_empty_rate': non_empty_count / max(total_samples, 1),
+            'avg_length': np.mean(lengths) if lengths else 0.0
+        }
+    
+    @torch.no_grad()
+    def show_generation_samples(self, num_samples=3):
+        """Show actual generation samples"""
+        self.model.eval()
+        
         print("\n" + "="*70)
-        print("FULL GENERATION TEST (True Inference)")
+        print("GENERATION SAMPLES")
         print("="*70)
         
         samples_shown = 0
@@ -700,7 +982,7 @@ class ImplicitReasoningTrainer:
             
             for i in range(min(batch_size, num_samples - samples_shown)):
                 try:
-                    # Encode image + question
+                    # Encode
                     vision_embeds = self.model.encode_image(tensor_batch['pixel_values'][i:i+1])
                     question_embeds = self.model.encode_text(
                         input_ids=tensor_batch['input_ids'][i:i+1],
@@ -708,23 +990,23 @@ class ImplicitReasoningTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # STEP 1: Generate reasoning (autoregressive) using model's method
-                    generated_reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
+                    # Generate reasoning
+                    reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
                         fused_features=fused_features,
                         max_length=96,
-                        num_beams=1,
-                        temperature=1.0,
-                        repetition_penalty=1.2
+                        num_beams=3,
+                        temperature=0.7,
+                        repetition_penalty=1.5
                     )
                     
-                    # STEP 2: Generate answer (autoregressive, conditioned on reasoning)
-                    # Use BARTpho's generate with reasoning_hidden as encoder output
+                    # Generate answer
                     from transformers.modeling_outputs import BaseModelOutput
                     answer_outputs = self.model.bartpho.generate(
                         encoder_outputs=BaseModelOutput(last_hidden_state=reasoning_hidden),
                         max_length=32,
-                        num_beams=1,
-                        do_sample=False,
+                        num_beams=3,
+                        temperature=0.7,
+                        repetition_penalty=1.5,
                         pad_token_id=self.model.tokenizer.pad_token_id,
                         eos_token_id=self.model.tokenizer.eos_token_id,
                     )
@@ -736,7 +1018,7 @@ class ImplicitReasoningTrainer:
                     )
                     
                     generated_reasoning_text = self.model.tokenizer.decode(
-                        generated_reasoning_ids[0],
+                        reasoning_ids[0],
                         skip_special_tokens=True
                     )
                     
@@ -767,182 +1049,70 @@ class ImplicitReasoningTrainer:
                     samples_shown += 1
                     
                 except Exception as e:
-                    print(f"[ERROR] Failed to generate sample {samples_shown + 1}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"[ERROR] Failed to generate sample: {e}")
                     continue
                 
                 if samples_shown >= num_samples:
                     break
         
-        print("\n" + "="*70)
+        print("="*70 + "\n")
         return samples_shown
     
-    @torch.no_grad()
-    def validate_generation(self, epoch):
-        """
-        TRUE VALIDATION: Generate BOTH reasoning AND answer autoregressively
-        
-        This gives REAL performance estimate for inference.
-        NO teacher forcing - pure generation!
-        """
-        self.model.eval()
-        total_loss = 0
-        answer_loss_sum = 0
-        num_batches = 0
-        
-        # Compute current α_reasoning for consistency
-        progress = epoch / max(self.num_epochs - 1, 1)
-        alpha_reasoning = self.alpha_reasoning_start + progress * (self.alpha_reasoning_end - self.alpha_reasoning_start)
-        
-        progress_bar = tqdm(self.val_loader, desc="Evaluating (GENERATION - TRUE VAL)")
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            try:
-                tensor_batch = {k: v.to(self.device) for k, v in batch.items() 
-                               if torch.is_tensor(v)}
-                
-                answer_labels = tensor_batch['answer_input_ids'].clone()
-                answer_labels[answer_labels == self.model.tokenizer.pad_token_id] = -100
-                
-                with autocast('cuda', enabled=self.use_amp):
-                    # Encode
-                    vision_embeds = self.model.encode_image(tensor_batch['pixel_values'])
-                    question_embeds = self.model.encode_text(
-                        input_ids=tensor_batch['input_ids'],
-                        attention_mask=tensor_batch['attention_mask']
-                    )
-                    fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
-                    
-                    # STEP 1: Generate reasoning AUTOREGRESSIVELY (NO teacher forcing!)
-                    reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
-                        fused_features=fused_features,
-                        max_length=96,
-                        num_beams=1,  # Greedy for speed
-                        temperature=1.0,
-                        repetition_penalty=1.2
-                    )
-                    
-                    # STEP 2: Generate answer AUTOREGRESSIVELY (NO teacher forcing!)
-                    # Use BARTpho's generate with reasoning_hidden as encoder
-                    from transformers.modeling_outputs import BaseModelOutput
-                    generated_answer_ids = self.model.bartpho.generate(
-                        encoder_outputs=BaseModelOutput(last_hidden_state=reasoning_hidden),
-                        max_length=32,
-                        num_beams=1,
-                        do_sample=False,
-                        pad_token_id=self.model.tokenizer.pad_token_id,
-                        eos_token_id=self.model.tokenizer.eos_token_id,
-                    )
-                    
-                    # STEP 3: Forward pass with generated answer to compute loss
-                    # Need to get logits from generated tokens to compare with GT
-                    decoder_outputs = self.model.bartpho.model.decoder(
-                        input_ids=generated_answer_ids,
-                        encoder_hidden_states=reasoning_hidden,
-                        return_dict=True,
-                        use_cache=False
-                    )
-                    answer_logits = self.model.bartpho.lm_head(decoder_outputs.last_hidden_state)
-                    
-                    # Compute loss between generated logits and GT labels
-                    # Align lengths: take minimum of generated and GT
-                    min_len = min(generated_answer_ids.size(1), answer_labels.size(1))
-                    answer_logits_aligned = answer_logits[:, :min_len, :]
-                    answer_labels_aligned = answer_labels[:, :min_len]
-                    
-                    answer_loss = self.criterion(
-                        answer_logits_aligned.reshape(-1, answer_logits_aligned.size(-1)),
-                        answer_labels_aligned.reshape(-1)
-                    )
-                    
-                    loss = answer_loss
-                
-                total_loss += loss.item()
-                answer_loss_sum += answer_loss.item()
-                num_batches += 1
-                
-                if (batch_idx + 1) % 10 == 0:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                        
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
-                else:
-                    raise e
-        
-        if num_batches > 0:
-            return {
-                'total': total_loss / num_batches,
-                'answer': answer_loss_sum / num_batches
-            }
-        else:
-            return {'total': float('inf'), 'answer': 0}
-    
     def train(self):
-        """Main training loop"""
+        """Main training loop with validation-guided curriculum"""
         print(f"\n{'='*70}")
-        print(f"IMPLICIT REASONING TRAINING")
+        print(f"IMPROVED IMPLICIT REASONING TRAINING")
         print(f"{'='*70}\n")
         
         for epoch in range(self.current_epoch, self.num_epochs):
+            # Auto-unfreeze vision encoder at Stage 3
+            if self.unfreeze_after_epoch is not None and epoch == self.unfreeze_after_epoch and self.vision_frozen:
+                self._unfreeze_vision_encoder()
+            
+            # Measure generation quality (skip in Stage 1 - alignment only)
+            if epoch < self.alignment_epochs:
+                print(f"\n[EPOCH {epoch+1}] Stage 1: ALIGNMENT (skipping quality measurement)")
+                gen_metrics = {'perplexity': 0, 'non_empty_rate': 0, 'avg_length': 0}
+                quality_score = 0.0
+            else:
+                print(f"\n[EPOCH {epoch+1}] Measuring generation quality...")
+                gen_metrics = self.measure_generation_quality(num_samples=50)
+                self.quality_tracker.update(gen_metrics)
+                quality_score = self.quality_tracker.get_quality_score()
+                
+                print(f"  Perplexity: {gen_metrics['perplexity']:.2f}")
+                print(f"  Non-empty rate: {gen_metrics['non_empty_rate']:.1%}")
+                print(f"  Avg length: {gen_metrics['avg_length']:.1f} tokens")
+                print(f"  Quality score: {quality_score:.3f}")
+            
+            # Compute gen_prob based on quality
+            new_gen_prob, phase = self.compute_gen_prob(epoch, quality_score)
+            
+            # Safety: only increase if quality improving
+            if new_gen_prob > self.current_gen_prob:
+                if not self.quality_tracker.is_improving():
+                    print(f"  ⚠️  Quality not improving - holding gen_prob at {self.current_gen_prob:.1%}")
+                    new_gen_prob = self.current_gen_prob
+                else:
+                    print(f"  ✓ Quality improving - increasing gen_prob: {self.current_gen_prob:.1%} → {new_gen_prob:.1%}")
+            
+            self.current_gen_prob = new_gen_prob
+            
             # Train
-            train_losses, alpha_reasoning, gen_prob, phase = self.train_epoch(epoch)
-            print(f"\n[EPOCH {epoch+1}] [{phase} Phase] Train Loss: {train_losses['total']:.4f} [α_r={alpha_reasoning:.3f}, gen={gen_prob:.1%}]")
+            train_losses = self.train_epoch(epoch, self.current_gen_prob)
+            print(f"\n[EPOCH {epoch+1}] [{phase}] Train Loss: {train_losses['total']:.4f}")
             print(f"  Reasoning: {train_losses['reasoning']:.4f}")
             print(f"  Answer: {train_losses['answer']:.4f}")
             
-            # Validate (normal)
-            val_losses = self.validate(epoch, test_detach=False)
-            print(f"[VALIDATION - Teacher Forcing] Loss: {val_losses['total']:.4f}")
+            # Validate
+            val_losses = self.validate(epoch)
+            print(f"[VALIDATION] Loss: {val_losses['total']:.4f}")
             print(f"  Reasoning: {val_losses['reasoning']:.4f}")
             print(f"  Answer: {val_losses['answer']:.4f}")
             
-            # TRUE VALIDATION: Autoregressive generation every epoch
-            print(f"\n[TRUE VALIDATION - Generation]")
-            val_gen_losses = self.validate_generation(epoch)
-            print(f"  Answer loss (generated reasoning): {val_gen_losses['answer']:.4f}")
-            gap = val_gen_losses['answer'] - val_losses['answer']
-            gap_pct = (gap / val_losses['answer']) * 100 if val_losses['answer'] > 0 else 0
-            print(f"  Gap vs teacher forcing: +{gap:.4f} ({gap_pct:+.2f}%)")
-            if gap > 1.0:
-                print(f"  ⚠️ Large gap - reasoning generation quality needs improvement")
-            else:
-                print(f"  ✅ Small gap - reasoning transfers well to generation")
-            
-            # FULL GENERATION: Show actual outputs every 5 epochs
+            # Show samples every 5 epochs
             if (epoch + 1) % 5 == 0:
-                self.validate_full_generation(num_samples=3)
-            
-            # Detach test every N epochs
-            val_loss_detached = None
-            if (epoch + 1) % self.detach_test_every == 0:
-                print(f"\n[DETACH TEST] Testing if reasoning is useful...")
-                
-                # Test on validation set
-                val_losses_detached = self.validate(epoch, test_detach=True)
-                val_loss_detached = val_losses_detached['answer']
-                
-                # Calculate degradation
-                answer_drop = val_loss_detached - val_losses['answer']
-                answer_drop_pct = (answer_drop / val_losses['answer']) * 100 if val_losses['answer'] > 0 else 0
-                
-                print(f"  Answer loss (normal): {val_losses['answer']:.4f}")
-                print(f"  Answer loss (detached): {val_loss_detached:.4f}")
-                print(f"  Degradation: +{answer_drop:.4f} ({answer_drop_pct:+.2f}%)")
-                
-                # More lenient threshold if loss is very low (overfitting)
-                if val_losses['answer'] < 0.1:
-                    print(f"  ⚠️ Val loss too low ({val_losses['answer']:.4f}) - possible overfitting")
-                    print(f"     Detach test may not be reliable at this loss level")
-                elif answer_drop > 0.01:
-                    print(f"  ✅ Reasoning IS useful! (answer degrades without it)")
-                else:
-                    print(f"  ⚠️ Reasoning NOT useful (answer doesn't need it)")
-                    print(f"     This could indicate reasoning collapse - monitor closely")
+                self.show_generation_samples(num_samples=3)
             
             # Save best
             is_best = False
@@ -959,7 +1129,8 @@ class ImplicitReasoningTrainer:
             self.save_checkpoint(epoch, val_losses['total'], is_best=False)
             
             # Log
-            self.log_to_csv(epoch, train_losses, val_losses, alpha_reasoning, gen_prob, phase, val_gen_losses, val_loss_detached, is_best)
+            self.log_to_csv(epoch, phase, self.current_gen_prob, quality_score, 
+                          train_losses, val_losses, gen_metrics, is_best)
             
             # Early stopping
             if self.patience_counter >= self.patience:
@@ -973,71 +1144,62 @@ class ImplicitReasoningTrainer:
 
 
 # ============================================================================
-# 3. MAIN
+# 4. MAIN
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Implicit Reasoning Training')
+    parser = argparse.ArgumentParser(description='Improved Implicit Reasoning Training')
     
     parser.add_argument('--train_json', type=str, 
                         default='/kaggle/input/teacher/teacher_outputs_train.jsonl')
     parser.add_argument('--image_dir', type=str,
                         default='/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train')
     parser.add_argument('--output_dir', type=str,
-                        default='/kaggle/working/checkpoints_implicit_reasoning')
+                        default='/kaggle/working/checkpoints_implicit_fixed')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=16)
-    parser.add_argument('--num_epochs', type=int, default=30)
+    parser.add_argument('--num_epochs', type=int, default=20,
+                        help='Total epochs (20 for feature extraction, 30 for full finetuning)')
     parser.add_argument('--learning_rate', type=float, default=2e-5)
-    parser.add_argument('--alpha_reasoning_start', type=float, default=0.5, 
-                        help='Initial weight for reasoning loss (will anneal down)')
-    parser.add_argument('--alpha_reasoning_end', type=float, default=0.1,
-                        help='Final weight for reasoning loss')
-    parser.add_argument('--detach_test_every', type=int, default=5,
-                        help='Test reasoning utility every N epochs')
-    parser.add_argument('--reasoning_bottleneck', type=int, default=None,
-                        help='Compress reasoning to k tokens (e.g., 6). None = no compression')
+    parser.add_argument('--alpha_reasoning', type=float, default=0.4)
+    parser.add_argument('--foundation_epochs', type=int, default=5)
+    parser.add_argument('--max_gen_prob', type=float, default=0.40)
+    parser.add_argument('--reasoning_bottleneck', type=int, default=None)
+    parser.add_argument('--freeze_pretrained', action='store_true',
+                        help='Freeze all pretrained weights (encoder + decoders), only train heads')
     parser.add_argument('--freeze_vision', action='store_true',
-                        help='Freeze DINOv2 vision encoder (for Stage 1 training)')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume training from')
+                        help='Stage 1: Freeze DINOv2 only (train decoders)')
+    parser.add_argument('--unfreeze_after_epoch', type=int, default=None,
+                        help='DEPRECATED: Use manual 2-stage instead for better control')
+    parser.add_argument('--resume', type=str, default=None)
     
     args = parser.parse_args()
     
-    CONFIG = {
-        'train_json': args.train_json,
-        'image_dir': args.image_dir,
-        'output_dir': args.output_dir,
-        'val_split': 0.1,
-        'random_seed': 42,
-        'batch_size': args.batch_size,
-        'gradient_accumulation_steps': args.gradient_accumulation_steps,
-        'num_epochs': args.num_epochs,
-        'learning_rate': args.learning_rate,
-        'weight_decay': 0.01,
-        'warmup_ratio': 0.1,
-        'max_grad_norm': 1.0,
-        'alpha_reasoning_start': args.alpha_reasoning_start,
-        'alpha_reasoning_end': args.alpha_reasoning_end,
-        'alpha_answer': 0.6,
-        'label_smoothing': 0.1,
-        'use_amp': True,
-        'patience': 5,
-        'log_steps': 10,
-        'detach_test_every': args.detach_test_every,
-    }
+    # Validate strategy
+    if args.freeze_pretrained and args.freeze_vision:
+        raise ValueError("Cannot use both --freeze_pretrained and --freeze_vision. Choose one strategy.")
+    
+    # Validate strategy
+    if args.freeze_vision and args.unfreeze_after_epoch:
+        print("\n⚠️  WARNING: Auto-unfreeze may conflict with curriculum phases!")
+        print("   Recommended: Use manual 2-stage training instead")
+        print("   Stage 1: --freeze_vision --num_epochs 15")
+        print("   Stage 2: --resume best_model.pt --num_epochs 25 --learning_rate 1e-5\n")
     
     print("="*70)
-    print("IMPLICIT REASONING TRAINING: DINOv2 + BARTpho")
+    print("IMPROVED IMPLICIT REASONING TRAINING")
+    if args.freeze_vision:
+        print("🔒 STAGE 1: WARM-UP (Vision Frozen - covers Foundation+Exposure)")
+        print("   Recommended: Train for 15 epochs")
+    elif args.resume:
+        print("🔓 STAGE 2: FINE-TUNE (All Parameters - Robustness phase)")
+        print("   Recommended: LR=1e-5, train for 20-25 epochs")
     print("="*70)
-    print("\nConfiguration:")
-    for k, v in CONFIG.items():
-        print(f"  {k}: {v}")
     
     # Seed
-    random.seed(CONFIG['random_seed'])
-    np.random.seed(CONFIG['random_seed'])
-    torch.manual_seed(CONFIG['random_seed'])
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
     
     # Model
     print("\n[INFO] Initializing model...")
@@ -1047,42 +1209,46 @@ def main():
         num_cross_attn_layers=3,
         use_reasoning_quality_check=False,
         gradient_checkpointing=True,
-        reasoning_bottleneck_tokens=args.reasoning_bottleneck  # NEW: bottleneck
+        reasoning_bottleneck_tokens=args.reasoning_bottleneck
     )
     
-    # Freeze vision encoder if requested (for Stage 1)
-    if args.freeze_vision:
-        print("\n[INFO] 🔒 FREEZING DINOv2 Vision Encoder (Stage 1 mode)")
+    # Freeze pretrained weights - chỉ train task-specific heads
+    if args.freeze_pretrained:
+        model.freeze_pretrained_weights()
+    elif args.freeze_vision:
+        print("\n[INFO] 🔒 FREEZING DINOv2 Vision Encoder only")
         for param in model.vision_encoder.parameters():
             param.requires_grad = False
-        print(f"[INFO] Vision encoder params frozen")
-    else:
-        print("\n[INFO] 🔓 All parameters trainable (Stage 2 mode)")
     
     total_params, trainable_params = count_parameters(model)
-    print(f"[INFO] Total params: {total_params/1e6:.1f}M")
-    if args.reasoning_bottleneck:
-        print(f"[INFO] Reasoning bottleneck: {args.reasoning_bottleneck} tokens")
+    print(f"\n[INFO] Total params: {total_params/1e6:.1f}M")
     print(f"[INFO] Trainable params: {trainable_params/1e6:.1f}M")
+    
+    if args.freeze_pretrained:
+        print(f"[INFO] Strategy: Feature extraction - train heads only (~91M)")
+    elif args.freeze_vision:
+        vision_params = sum(p.numel() for p in model.vision_encoder.parameters())
+        print(f"[INFO] Frozen vision params: {vision_params/1e6:.1f}M")
+        print(f"[INFO] Strategy: Train fusion + decoders (~595M)")
     
     # Dataset
     print("\n[INFO] Loading dataset...")
     full_dataset = ImplicitReasoningDataset(
-        json_path=CONFIG['train_json'],
-        image_dir=CONFIG['image_dir'],
+        json_path=args.train_json,
+        image_dir=args.image_dir,
         vision_processor=model.vision_processor,
         tokenizer=model.tokenizer,
         augment=True
     )
     
     total_size = len(full_dataset)
-    val_size = int(total_size * CONFIG['val_split'])
+    val_size = int(total_size * 0.1)
     train_size = total_size - val_size
     
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(CONFIG['random_seed'])
+        generator=torch.Generator().manual_seed(42)
     )
     
     print(f"[INFO] Train: {len(train_dataset)} | Val: {len(val_dataset)}")
@@ -1092,34 +1258,48 @@ def main():
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
-        output_dir=CONFIG['output_dir'],
-        batch_size=CONFIG['batch_size'],
-        gradient_accumulation_steps=CONFIG['gradient_accumulation_steps'],
-        num_epochs=CONFIG['num_epochs'],
-        learning_rate=CONFIG['learning_rate'],
-        weight_decay=CONFIG['weight_decay'],
-        warmup_ratio=CONFIG['warmup_ratio'],
-        max_grad_norm=CONFIG['max_grad_norm'],
-        alpha_reasoning_start=CONFIG['alpha_reasoning_start'],
-        alpha_reasoning_end=CONFIG['alpha_reasoning_end'],
-        alpha_answer=CONFIG['alpha_answer'],
-        label_smoothing=CONFIG['label_smoothing'],
-        use_amp=CONFIG['use_amp'],
-        patience=CONFIG['patience'],
-        log_steps=CONFIG['log_steps'],
-        detach_test_every=CONFIG['detach_test_every'],
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        alpha_reasoning=args.alpha_reasoning,
+        foundation_epochs=args.foundation_epochs,
+        max_gen_prob=args.max_gen_prob,
+        unfreeze_after_epoch=args.unfreeze_after_epoch,
     )
     
-    # Resume training if checkpoint provided
+    # Resume if checkpoint provided
     if args.resume:
-        success = trainer.load_checkpoint(args.resume)
-        if not success:
-            print("[WARNING] Failed to load checkpoint. Starting fresh training...")
+        trainer.load_checkpoint(args.resume)
     
     trainer.train()
     
     print("\n[INFO] Training completed!")
-    print(f"[INFO] Best model: {trainer.output_dir / 'best_model.pt'}")
+    
+    # Print 2-stage training guidance
+    if args.freeze_vision and not args.resume:
+        print("\n" + "="*70)
+        print("STAGE 1 COMPLETE - Next Steps for STAGE 2:")
+        print("="*70)
+        print("Stage 2: Unfreeze vision encoder and fine-tune end-to-end")
+        print("")
+        print("✅ ALIGNED STRATEGY (Recommended):")
+        print("   Stage 1 covered Foundation + Exposure phases")
+        print("   Stage 2 will continue Robustness phase from current gen_prob")
+        print("")
+        print("Command:")
+        print(f"  python {os.path.basename(__file__)} \\")
+        print(f"    --resume {args.output_dir}/best_model.pt \\")
+        print(f"    --output_dir {args.output_dir}_stage2 \\")
+        print(f"    --num_epochs 25 \\")
+        print(f"    --learning_rate 1e-5  # 🔥 LOWER LR for fine-tuning!")
+        print("")
+        print("Expected behavior:")
+        print("  - Will resume from epoch {current_epoch}")
+        print("  - Will continue gen_prob from checkpoint (no reset)")
+        print("  - Vision encoder will be unfrozen automatically")
+        print("="*70)
 
 
 if __name__ == '__main__':

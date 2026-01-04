@@ -235,12 +235,31 @@ class DINOv2BARTphoVQA(nn.Module):
         self.vision_processor = AutoImageProcessor.from_pretrained(dinov2_model_name)
         vision_hidden_dim = self.vision_encoder.config.hidden_size  # 768 for base
         
-        # === 2. LANGUAGE MODEL: BARTpho (Encoder + Decoder) ===
+        # === 2. LANGUAGE MODEL: BARTpho (Encoder + 2 Separate Decoders) ===
         # Note: BARTpho trên HuggingFace là mBART architecture
-        self.bartpho = MBartForConditionalGeneration.from_pretrained(bartpho_model_name)
-        self.bartpho.config.use_cache = False  # Disable cache for training
+        print("[INFO] Loading BARTpho and creating separate decoders...")
+        bartpho_full = MBartForConditionalGeneration.from_pretrained(bartpho_model_name)
+        bartpho_full.config.use_cache = False  # Disable cache for training
         self.tokenizer = AutoTokenizer.from_pretrained(bartpho_model_name)
-        bart_hidden_dim = self.bartpho.config.d_model  # 1024 for large
+        bart_hidden_dim = bartpho_full.config.d_model  # 1024 for large
+        
+        # Split into components
+        self.encoder = bartpho_full.model.encoder  # Shared encoder
+        self.reasoning_decoder = bartpho_full.model.decoder  # Reasoning-specific decoder
+        
+        # Clone decoder for answer (separate parameters!)
+        import copy
+        self.answer_decoder = copy.deepcopy(self.reasoning_decoder)
+        print("[INFO] ✓ Created separate decoders: reasoning + answer")
+        
+        # Shared lm_head (vocabulary projection)
+        self.lm_head = bartpho_full.lm_head
+        
+        # Clean up full model to save memory
+        del bartpho_full
+        
+        # Store config for generation
+        self.config = self.encoder.config
         
         # === 3. DIMENSION ALIGNMENT ===
         # DINOv2-base: 768, BARTpho-large: 1024
@@ -294,10 +313,70 @@ class DINOv2BARTphoVQA(nn.Module):
         # === 7. GRADIENT CHECKPOINTING (Save memory) ===
         if gradient_checkpointing:
             self.vision_encoder.gradient_checkpointing_enable()
-            self.bartpho.gradient_checkpointing_enable()
+            self.encoder.gradient_checkpointing_enable()
+            self.reasoning_decoder.gradient_checkpointing_enable()
+            self.answer_decoder.gradient_checkpointing_enable()
             print("[INFO] ✓ Gradient checkpointing enabled")
         
-        print(f"[INFO] ✓ Model initialized: ~482M parameters")
+        print(f"[INFO] ✓ Model initialized: ~681M parameters (with separate decoders)")
+        
+    def freeze_pretrained_weights(self):
+        """
+        Freeze all pretrained components, only train task-specific heads.
+        
+        FROZEN (giữ pretrained knowledge):
+        - Vision encoder (DINOv2)
+        - Text encoder (BARTpho)
+        - Reasoning decoder (BARTpho)
+        - Answer decoder (BARTpho)
+        
+        TRAINABLE (task-specific):
+        - Vision projection
+        - Cross-attention fusion
+        - LM head (optional)
+        """
+        print("\n[INFO] 🔒 FREEZING PRETRAINED WEIGHTS (Feature Extraction Mode)")
+        
+        # Freeze vision encoder
+        for param in self.vision_encoder.parameters():
+            param.requires_grad = False
+        vision_params = sum(p.numel() for p in self.vision_encoder.parameters())
+        print(f"  ❄️  Vision Encoder: {vision_params/1e6:.1f}M params frozen")
+        
+        # Freeze text encoder
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        encoder_params = sum(p.numel() for p in self.encoder.parameters())
+        print(f"  ❄️  BARTpho Encoder: {encoder_params/1e6:.1f}M params frozen")
+        
+        # Freeze reasoning decoder
+        for param in self.reasoning_decoder.parameters():
+            param.requires_grad = False
+        reasoning_params = sum(p.numel() for p in self.reasoning_decoder.parameters())
+        print(f"  ❄️  Reasoning Decoder: {reasoning_params/1e6:.1f}M params frozen")
+        
+        # Freeze answer decoder
+        for param in self.answer_decoder.parameters():
+            param.requires_grad = False
+        answer_params = sum(p.numel() for p in self.answer_decoder.parameters())
+        print(f"  ❄️  Answer Decoder: {answer_params/1e6:.1f}M params frozen")
+        
+        # Keep trainable: projection, fusion, lm_head
+        proj_params = sum(p.numel() for p in self.vision_proj.parameters())
+        fusion_params = sum(p.numel() for p in self.cross_attention_fusion.parameters())
+        lmhead_params = sum(p.numel() for p in self.lm_head.parameters())
+        
+        print(f"\n  ✅ Vision Projection: {proj_params/1e6:.1f}M params trainable")
+        print(f"  ✅ Cross-Attention Fusion: {fusion_params/1e6:.1f}M params trainable")
+        print(f"  ✅ LM Head: {lmhead_params/1e6:.1f}M params trainable")
+        
+        total_frozen = vision_params + encoder_params + reasoning_params + answer_params
+        total_trainable = proj_params + fusion_params + lmhead_params
+        
+        print(f"\n  📊 Summary:")
+        print(f"     Frozen: {total_frozen/1e6:.1f}M ({total_frozen/(total_frozen+total_trainable)*100:.1f}%)")
+        print(f"     Trainable: {total_trainable/1e6:.1f}M ({total_trainable/(total_frozen+total_trainable)*100:.1f}%)")
+        print(f"  ✓ Pretrained knowledge preserved!")
         
     def encode_image(self, pixel_values):
         """
@@ -327,8 +406,8 @@ class DINOv2BARTphoVQA(nn.Module):
         Returns:
             text_features: [batch, seq_len, 1024]
         """
-        # BARTpho encoder
-        encoder_outputs = self.bartpho.model.encoder(
+        # BARTpho encoder (shared)
+        encoder_outputs = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True
@@ -374,7 +453,7 @@ class DINOv2BARTphoVQA(nn.Module):
             reasoning_confidence: [batch] - quality score
         """
         # Decoder forward pass for reasoning
-        decoder_outputs = self.bartpho.model.decoder(
+        decoder_outputs = self.reasoning_decoder(
             input_ids=reasoning_input_ids,
             attention_mask=reasoning_attention_mask,
             encoder_hidden_states=fused_features,
@@ -383,7 +462,7 @@ class DINOv2BARTphoVQA(nn.Module):
         )
         
         reasoning_hidden = decoder_outputs.last_hidden_state  # [batch, target_len, 1024]
-        reasoning_logits = self.bartpho.lm_head(reasoning_hidden)  # [batch, target_len, vocab_size]
+        reasoning_logits = self.lm_head(reasoning_hidden)  # [batch, target_len, vocab_size]
         
         # BOTTLENECK: Compress reasoning hidden if enabled
         if self.reasoning_bottleneck_tokens is not None:
@@ -434,23 +513,55 @@ class DINOv2BARTphoVQA(nn.Module):
         batch_size = fused_features.size(0)
         device = fused_features.device
         
-        # Generate reasoning tokens
-        reasoning_ids = self.bartpho.generate(
-            encoder_outputs=BaseModelOutput(last_hidden_state=fused_features),
-            max_length=max_length,
-            num_beams=num_beams,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            do_sample=(num_beams == 1 and temperature > 0),
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            use_cache=False
+        # Manual generation with reasoning_decoder
+        # Start with BOS token
+        reasoning_ids = torch.full(
+            (batch_size, 1), 
+            self.tokenizer.bos_token_id, 
+            dtype=torch.long, 
+            device=device
         )
         
-        # Get hidden states by running decoder again
-        # (generate() doesn't return hidden states)
-        decoder_outputs = self.bartpho.model.decoder(
+        # Greedy/sampling generation
+        for _ in range(max_length - 1):
+            # Forward through reasoning_decoder
+            decoder_outputs = self.reasoning_decoder(
+                input_ids=reasoning_ids,
+                encoder_hidden_states=fused_features,
+                return_dict=True,
+                use_cache=False
+            )
+            
+            # Get logits for next token
+            hidden = decoder_outputs.last_hidden_state[:, -1, :]  # [batch, 1024]
+            logits = self.lm_head(hidden)  # [batch, vocab_size]
+            
+            # Apply temperature
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                for i in range(batch_size):
+                    for token_id in set(reasoning_ids[i].tolist()):
+                        logits[i, token_id] /= repetition_penalty
+            
+            # Sample next token
+            if num_beams == 1 and temperature > 0:
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+            
+            # Append to sequence
+            reasoning_ids = torch.cat([reasoning_ids, next_token], dim=1)
+            
+            # Stop if all sequences generated EOS
+            if (next_token == self.tokenizer.eos_token_id).all():
+                break
+        
+        # Get final hidden states
+        decoder_outputs = self.reasoning_decoder(
             input_ids=reasoning_ids,
             encoder_hidden_states=fused_features,
             return_dict=True,
@@ -499,8 +610,8 @@ class DINOv2BARTphoVQA(nn.Module):
             # Old behavior: concatenate both (allows shortcut → reasoning ignored!)
             encoder_hidden_states = torch.cat([fused_features, reasoning_hidden], dim=1)
         
-        # Decoder forward pass for answer
-        decoder_outputs = self.bartpho.model.decoder(
+        # Decoder forward pass for answer (SEPARATE ANSWER DECODER)
+        decoder_outputs = self.answer_decoder(
             input_ids=answer_input_ids,
             attention_mask=answer_attention_mask,
             encoder_hidden_states=encoder_hidden_states,
@@ -509,7 +620,7 @@ class DINOv2BARTphoVQA(nn.Module):
         )
         
         answer_hidden = decoder_outputs.last_hidden_state  # [batch, target_len, 1024]
-        answer_logits = self.bartpho.lm_head(answer_hidden)  # [batch, target_len, vocab_size]
+        answer_logits = self.lm_head(answer_hidden)  # [batch, target_len, vocab_size]
         
         return answer_logits, answer_hidden
     
@@ -622,61 +733,62 @@ class DINOv2BARTphoVQA(nn.Module):
         text_features = self.encode_text(input_ids, attention_mask)
         fused_features, _ = self.fuse_multimodal(text_features, visual_features)
         
-        # 2. Generate reasoning using bartpho.generate (lm_head)
-        encoder_outputs_wrapped = BaseModelOutput(last_hidden_state=fused_features)
-        reasoning_outputs = self.bartpho.generate(
-            encoder_outputs=encoder_outputs_wrapped,
+        # 2. Generate reasoning using reasoning_decoder
+        reasoning_ids, reasoning_hidden = self.generate_reasoning_autoregressive(
+            fused_features=fused_features,
             max_length=max_reasoning_len,
             num_beams=num_beams,
-            repetition_penalty=repetition_penalty,
-            length_penalty=length_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,  # 🔥 Pass through
-            early_stopping=early_stopping,              # 🔥 Pass through
-            temperature=temperature,                     # 🔥 Pass through
-            top_k=top_k,                                 # 🔥 Pass through
-            top_p=top_p,                                 # 🔥 Pass through
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            bos_token_id=self.tokenizer.bos_token_id,
-            use_cache=False,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty
         )
         
-        reasoning_text = self.tokenizer.batch_decode(reasoning_outputs, skip_special_tokens=True)
-        
-        # 3. Get reasoning hidden states
-        reasoning_hidden = self.bartpho.model.decoder(
-            input_ids=reasoning_outputs,
-            encoder_hidden_states=fused_features,
-            return_dict=True
-        ).last_hidden_state
+        reasoning_text = self.tokenizer.batch_decode(reasoning_ids, skip_special_tokens=True)
         
         reasoning_confidence = None
         if self.use_quality_check:
             reasoning_confidence = self.reasoning_quality_checker(reasoning_hidden)
         
-        # 4. Generate answer conditioned on reasoning
-        # Concat fused_features + reasoning_hidden as new encoder
-        enhanced_encoder_output = torch.cat([fused_features, reasoning_hidden], dim=1)
-        enhanced_encoder_wrapped = BaseModelOutput(last_hidden_state=enhanced_encoder_output)
-        
-        answer_outputs = self.bartpho.generate(
-            encoder_outputs=enhanced_encoder_wrapped,
-            max_length=max_answer_len,
-            num_beams=num_beams,
-            repetition_penalty=repetition_penalty,
-            length_penalty=length_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,  # 🔥 Pass through
-            early_stopping=early_stopping,              # 🔥 Pass through
-            temperature=temperature,                     # 🔥 Pass through
-            top_k=top_k,                                 # 🔥 Pass through
-            top_p=top_p,                                 # 🔥 Pass through
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            bos_token_id=self.tokenizer.bos_token_id,
-            use_cache=False,
+        # 3. Generate answer using answer_decoder (conditioned on reasoning only)
+        # Use reasoning_hidden as encoder context (forces dependency!)
+        answer_ids = torch.full(
+            (batch_size, 1),
+            self.tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device
         )
         
-        answer_text = self.tokenizer.batch_decode(answer_outputs, skip_special_tokens=True)
+        for _ in range(max_answer_len - 1):
+            decoder_outputs = self.answer_decoder(
+                input_ids=answer_ids,
+                encoder_hidden_states=reasoning_hidden,  # ← ONLY reasoning!
+                return_dict=True,
+                use_cache=False
+            )
+            
+            hidden = decoder_outputs.last_hidden_state[:, -1, :]
+            logits = self.lm_head(hidden)
+            
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            if repetition_penalty != 1.0:
+                for i in range(batch_size):
+                    for token_id in set(answer_ids[i].tolist()):
+                        logits[i, token_id] /= repetition_penalty
+            
+            if num_beams == 1 and temperature > 0:
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+            
+            answer_ids = torch.cat([answer_ids, next_token], dim=1)
+            
+            if (next_token == self.tokenizer.eos_token_id).all():
+                break
+        
+        answer_text = self.tokenizer.batch_decode(answer_ids, skip_special_tokens=True)
         
         return reasoning_text, answer_text, reasoning_confidence
 
