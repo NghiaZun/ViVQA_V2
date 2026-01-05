@@ -1257,8 +1257,8 @@ def main():
     parser.add_argument('--gradient_accumulation_steps', type=int, default=16)
     parser.add_argument('--num_epochs', type=int, default=40,
                         help='🔥 FIXED: 40 epochs cho 3-stage curriculum (8+12+20)')
-    parser.add_argument('--learning_rate', type=float, default=5e-4,
-                        help='🔥 FIXED: Tăng LR vì có warmup + hold phase')
+    parser.add_argument('--learning_rate', type=float, default=5e-5,
+                        help='🔥 ULTRA-SAFE: 5e-5 for very stable decoder training')
     parser.add_argument('--alpha_reasoning', type=float, default=0.4)
     parser.add_argument('--reasoning_bottleneck', type=int, default=None)
     parser.add_argument('--freeze_pretrained', action='store_true',
@@ -1270,10 +1270,10 @@ def main():
     parser.add_argument('--unfreeze_after_epoch', type=int, default=None,
                         help='DEPRECATED: Use manual 2-stage instead for better control')
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--label_smoothing', type=float, default=0.05,
-                        help='Label smoothing (0.05 recommended for decoder training)')
-    parser.add_argument('--weight_decay', type=float, default=0.02,
-                        help='Weight decay (0.02 recommended)')
+    parser.add_argument('--label_smoothing', type=float, default=0.20,
+                        help='Label smoothing (0.20 ULTRA-SAFE - maximum overfitting prevention)')
+    parser.add_argument('--weight_decay', type=float, default=0.10,
+                        help='Weight decay (0.10 ULTRA-SAFE - 10x stronger regularization)')
     parser.add_argument('--quality_threshold', type=float, default=0.60,
                         help='Quality threshold for scheduled sampling (0.60 recommended)')
     
