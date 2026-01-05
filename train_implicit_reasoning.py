@@ -1196,17 +1196,26 @@ def main():
     parser.add_argument('--reasoning_bottleneck', type=int, default=None)
     parser.add_argument('--freeze_pretrained', action='store_true',
                         help='Freeze all pretrained weights (encoder + decoders), only train heads')
+    parser.add_argument('--freeze_encoders_only', action='store_true',
+                        help='🔥 RECOMMENDED: Freeze encoders only, train decoders + fusion (~573M trainable)')
     parser.add_argument('--freeze_vision', action='store_true',
                         help='Stage 1: Freeze DINOv2 only (train decoders)')
     parser.add_argument('--unfreeze_after_epoch', type=int, default=None,
                         help='DEPRECATED: Use manual 2-stage instead for better control')
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--label_smoothing', type=float, default=0.05,
+                        help='Label smoothing (0.05 recommended for decoder training)')
+    parser.add_argument('--weight_decay', type=float, default=0.02,
+                        help='Weight decay (0.02 recommended)')
+    parser.add_argument('--quality_threshold', type=float, default=0.60,
+                        help='Quality threshold for scheduled sampling (0.60 recommended)')
     
     args = parser.parse_args()
     
     # Validate strategy
-    if args.freeze_pretrained and args.freeze_vision:
-        raise ValueError("Cannot use both --freeze_pretrained and --freeze_vision. Choose one strategy.")
+    strategies = [args.freeze_pretrained, args.freeze_encoders_only, args.freeze_vision]
+    if sum(strategies) > 1:
+        raise ValueError("Cannot use multiple freeze strategies. Choose only one.")
     
     # Validate strategy
     if args.freeze_vision and args.unfreeze_after_epoch:
@@ -1217,9 +1226,17 @@ def main():
     
     print("="*70)
     print("IMPROVED IMPLICIT REASONING TRAINING")
-    if args.freeze_vision:
+    if args.freeze_encoders_only:
+        print("🔥 RECOMMENDED: Freeze Encoders Only (Train Decoders)")
+        print("   Frozen: Vision + Text Encoder (~280M)")
+        print("   Trainable: Both Decoders + Fusion (~573M)")
+        print("   Recommended: LR=1e-4, epochs=25-30")
+    elif args.freeze_vision:
         print("🔒 STAGE 1: WARM-UP (Vision Frozen - covers Foundation+Exposure)")
         print("   Recommended: Train for 15 epochs")
+    elif args.freeze_pretrained:
+        print("🔒 FEATURE EXTRACTION: All Pretrained Frozen")
+        print("   Warning: Decoders frozen → poor generation")
     elif args.resume:
         print("🔓 STAGE 2: FINE-TUNE (All Parameters - Robustness phase)")
         print("   Recommended: LR=1e-5, train for 20-25 epochs")
@@ -1241,9 +1258,11 @@ def main():
         reasoning_bottleneck_tokens=args.reasoning_bottleneck
     )
     
-    # Freeze pretrained weights - chỉ train task-specific heads
+    # Apply freezing strategy
     if args.freeze_pretrained:
         model.freeze_pretrained_weights()
+    elif args.freeze_encoders_only:
+        model.freeze_encoders_only()
     elif args.freeze_vision:
         print("\n[INFO] 🔒 FREEZING DINOv2 Vision Encoder only")
         for param in model.vision_encoder.parameters():
@@ -1292,7 +1311,10 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        label_smoothing=args.label_smoothing,
         alpha_reasoning=args.alpha_reasoning,
+        quality_threshold=args.quality_threshold,
         # Use default 3-stage params (optimized for feature extraction):
         # alignment_epochs=3, language_tuning_epochs=10, full_finetuning_epochs=20
         unfreeze_after_epoch=args.unfreeze_after_epoch,

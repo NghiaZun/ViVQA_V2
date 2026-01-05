@@ -376,8 +376,59 @@ class DINOv2BARTphoVQA(nn.Module):
         print(f"\n  📊 Summary:")
         print(f"     Frozen: {total_frozen/1e6:.1f}M ({total_frozen/(total_frozen+total_trainable)*100:.1f}%)")
         print(f"     Trainable: {total_trainable/1e6:.1f}M ({total_trainable/(total_frozen+total_trainable)*100:.1f}%)")
-        print(f"  ✓ Pretrained knowledge preserved!")
+        print(f"  ✓ Pretrained knowledge preserved!")    
+    def freeze_encoders_only(self):
+        """
+        🔥 RECOMMENDED STRATEGY: Freeze encoders, train decoders + fusion
         
+        FROZEN (giữ pretrained vision/language understanding):
+        - Vision encoder (DINOv2) - 86.6M
+        - Text encoder (BARTpho) - 193.2M
+        
+        TRAINABLE (học Vietnamese generation):
+        - Reasoning decoder (BARTpho) - 243.6M ✅
+        - Answer decoder (BARTpho) - 243.6M ✅
+        - Vision projection - 0.8M
+        - Cross-attention fusion - 44.1M
+        - LM head - 41.0M
+        
+        Total trainable: ~573M (84% of model)
+        → Decoders học sinh Vietnamese text chất lượng cao!
+        """
+        print("\n[INFO] 🔥 FREEZING ENCODERS ONLY (Recommended Strategy)")
+        
+        # Freeze vision encoder
+        for param in self.vision_encoder.parameters():
+            param.requires_grad = False
+        vision_params = sum(p.numel() for p in self.vision_encoder.parameters())
+        print(f"  ❄️  Vision Encoder: {vision_params/1e6:.1f}M params frozen")
+        
+        # Freeze text encoder
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        encoder_params = sum(p.numel() for p in self.encoder.parameters())
+        print(f"  ❄️  BARTpho Encoder: {encoder_params/1e6:.1f}M params frozen")
+        
+        # Keep decoders trainable (CRITICAL for generation!)
+        reasoning_params = sum(p.numel() for p in self.reasoning_decoder.parameters() if p.requires_grad)
+        answer_params = sum(p.numel() for p in self.answer_decoder.parameters() if p.requires_grad)
+        proj_params = sum(p.numel() for p in self.vision_proj.parameters())
+        fusion_params = sum(p.numel() for p in self.cross_attention_fusion.parameters())
+        lmhead_params = sum(p.numel() for p in self.lm_head.parameters())
+        
+        print(f"\n  ✅ Reasoning Decoder: {reasoning_params/1e6:.1f}M params trainable")
+        print(f"  ✅ Answer Decoder: {answer_params/1e6:.1f}M params trainable")
+        print(f"  ✅ Vision Projection: {proj_params/1e6:.1f}M params trainable")
+        print(f"  ✅ Cross-Attention Fusion: {fusion_params/1e6:.1f}M params trainable")
+        print(f"  ✅ LM Head: {lmhead_params/1e6:.1f}M params trainable")
+        
+        total_frozen = vision_params + encoder_params
+        total_trainable = reasoning_params + answer_params + proj_params + fusion_params + lmhead_params
+        
+        print(f"\n  📊 Summary:")
+        print(f"     Frozen: {total_frozen/1e6:.1f}M ({total_frozen/(total_frozen+total_trainable)*100:.1f}%)")
+        print(f"     Trainable: {total_trainable/1e6:.1f}M ({total_trainable/(total_frozen+total_trainable)*100:.1f}%)")
+        print(f"  🎯 Decoders will learn Vietnamese generation!")        
     def encode_image(self, pixel_values):
         """
         Encode image với DINOv2
