@@ -99,17 +99,18 @@ Goal: Polish generation quality with task-specific heads
 
 USAGE:
 ======
-# MODE 1: Feature Extraction (Recommended - 20 epochs)
+# 🔥 FIXED VERSION - Chống Overfitting
 python train_implicit_reasoning.py \
   --freeze_pretrained \
-  --num_epochs 20 \
-  --learning_rate 5e-4
+  --num_epochs 40 \
+  --learning_rate 5e-4 \
+  --batch_size 4 \
+  --gradient_accumulation_steps 16
 
-# MODE 2: Full Finetuning (Aggressive - 30 epochs)  
-python train_implicit_reasoning.py \
-  --freeze_vision \
-  --num_epochs 30 \
-  --learning_rate 2e-5
+# Expected behavior:
+# - Stage 1 (0-7):   gen_prob=0%,    val_answer_loss giảm stable
+# - Stage 2 (8-19):  gen_prob=0→12%, val_answer_loss giảm hoặc ổn định  
+# - Stage 3 (20-39): gen_prob=12→40%, val_answer_loss < train * 1.3
 """
 
 import os
@@ -120,7 +121,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
-from transformers import get_cosine_schedule_with_warmup
+from torch.optim.lr_scheduler import LambdaLR
 from PIL import Image
 from tqdm.auto import tqdm
 import numpy as np
@@ -329,23 +330,23 @@ class ImplicitReasoningTrainer:
         gradient_accumulation_steps=16,
         num_epochs=30,
         learning_rate=2e-5,
-        weight_decay=0.01,
+        weight_decay=0.08,       # 🔥 FIX 1: Tăng từ 0.01 → 0.08 (8x) chống overfitting
         warmup_ratio=0.1,
-        max_grad_norm=1.0,
-        alpha_reasoning=0.4,  # Fixed weight, không anneal
+        max_grad_norm=0.5,       # 🔥 FIX 1: Giảm từ 1.0 → 0.5 (gradient clipping mạnh hơn)
+        alpha_reasoning=0.4,     # Fixed weight, không anneal
         alpha_answer=0.6,
-        label_smoothing=0.1,
+        label_smoothing=0.15,    # 🔥 FIX 1: Tăng từ 0.1 → 0.15 (1.5x)
         use_amp=True,
-        patience=7,  # Increased patience
+        patience=5,              # 🔥 FIX 3: Giảm từ 7 → 5 (early stop sớm hơn)
         log_steps=10,
         save_steps=100,
-        # NEW: 3-Stage curriculum params (optimized for feature extraction)
-        alignment_epochs=3,      # Stage 1: Pure alignment (reduced for frozen pretrained)
-        language_tuning_epochs=10,  # End of Stage 2: Language tuning (reduced)
-        full_finetuning_epochs=20,  # End of Stage 3: Full finetuning (reduced)
-        stage2_ceiling=0.20,     # Max gen_prob in Stage 2
+        # NEW: 3-Stage curriculum params (FIXED - chậm hơn nhiều)
+        alignment_epochs=8,      # 🔥 FIX 2: Tăng từ 3 → 8 (stabilization dài hơn)
+        language_tuning_epochs=20,  # 🔥 FIX 2: Tăng từ 10 → 20 (gradual exposure)
+        full_finetuning_epochs=40,  # 🔥 FIX 2: Tăng từ 20 → 40 (full finetuning)
+        stage2_ceiling=0.12,     # 🔥 FIX 2: Giảm từ 0.20 → 0.12 (ceiling thấp hơn)
         stage3_ceiling=0.40,     # Max gen_prob in Stage 3
-        quality_threshold=0.6,   # Minimum quality to increase gen_prob
+        quality_threshold=0.85,  # 🔥 FIX 4: Tăng từ 0.6 → 0.85 (strict hơn)
         # NEW: 2-stage training
         unfreeze_after_epoch=None,  # Auto-unfreeze vision after N epochs
     ):
@@ -422,13 +423,27 @@ class ImplicitReasoningTrainer:
             eps=1e-8
         )
         
+        # 🔥 FIX 5: Warmup + Linear Decay thay vì Cosine (giữ LR stable lâu hơn)
         total_steps = len(self.train_loader) * num_epochs // gradient_accumulation_steps
-        num_warmup_steps = int(total_steps * warmup_ratio)
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=total_steps
-        )
+        num_warmup_steps = int(total_steps * warmup_ratio)  # 10% warmup
+        
+        def lr_lambda(current_step):
+            # Warmup phase (0 → 1.0 trong 10% đầu)
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            
+            # Hold phase (giữ 1.0 trong 50% tiếp theo)
+            hold_steps = int(total_steps * 0.5)
+            if current_step < num_warmup_steps + hold_steps:
+                return 1.0
+            
+            # Linear decay phase (1.0 → 0.1 trong 40% cuối)
+            progress = (current_step - num_warmup_steps - hold_steps) / float(max(1, total_steps - num_warmup_steps - hold_steps))
+            return max(0.1, 1.0 - 0.9 * progress)  # Decay to 0.1x, not 0
+        
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+        
+        print(f"[INFO] 🔥 Custom LR Schedule: Warmup({num_warmup_steps}) + Hold({int(total_steps*0.5)}) + LinearDecay")
         
         # Mixed precision
         self.scaler = GradScaler() if use_amp else None
@@ -437,6 +452,8 @@ class ImplicitReasoningTrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.best_val_answer_loss = float('inf')  # 🔥 FIX 3: Track answer loss riêng
+        self.val_answer_loss_history = []         # 🔥 FIX 3: History để detect divergence
         self.patience_counter = 0
         self.current_gen_prob = 0.0
         
@@ -444,12 +461,17 @@ class ImplicitReasoningTrainer:
         self.csv_log_path = self.output_dir / 'training_log.csv'
         self.init_csv_logger()
         
-        print(f"\n[INFO] Improved Implicit Reasoning Trainer initialized")
-        print(f"  3-Stage Curriculum:")
-        print(f"    Stage 1 (0-{alignment_epochs-1}): ALIGNMENT [gen_prob=0%, hard lock]")
-        print(f"    Stage 2 ({alignment_epochs}-{language_tuning_epochs-1}): LANGUAGE TUNING [gen_prob=0→{stage2_ceiling*100:.0f}%, ceiling]")
-        print(f"    Stage 3 ({language_tuning_epochs}-{full_finetuning_epochs-1}): FULL FINETUNING [gen_prob={stage2_ceiling*100:.0f}→{stage3_ceiling*100:.0f}%, ceiling]")
-        print(f"  Quality threshold: {quality_threshold}")
+        print(f"\n[INFO] 🔥 IMPROVED Implicit Reasoning Trainer (OVERFITTING-PROOF)")
+        print(f"  💪 Regularization:")
+        print(f"    - Weight decay: {weight_decay:.3f} (8x stronger)")
+        print(f"    - Label smoothing: {label_smoothing:.2f} (1.5x stronger)")
+        print(f"    - Gradient clipping: {max_grad_norm:.1f} (2x stricter)")
+        print(f"    - Patience: {patience} epochs (early stop faster)")
+        print(f"  📚 3-Stage Curriculum (SLOWER & SAFER):")
+        print(f"    Stage 1 (0-{alignment_epochs-1}): STABILIZATION [gen_prob=0%, pure teacher forcing]")
+        print(f"    Stage 2 ({alignment_epochs}-{language_tuning_epochs-1}): GRADUAL EXPOSURE [gen_prob=0→{stage2_ceiling*100:.0f}%, +1%/epoch]")
+        print(f"    Stage 3 ({language_tuning_epochs}-{full_finetuning_epochs-1}): FULL FINETUNING [gen_prob={stage2_ceiling*100:.0f}→{stage3_ceiling*100:.0f}%, +1.4%/epoch]")
+        print(f"  🎯 Quality threshold: {quality_threshold:.2f} (strict gating)")
         if self.vision_frozen:
             print(f"  🔒 Vision encoder: FROZEN (Stage 1+2)")
             if unfreeze_after_epoch:
@@ -463,6 +485,30 @@ class ImplicitReasoningTrainer:
             if param.requires_grad:
                 return False
         return True
+    
+    def _check_answer_decoder_divergence(self, current_val_answer_loss, train_answer_loss):
+        """
+        🔥 FIX 3: Kiểm tra answer decoder có đang diverge không
+        
+        Returns:
+            (is_diverging, should_decrease_gen_prob, message)
+        """
+        # Rule 1: Val answer loss > Train answer loss * 1.3 → Overfitting nghiêm trọng
+        if current_val_answer_loss > train_answer_loss * 1.3:
+            return True, True, f"⚠️ OVERFITTING: val_answer ({current_val_answer_loss:.4f}) >> train_answer ({train_answer_loss:.4f})"
+        
+        # Rule 2: Val answer loss tăng > 20% so với best
+        if len(self.val_answer_loss_history) >= 3:
+            recent_best = min(self.val_answer_loss_history[-3:])
+            if current_val_answer_loss > recent_best * 1.2:
+                return True, True, f"⚠️ DIVERGING: val_answer tăng {((current_val_answer_loss/recent_best - 1)*100):.1f}% so với best"
+        
+        # Rule 3: Val answer loss tăng liên tục 3 epochs
+        if len(self.val_answer_loss_history) >= 3:
+            if (self.val_answer_loss_history[-1] > self.val_answer_loss_history[-2] > self.val_answer_loss_history[-3]):
+                return True, False, f"⚠️ UNSTABLE: val_answer tăng 3 epochs liên tiếp"
+        
+        return False, False, "✓ Answer decoder stable"
     
     def _unfreeze_vision_encoder(self):
         """Unfreeze vision encoder for Stage 3"""
@@ -527,58 +573,59 @@ class ImplicitReasoningTrainer:
     
     def compute_gen_prob(self, epoch, quality_score):
         """
-        3-Stage Quality-Gated Scheduled Sampling
+        🔥 FIXED: 3-Stage Quality-Gated Scheduled Sampling (SLOWER & SAFER)
         
-        Stage 1 (0-4): ALIGNMENT
+        Stage 1 (0-7): STABILIZATION
           - gen_prob = 0% (HARD LOCK)
-          - No quality check
-          - Pure teacher forcing
+          - Mục tiêu: Học stable reasoning với pure teacher forcing
+          - 8 epochs để model nắm vững pattern
         
-        Stage 2 (5-14): LANGUAGE TUNING
-          - gen_prob: 0% → 20% (CEILING)
-          - Quality-gated: increase only if quality > 0.6
-          - +2% per epoch when quality good
+        Stage 2 (8-19): GRADUAL EXPOSURE
+          - gen_prob: 0% → 12% (CEILING thấp hơn)
+          - Quality-gated: increase only if quality > 0.85 (strict hơn)
+          - +1% per epoch (chậm hơn 2x so với cũ)
         
-        Stage 3 (15-29): FULL FINETUNING
-          - gen_prob: 20% → 40% (FLOOR 20%, CEILING 40%)
+        Stage 3 (20-39): FULL FINETUNING
+          - gen_prob: 12% → 40% (FLOOR 12%, CEILING 40%)
           - Quality-gated: increase/decrease based on quality
-          - Can decrease to 20% floor if quality drops
+          - +1.4% per epoch
+          - Can decrease to floor if quality drops
         """
-        # Stage 1: ALIGNMENT (hard lock at 0%)
+        # Stage 1: STABILIZATION (hard lock at 0% for 8 epochs)
         if epoch < self.alignment_epochs:
-            return 0.0, "Stage 1: ALIGNMENT"
+            return 0.0, "Stage 1: STABILIZATION"
         
-        # Stage 2: LANGUAGE TUNING
+        # Stage 2: GRADUAL EXPOSURE
         elif epoch < self.language_tuning_epochs:
-            # Quality gate
+            # Quality gate (strict!)
             if quality_score < self.quality_threshold:
                 # Quality not good → hold
-                return self.current_gen_prob, "Stage 2: LANGUAGE TUNING (Holding)"
+                return self.current_gen_prob, "Stage 2: GRADUAL EXPOSURE (Holding)"
             
-            # Quality good → increase gradually
+            # Quality good → increase slowly
             epochs_in_stage = epoch - self.alignment_epochs  # 0-indexed
-            target_prob = min(self.stage2_ceiling, (epochs_in_stage + 1) * 0.02)  # 2% per epoch
+            target_prob = min(self.stage2_ceiling, (epochs_in_stage + 1) * 0.01)  # 🔥 1% per epoch (was 2%)
             
             # Smooth increase
-            new_prob = min(self.current_gen_prob + 0.02, target_prob, self.stage2_ceiling)
-            return new_prob, "Stage 2: LANGUAGE TUNING (Growing)"
+            new_prob = min(self.current_gen_prob + 0.01, target_prob, self.stage2_ceiling)
+            return new_prob, "Stage 2: GRADUAL EXPOSURE (Growing)"
         
         # Stage 3: FULL FINETUNING
         else:
-            # Start from Stage 2 floor (20%)
+            # Start from Stage 2 floor (12%)
             floor = self.stage2_ceiling
             
             if quality_score < self.quality_threshold:
                 # Quality drop → DECREASE (but respect floor)
-                new_prob = max(floor, self.current_gen_prob - 0.02)
+                new_prob = max(floor, self.current_gen_prob - 0.014)  # 🔥 Decrease proportional to increase
                 return new_prob, "Stage 3: FULL FINETUNING (Decreasing)"
             
             # Quality good → increase to ceiling
             epochs_in_stage = epoch - self.language_tuning_epochs  # 0-indexed
-            target_prob = min(self.stage3_ceiling, floor + (epochs_in_stage + 1) * 0.02)
+            target_prob = min(self.stage3_ceiling, floor + (epochs_in_stage + 1) * 0.014)  # 🔥 1.4% per epoch
             
             # Smooth increase
-            new_prob = min(self.current_gen_prob + 0.02, target_prob, self.stage3_ceiling)
+            new_prob = min(self.current_gen_prob + 0.014, target_prob, self.stage3_ceiling)
             
             if new_prob >= self.stage3_ceiling:
                 return self.stage3_ceiling, "Stage 3: FULL FINETUNING (Ceiling)"
@@ -594,6 +641,8 @@ class ImplicitReasoningTrainer:
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'scheduler_state_dict': self.scheduler.state_dict(),
                 'best_val_loss': self.best_val_loss,
+                'best_val_answer_loss': self.best_val_answer_loss,  # 🔥 FIX 3
+                'val_answer_loss_history': self.val_answer_loss_history,  # 🔥 FIX 3
                 'patience_counter': self.patience_counter,
                 'current_gen_prob': self.current_gen_prob,
                 'quality_tracker': self.quality_tracker.history,
@@ -629,6 +678,8 @@ class ImplicitReasoningTrainer:
             self.current_epoch = checkpoint['epoch']  # Epoch already +1 when saved
             self.global_step = checkpoint['global_step']
             self.best_val_loss = checkpoint['best_val_loss']
+            self.best_val_answer_loss = checkpoint.get('best_val_answer_loss', float('inf'))  # 🔥 FIX 3
+            self.val_answer_loss_history = checkpoint.get('val_answer_loss_history', [])  # 🔥 FIX 3
             self.patience_counter = checkpoint['patience_counter']
             self.current_gen_prob = checkpoint.get('current_gen_prob', 0.0)
             
@@ -1141,17 +1192,32 @@ class ImplicitReasoningTrainer:
             print(f"  Reasoning: {val_losses['reasoning']:.4f}")
             print(f"  Answer: {val_losses['answer']:.4f}")
             
+            # 🔥 FIX 3: Check answer decoder divergence
+            self.val_answer_loss_history.append(val_losses['answer'])
+            is_diverging, should_decrease_gen, divergence_msg = self._check_answer_decoder_divergence(
+                val_losses['answer'], 
+                train_losses['answer']
+            )
+            print(f"[HEALTH CHECK] {divergence_msg}")
+            
+            if should_decrease_gen and self.current_gen_prob > 0:
+                old_gen_prob = self.current_gen_prob
+                self.current_gen_prob = max(0.0, self.current_gen_prob - 0.05)
+                print(f"[ACTION] 🛑 Decreasing gen_prob: {old_gen_prob:.1%} → {self.current_gen_prob:.1%}")
+            
             # Show samples every 5 epochs
             if (epoch + 1) % 5 == 0:
                 self.show_generation_samples(num_samples=3)
             
-            # Save best
+            # 🔥 FIX 3: Save best dựa trên val_answer_loss (key metric!)
             is_best = False
-            if val_losses['total'] < self.best_val_loss:
-                self.best_val_loss = val_losses['total']
+            if val_losses['answer'] < self.best_val_answer_loss:
+                self.best_val_answer_loss = val_losses['answer']
+                self.best_val_loss = val_losses['total']  # Also update total
                 self.patience_counter = 0
                 is_best = True
                 self.save_checkpoint(epoch, val_losses['total'], is_best=True)
+                print(f"[INFO] 🎯 New best answer loss: {self.best_val_answer_loss:.4f}")
             else:
                 self.patience_counter += 1
                 print(f"[INFO] No improvement. Patience: {self.patience_counter}/{self.patience}")
@@ -1189,9 +1255,10 @@ def main():
                         default='/kaggle/working/checkpoints_implicit_fixed')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=16)
-    parser.add_argument('--num_epochs', type=int, default=20,
-                        help='Total epochs (20 for feature extraction, 30 for full finetuning)')
-    parser.add_argument('--learning_rate', type=float, default=2e-5)
+    parser.add_argument('--num_epochs', type=int, default=40,
+                        help='🔥 FIXED: 40 epochs cho 3-stage curriculum (8+12+20)')
+    parser.add_argument('--learning_rate', type=float, default=5e-4,
+                        help='🔥 FIXED: Tăng LR vì có warmup + hold phase')
     parser.add_argument('--alpha_reasoning', type=float, default=0.4)
     parser.add_argument('--reasoning_bottleneck', type=int, default=None)
     parser.add_argument('--freeze_pretrained', action='store_true',
