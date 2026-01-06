@@ -47,55 +47,67 @@ Risks:
   - May lose pretrained knowledge
 
 
+🔥 CRITICAL FIX: GRADIENT FLOW
+================================
+Old approach: Generated reasoning was DETACHED (torch.no_grad)
+  → Reasoning decoder only learned from GT (reasoning_loss)
+  → No feedback from answer quality!
+  → Result: Generated reasoning was useless for answering
+
+New approach: Generated reasoning has GRADIENTS
+  → Reasoning decoder learns from reasoning_loss (mimic GT)
+  → AND from answer_loss (generate USEFUL reasoning)!
+  → Result: Reasoning decoder optimizes for answer quality
+
+
 3-STAGE CURRICULUM:
 ===================
 
-STAGE 1 (Epochs 0-4): ALIGNMENT
+STAGE 1 (Epochs 0-7): STABILIZATION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STAGE 1 (Epochs 0-2): ALIGNMENT
-Duration:  3 epochs (reduced for frozen pretrained)
+Duration:  8 epochs
 Gen_prob:  0% (HARD LOCKED - no generation)
 Quality:   Not measured (teacher forcing only)
 Strategy:  Pure alignment learning
 
 Goal: Learn cross-modal fusion without generation pressure
       Both decoders receive ground truth targets
-      Quick alignment since pretrained weights already good
+      Stabilize before introducing generation
 
-STAGE 2 (Epochs 3-9): LANGUAGE TUNING
-Duration:  7 epochs (reduced - pretrained decoder already knows)
-Gen_prob:  0% to 20% (CEILING at 20%)
-Quality:   Active gating
+STAGE 2 (Epochs 8-19): GRADUAL EXPOSURE
+Duration:  12 epochs (conservative growth)
+Gen_prob:  0% to 5% (🔥 ULTRA-SAFE CEILING)
+Quality:   Strict Vietnamese coherence gating (>30% Vietnamese tokens)
 
 Gating Logic:
-  IF quality_score > 0.6 AND improving:
-    INCREASE gen_prob (+3% per epoch for faster ramp)
+  IF quality_score > 0.70 AND improving AND vietnamese_coherence > 0.30:
+    INCREASE gen_prob (+0.5% per epoch - very slow)
   ELSE:
     HOLD gen_prob (wait for quality)
   
-  Hard ceiling: max(gen_prob) = 20%
+  Hard ceiling: max(gen_prob) = 5%
 
-Goal: Adapt pretrained generation to task style
-      Build robustness to self-generation
+Goal: Build Vietnamese generation capability gradually
+      Ensure model generates Vietnamese, not gibberish
 
-STAGE 3 (Epochs 10-19): REFINEMENT
-Duration:  10 epochs (reduced - only tuning heads)
-Gen_prob:  20% to 40% (FLOOR at 20%, CEILING at 40%)
-Quality:   Active gating with DECREASE on drop
+STAGE 3 (Epochs 20-39): REFINEMENT
+Duration:  20 epochs (slow refinement)
+Gen_prob:  5% to 15% (🔥 ULTRA-SAFE: FLOOR 5%, CEILING 15%)
+Quality:   Strict gating with Vietnamese check & DECREASE on drop
 
 Gating Logic:
-  IF quality_score > 0.6 AND improving:
-    INCREASE gen_prob (+2% per epoch)
-  ELIF quality_score < 0.6 OR degrading:
-    DECREASE gen_prob (-2%, min=20%)
+  IF quality_score > 0.70 AND improving AND vietnamese_coherence > 0.50:
+    INCREASE gen_prob (+0.5% per epoch)
+  ELIF vietnamese_coherence < 0.30 OR repetition_rate > 0.50:
+    DECREASE gen_prob (-1%, min=5%)
   ELSE:
     HOLD gen_prob
   
-  Hard floor: min(gen_prob) = 20% (from Stage 2)
-  Hard ceiling: max(gen_prob) = 40%
+  Hard floor: min(gen_prob) = 5% (from Stage 2)
+  Hard ceiling: max(gen_prob) = 15%
 
-Goal: Polish generation quality with task-specific heads
-      Max robustness without collapse
+Goal: Polish Vietnamese generation quality
+      Prevent model collapse into gibberish
 
 USAGE:
 ======
@@ -109,8 +121,8 @@ python train_implicit_reasoning.py \
 
 # Expected behavior:
 # - Stage 1 (0-7):   gen_prob=0%,    val_answer_loss giảm stable
-# - Stage 2 (8-19):  gen_prob=0→12%, val_answer_loss giảm hoặc ổn định  
-# - Stage 3 (20-39): gen_prob=12→40%, val_answer_loss < train * 1.3
+# - Stage 2 (8-19):  gen_prob=0→5%, Vietnamese coherence > 30%, quality > 0.70
+# - Stage 3 (20-39): gen_prob=5→15%, Vietnamese coherence > 50%, low repetition
 """
 
 import os
@@ -260,6 +272,8 @@ class GenerationQualityTracker:
             'perplexity': [],
             'non_empty_rate': [],
             'avg_length': [],
+            'vietnamese_coherence': [],  # 🔥 NEW
+            'repetition_rate': [],       # 🔥 NEW
         }
     
     def update(self, metrics):
@@ -273,29 +287,41 @@ class GenerationQualityTracker:
     
     def get_quality_score(self):
         """
-        Return quality score [0, 1]
+        🔥 FIXED: Return quality score [0, 1] with Vietnamese coherence check
         - 1.0 = excellent (ready for more generated)
         - 0.0 = poor (stay with GT)
         """
         if not self.history['perplexity']:
             return 0.0
         
-        # Average recent perplexity
+        # Average recent metrics
         avg_ppl = np.mean(self.history['perplexity'])
         non_empty = np.mean(self.history['non_empty_rate'])
         avg_len = np.mean(self.history['avg_length'])
+        
+        # 🔥 NEW: Vietnamese coherence and repetition
+        viet_coherence = np.mean(self.history.get('vietnamese_coherence', [0.0])) if 'vietnamese_coherence' in self.history else 0.0
+        repetition = np.mean(self.history.get('repetition_rate', [1.0])) if 'repetition_rate' in self.history else 1.0
         
         # Quality criteria:
         # - Perplexity < 20 (good), < 10 (excellent)
         # - Non-empty > 0.95 (most generations are valid)
         # - Avg length > 10 tokens (not degenerate)
+        # - Vietnamese coherence > 0.3 (at least 30% Vietnamese tokens)
+        # - Repetition < 0.5 (less than 50% repeated trigrams)
         
         ppl_score = max(0, 1 - (avg_ppl / 30))  # 30+ ppl = 0, 0 ppl = 1
         empty_score = non_empty
         length_score = min(1.0, avg_len / 20)  # 20+ tokens = 1
+        viet_score = min(1.0, viet_coherence / 0.3)  # 30%+ Vietnamese = good
+        repetition_score = max(0, 1 - (repetition / 0.5))  # <50% repetition = good
         
-        # Weighted average
-        quality = 0.5 * ppl_score + 0.3 * empty_score + 0.2 * length_score
+        # 🔥 STRICTER: Weighted average with language coherence
+        quality = (0.3 * ppl_score + 
+                  0.2 * empty_score + 
+                  0.15 * length_score + 
+                  0.25 * viet_score +      # High weight on Vietnamese!
+                  0.1 * repetition_score)
         
         return quality
     
@@ -344,9 +370,9 @@ class ImplicitReasoningTrainer:
         alignment_epochs=8,      # 🔥 FIX 2: Tăng từ 3 → 8 (stabilization dài hơn)
         language_tuning_epochs=20,  # 🔥 FIX 2: Tăng từ 10 → 20 (gradual exposure)
         full_finetuning_epochs=40,  # 🔥 FIX 2: Tăng từ 20 → 40 (full finetuning)
-        stage2_ceiling=0.12,     # 🔥 FIX 2: Giảm từ 0.20 → 0.12 (ceiling thấp hơn)
-        stage3_ceiling=0.40,     # Max gen_prob in Stage 3
-        quality_threshold=0.85,  # 🔥 FIX 4: Tăng từ 0.6 → 0.85 (strict hơn)
+        stage2_ceiling=0.05,     # 🔥 ULTRA-SAFE: 5% max (was 12%)
+        stage3_ceiling=0.15,     # 🔥 ULTRA-SAFE: 15% max (was 40%)
+        quality_threshold=0.70,  # 🔥 REALISTIC: 0.70 (with new Vietnamese check)
         # NEW: 2-stage training
         unfreeze_after_epoch=None,  # Auto-unfreeze vision after N epochs
     ):
@@ -544,6 +570,7 @@ class ImplicitReasoningTrainer:
                 'train_loss', 'train_reasoning_loss', 'train_answer_loss',
                 'val_loss', 'val_reasoning_loss', 'val_answer_loss',
                 'gen_perplexity', 'gen_non_empty_rate', 'gen_avg_length',
+                'gen_vietnamese_coherence', 'gen_repetition_rate',  # 🔥 NEW
                 'learning_rate', 'patience_counter', 'is_best'
             ])
     
@@ -566,6 +593,8 @@ class ImplicitReasoningTrainer:
                 f"{gen_metrics.get('perplexity', 0):.2f}",
                 f"{gen_metrics.get('non_empty_rate', 0):.3f}",
                 f"{gen_metrics.get('avg_length', 0):.1f}",
+                f"{gen_metrics.get('vietnamese_coherence', 0):.3f}",  # 🔥 NEW
+                f"{gen_metrics.get('repetition_rate', 1):.3f}",        # 🔥 NEW
                 f"{current_lr:.2e}",
                 self.patience_counter,
                 1 if is_best else 0
@@ -733,35 +762,47 @@ class ImplicitReasoningTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Step 1: Reasoning loss (ALWAYS from GT)
-                    reasoning_logits, reasoning_hidden_gt, _ = self.model.generate_reasoning(
+                    # 🔥 FIX: Two-pass training for reasoning decoder feedback
+                    
+                    # Pass 1: GT reasoning path (for reasoning loss + GT answer baseline)
+                    reasoning_logits_gt, reasoning_hidden_gt, _ = self.model.generate_reasoning(
                         fused_features=fused_features,
                         reasoning_input_ids=tensor_batch['reasoning_input_ids'],
                         reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
                     )
                     
                     reasoning_loss = self.criterion(
-                        reasoning_logits.view(-1, reasoning_logits.size(-1)),
+                        reasoning_logits_gt.view(-1, reasoning_logits_gt.size(-1)),
                         reasoning_labels.view(-1)
                     )
                     
-                    # Step 2: Scheduled sampling
-                    if random.random() < gen_prob:
-                        # Use generated reasoning
-                        with torch.no_grad():
-                            _, reasoning_hidden_gen = self.model.generate_reasoning_autoregressive(
-                                fused_features=fused_features,
-                                max_length=96,
-                                num_beams=1,  # Greedy decoding
-                                temperature=0.7,  # Lower temp for quality
-                                repetition_penalty=1.5  # Stronger penalty
-                            )
+                    # Pass 2: Scheduled sampling with GRADIENT flow
+                    use_generated = random.random() < gen_prob
+                    
+                    if use_generated and gen_prob > 0:
+                        # 🔥 Generate reasoning WITH GRADIENT (not detached!)
+                        # Use teacher forcing on generated tokens (differentiable)
+                        reasoning_ids_gen, _ = self.model.generate_reasoning_autoregressive(
+                            fused_features=fused_features,
+                            max_length=96,
+                            num_beams=1,
+                            temperature=0.7,
+                            repetition_penalty=1.5
+                        )
+                        
+                        # Forward pass with generated IDs (gradients flow!)
+                        gen_attention_mask = (reasoning_ids_gen != self.model.tokenizer.pad_token_id).long()
+                        _, reasoning_hidden_gen, _ = self.model.generate_reasoning(
+                            fused_features=fused_features,
+                            reasoning_input_ids=reasoning_ids_gen,  # Generated, but gradients flow through decoder
+                            reasoning_attention_mask=gen_attention_mask
+                        )
                         reasoning_hidden_for_answer = reasoning_hidden_gen
                     else:
                         # Use GT reasoning
                         reasoning_hidden_for_answer = reasoning_hidden_gt
                     
-                    # Step 3: Answer
+                    # Answer loss (gradients flow back to reasoning decoder if generated!)
                     answer_logits, _ = self.model.generate_answer(
                         fused_features=fused_features,
                         reasoning_hidden=reasoning_hidden_for_answer,
@@ -774,7 +815,7 @@ class ImplicitReasoningTrainer:
                         answer_labels.view(-1)
                     )
                     
-                    # Combined loss
+                    # 🔥 Combined loss: reasoning decoder learns from BOTH losses!
                     loss = (self.alpha_reasoning * reasoning_loss + 
                            self.alpha_answer * answer_loss)
                     loss = loss / self.gradient_accumulation_steps
@@ -928,19 +969,28 @@ class ImplicitReasoningTrainer:
     @torch.no_grad()
     def measure_generation_quality(self, num_samples=50):
         """
-        Measure generation quality for curriculum guidance
+        🔥 FIXED: Measure ACTUAL generation quality (not GT!)
         
         Metrics:
-        - Perplexity: Lower = better text modeling
+        - Perplexity: Computed on GENERATED text (via loss)
         - Non-empty rate: % of non-empty generations
         - Avg length: Average token count
+        - Vietnamese coherence: % of Vietnamese tokens (NEW)
+        - Repetition rate: % of repeated trigrams (NEW)
         """
         self.model.eval()
         
         perplexities = []
         non_empty_count = 0
         lengths = []
+        vietnamese_scores = []
+        repetition_rates = []
         total_samples = 0
+        
+        # Vietnamese token detection (common Vietnamese syllables/words)
+        vietnamese_tokens = {'người', 'hình', 'ảnh', 'màu', 'chiếc', 'đang', 'một', 'trong', 'có', 
+                           'là', 'của', 'được', 'không', 'này', 'đó', 'cho', 'với', 'các', 'từ',
+                           'sắc', 'trên', 'thấy', 'ở', 'bên', 'trái', 'phải', 'giữa', 'và'}
         
         for batch_idx, batch in enumerate(self.val_loader):
             if total_samples >= num_samples:
@@ -961,8 +1011,8 @@ class ImplicitReasoningTrainer:
                     )
                     fused_features, _ = self.model.fuse_multimodal(question_embeds, vision_embeds)
                     
-                    # Generate reasoning
-                    reasoning_ids, _ = self.model.generate_reasoning_autoregressive(
+                    # Generate reasoning (THIS is what we evaluate!)
+                    reasoning_ids, reasoning_hidden = self.model.generate_reasoning_autoregressive(
                         fused_features=fused_features,
                         max_length=96,
                         num_beams=1,
@@ -970,16 +1020,20 @@ class ImplicitReasoningTrainer:
                         repetition_penalty=1.5
                     )
                     
-                    # Compute perplexity using GT reasoning (teacher forcing)
-                    reasoning_labels = tensor_batch['reasoning_input_ids'].clone()
-                    reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
+                    # 🔥 FIX: Compute perplexity on GENERATED reasoning
+                    # Create attention mask for generated ids
+                    gen_attention_mask = (reasoning_ids != self.model.tokenizer.pad_token_id).long()
                     
-                    # Forward pass with GT reasoning_input_ids (not generated!)
+                    # Forward pass with GENERATED reasoning_ids
                     reasoning_logits, _, _ = self.model.generate_reasoning(
                         fused_features=fused_features,
-                        reasoning_input_ids=tensor_batch['reasoning_input_ids'],
-                        reasoning_attention_mask=tensor_batch['reasoning_attention_mask']
+                        reasoning_input_ids=reasoning_ids,  # ✅ Use generated!
+                        reasoning_attention_mask=gen_attention_mask
                     )
+                    
+                    # Prepare labels (shift for autoregressive loss)
+                    reasoning_labels = reasoning_ids.clone()
+                    reasoning_labels[reasoning_labels == self.model.tokenizer.pad_token_id] = -100
                     
                     # Compute loss (for perplexity)
                     loss = self.criterion(
@@ -990,14 +1044,33 @@ class ImplicitReasoningTrainer:
                     ppl = torch.exp(loss).item()
                     perplexities.append(ppl)
                     
-                    # Check non-empty
+                    # Check generation quality per sample
                     for i in range(batch_size):
                         text = self.model.tokenizer.decode(reasoning_ids[i], skip_special_tokens=True)
-                        if len(text.strip()) > 0:
+                        tokens = text.strip().split()
+                        
+                        if len(tokens) > 0:
                             non_empty_count += 1
-                            lengths.append(len(text.split()))
+                            lengths.append(len(tokens))
+                            
+                            # Vietnamese coherence check
+                            viet_count = sum(1 for t in tokens if t.lower() in vietnamese_tokens)
+                            vietnamese_scores.append(viet_count / len(tokens))
+                            
+                            # Repetition detection (trigram overlap)
+                            if len(tokens) >= 3:
+                                trigrams = [tuple(tokens[j:j+3]) for j in range(len(tokens)-2)]
+                                if len(trigrams) > 0:
+                                    unique_trigrams = len(set(trigrams))
+                                    repetition_rates.append(1.0 - unique_trigrams / len(trigrams))
+                                else:
+                                    repetition_rates.append(0.0)
+                            else:
+                                repetition_rates.append(0.0)
                         else:
                             lengths.append(0)
+                            vietnamese_scores.append(0.0)
+                            repetition_rates.append(1.0)  # Empty = max repetition
                         
                         total_samples += 1
                         if total_samples >= num_samples:
@@ -1015,13 +1088,17 @@ class ImplicitReasoningTrainer:
             return {
                 'perplexity': 999.0,
                 'non_empty_rate': 0.0,
-                'avg_length': 0.0
+                'avg_length': 0.0,
+                'vietnamese_coherence': 0.0,
+                'repetition_rate': 1.0
             }
         
         return {
             'perplexity': np.mean(perplexities),
             'non_empty_rate': non_empty_count / max(total_samples, 1),
-            'avg_length': np.mean(lengths) if lengths else 0.0
+            'avg_length': np.mean(lengths) if lengths else 0.0,
+            'vietnamese_coherence': np.mean(vietnamese_scores) if vietnamese_scores else 0.0,
+            'repetition_rate': np.mean(repetition_rates) if repetition_rates else 1.0
         }
     
     @torch.no_grad()
@@ -1165,6 +1242,8 @@ class ImplicitReasoningTrainer:
                 print(f"  Perplexity: {gen_metrics['perplexity']:.2f}")
                 print(f"  Non-empty rate: {gen_metrics['non_empty_rate']:.1%}")
                 print(f"  Avg length: {gen_metrics['avg_length']:.1f} tokens")
+                print(f"  Vietnamese coherence: {gen_metrics.get('vietnamese_coherence', 0):.1%}")  # 🔥 NEW
+                print(f"  Repetition rate: {gen_metrics.get('repetition_rate', 1):.1%}")  # 🔥 NEW
                 print(f"  Quality score: {quality_score:.3f}")
             
             # Compute gen_prob based on quality
