@@ -834,7 +834,23 @@ class DINOv2BARTphoVQA(nn.Module):
             no_repeat_ngram_size=no_repeat_ngram_size  # 🔥 Pass parameter
         )
         
-        reasoning_text = self.tokenizer.batch_decode(reasoning_ids, skip_special_tokens=True)
+        # 🔥 FIX: Decode reasoning từng sample, remove BOS token
+        reasoning_text = []
+        for i in range(batch_size):
+            tokens = reasoning_ids[i].tolist()
+            
+            # Remove BOS token ở đầu
+            if tokens and tokens[0] == self.tokenizer.bos_token_id:
+                tokens = tokens[1:]
+            
+            # Remove EOS và padding
+            if self.tokenizer.eos_token_id in tokens:
+                eos_idx = tokens.index(self.tokenizer.eos_token_id)
+                tokens = tokens[:eos_idx]
+            
+            # Decode clean tokens
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            reasoning_text.append(text)
         
         reasoning_confidence = None
         if self.use_quality_check:
@@ -900,7 +916,23 @@ class DINOv2BARTphoVQA(nn.Module):
             if (next_token == self.tokenizer.eos_token_id).all():
                 break
         
-        answer_text = self.tokenizer.batch_decode(answer_ids, skip_special_tokens=True)
+        # 🔥 FIX: Decode từng sample và remove BOS token thủ công
+        answer_text = []
+        for i in range(batch_size):
+            tokens = answer_ids[i].tolist()
+            
+            # Remove BOS token ở đầu (gây ra ký tự rác!)
+            if tokens and tokens[0] == self.tokenizer.bos_token_id:
+                tokens = tokens[1:]
+            
+            # Remove EOS và padding
+            if self.tokenizer.eos_token_id in tokens:
+                eos_idx = tokens.index(self.tokenizer.eos_token_id)
+                tokens = tokens[:eos_idx]
+            
+            # Decode clean tokens
+            text = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
+            answer_text.append(text)
         
         return reasoning_text, answer_text, reasoning_confidence
 
