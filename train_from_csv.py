@@ -156,7 +156,13 @@ class ViVQADataset(Dataset):
 # ============================================================================
 class VQATrainer:
     """
-    Trainer cho VQA model với single-stage (chỉ train answer, không có reasoning)
+    Trainer cho VQA model với 3-stage progressive unfreezing:
+    
+    Stage 1: Freeze all pretrained, train ONLY fusion (projection + cross-attention)
+    Stage 2: Unfreeze Answer Decoder + LM head (language generation adaptation)
+    Stage 3: Unfreeze Encoder last 3 layers (Vietnamese semantic adaptation)
+    
+    Note: Vision encoder ALWAYS frozen (11K samples không đủ, DINOv2 đã tốt)
     """
     
     def __init__(
@@ -166,7 +172,7 @@ class VQATrainer:
         val_loader,
         output_dir,
         learning_rate=2e-5,
-        num_epochs=10,
+        num_epochs_per_stage=(3, 3, 4),  # 🔥 Epochs cho mỗi stage
         warmup_steps=500,
         gradient_accumulation_steps=4,
         max_grad_norm=1.0,
@@ -181,28 +187,20 @@ class VQATrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
         
-        self.num_epochs = num_epochs
+        self.num_epochs_per_stage = num_epochs_per_stage
+        self.total_epochs = sum(num_epochs_per_stage)
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
         self.save_steps = save_steps
         self.eval_steps = eval_steps
         
-        # Optimizer
-        self.optimizer = AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=0.01
-        )
+        # Optimizer (sẽ được tạo lại cho mỗi stage)
+        self.optimizer = None
+        self.scheduler = None
+        self.learning_rate = learning_rate
         
-        # Scheduler
-        total_steps = len(train_loader) * num_epochs // gradient_accumulation_steps
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps
-        )
+        # Scheduler params
+        self.warmup_steps = warmup_steps
         
         # Mixed precision
         self.scaler = GradScaler()
@@ -217,43 +215,165 @@ class VQATrainer:
         logger.info(f"Trainer initialized:")
         logger.info(f"  - Device: {device}")
         logger.info(f"  - Learning rate: {learning_rate}")
-        logger.info(f"  - Num epochs: {num_epochs}")
-        logger.info(f"  - Total training steps: {total_steps}")
+        logger.info(f"  - Stage 1 epochs: {num_epochs_per_stage[0]} (fusion only)")
+        logger.info(f"  - Stage 2 epochs: {num_epochs_per_stage[1]} (+ answer decoder + LM head)")
+        logger.info(f"  - Stage 3 epochs: {num_epochs_per_stage[2]} (+ encoder last 3 layers)")
+        logger.info(f"  - Total epochs: {self.total_epochs}")
         logger.info(f"  - Warmup steps: {warmup_steps}")
+        logger.info(f"  - Vision encoder: ALWAYS FROZEN (11K samples insufficient)")
+    
+    def setup_stage(self, stage):
+        """
+        Setup freezing/unfreezing cho từng stage
+        
+        Stage 1: Train ONLY fusion (projection + cross-attention)
+        Stage 2: + Unfreeze Answer Decoder + LM head (language generation)
+        Stage 3: + Unfreeze Encoder last 3 layers (Vietnamese semantics)
+        
+        Note: Vision encoder ALWAYS frozen (11K samples insufficient)
+        """
+        logger.info("\n" + "=" * 80)
+        logger.info(f"SETTING UP STAGE {stage}")
+        logger.info("=" * 80)
+        
+        if stage == 1:
+            # Stage 1: Freeze ALL pretrained, train ONLY fusion
+            logger.info("[Stage 1] Freeze all pretrained, train ONLY fusion")
+            logger.info("  Goal: Learn vision-language alignment")
+            
+            # Freeze everything first
+            for param in self.model.parameters():
+                param.requires_grad = False
+            
+            # Unfreeze fusion components
+            for param in self.model.vision_proj.parameters():
+                param.requires_grad = True
+            for param in self.model.cross_attention_fusion.parameters():
+                param.requires_grad = True
+            
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params (fusion only)")
+            
+        elif stage == 2:
+            # Stage 2: + Unfreeze Answer Decoder + LM head
+            logger.info("[Stage 2] + Unfreeze Answer Decoder + LM head")
+            logger.info("  Goal: Adapt Vietnamese VQA answer generation")
+            
+            # Unfreeze answer decoder (199M params)
+            for param in self.model.answer_decoder.parameters():
+                param.requires_grad = True
+            
+            # Unfreeze LM head (vocabulary projection)
+            for param in self.model.lm_head.parameters():
+                param.requires_grad = True
+            
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params (fusion + answer decoder + LM head)")
+            
+        elif stage == 3:
+            # Stage 3: + Unfreeze Encoder last 3 layers
+            logger.info("[Stage 3] + Unfreeze Encoder last 3 layers")
+            logger.info("  Goal: Fine-tune Vietnamese semantic understanding")
+            
+            # Unfreeze last 3 layers của encoder
+            total_layers = len(self.model.encoder.layers)
+            for i, layer in enumerate(self.model.encoder.layers):
+                if i >= total_layers - 3:  # Last 3 layers
+                    for param in layer.parameters():
+                        param.requires_grad = True
+            
+            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params (fusion + decoder + LM head + encoder last 3 layers)")
+        
+        # Create optimizer cho stage này
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        self.optimizer = AdamW(
+            trainable_params,
+            lr=self.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.01
+        )
+        
+        # Create scheduler
+        num_epochs_this_stage = self.num_epochs_per_stage[stage - 1]
+        total_steps = len(self.train_loader) * num_epochs_this_stage // self.gradient_accumulation_steps
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=total_steps
+        )
+        
+        logger.info(f"  ✅ Optimizer & scheduler created for {num_epochs_this_stage} epochs")
+        logger.info("=" * 80 + "\n")
     
     def train(self):
-        """Main training loop"""
+        """Main training loop với 3 stages"""
         logger.info("=" * 80)
-        logger.info("Starting training...")
+        logger.info("Starting 3-Stage Training...")
         logger.info("=" * 80)
         
-        for epoch in range(self.num_epochs):
-            logger.info(f"\nEpoch {epoch + 1}/{self.num_epochs}")
-            self.train_epoch(epoch)
-            
-            # Validation
-            val_loss, val_metrics = self.validate()
+        epoch_counter = 0
+        
+        # Stage 1: Fusion only
+        self.setup_stage(1)
+        for epoch in range(self.num_epochs_per_stage[0]):
+            epoch_counter += 1
+            logger.info(f"\n[Stage 1] Epoch {epoch + 1}/{self.num_epochs_per_stage[0]} (Global: {epoch_counter}/{self.total_epochs})")
+            self.train_epoch(epoch_counter)
+            val_loss, _ = self.validate()
             logger.info(f"Validation Loss: {val_loss:.4f}")
             
-            # Save best model
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                self.save_checkpoint('best_model')
-                logger.info(f"✓ New best model saved! (val_loss={val_loss:.4f})")
+                self.save_checkpoint('best_model_stage1')
+                logger.info(f"✓ Best Stage 1 model saved! (val_loss={val_loss:.4f})")
+        
+        self.save_checkpoint('stage1_final')
+        
+        # Stage 2: + LM head
+        self.setup_stage(2)
+        for epoch in range(self.num_epochs_per_stage[1]):
+            epoch_counter += 1
+            logger.info(f"\n[Stage 2] Epoch {epoch + 1}/{self.num_epochs_per_stage[1]} (Global: {epoch_counter}/{self.total_epochs})")
+            self.train_epoch(epoch_counter)
+            val_loss, _ = self.validate()
+            logger.info(f"Validation Loss: {val_loss:.4f}")
             
-            # Save epoch checkpoint
-            self.save_checkpoint(f'epoch_{epoch + 1}')
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_checkpoint('best_model_stage2')
+                logger.info(f"✓ Best Stage 2 model saved! (val_loss={val_loss:.4f})")
+        
+        self.save_checkpoint('stage2_final')
+        
+        # Stage 3: + Vision projection
+        self.setup_stage(3)
+        for epoch in range(self.num_epochs_per_stage[2]):
+            epoch_counter += 1
+            logger.info(f"\n[Stage 3] Epoch {epoch + 1}/{self.num_epochs_per_stage[2]} (Global: {epoch_counter}/{self.total_epochs})")
+            self.train_epoch(epoch_counter)
+            val_loss, _ = self.validate()
+            logger.info(f"Validation Loss: {val_loss:.4f}")
+            
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_checkpoint('best_model_final')
+                logger.info(f"✓ Best final model saved! (val_loss={val_loss:.4f})")
+        
+        self.save_checkpoint('stage3_final')
         
         logger.info("\n" + "=" * 80)
-        logger.info("Training completed!")
+        logger.info("3-Stage Training completed!")
+        logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
         logger.info("=" * 80)
     
-    def train_epoch(self, epoch):
+    def train_epoch(self, global_epoch):
         """Train one epoch"""
         self.model.train()
         total_loss = 0
         
-        pbar = tqdm(self.train_loader, desc=f"Training Epoch {epoch + 1}")
+        pbar = tqdm(self.train_loader, desc=f"Training Epoch {global_epoch}")
         for step, batch in enumerate(pbar):
             # Move to device
             pixel_values = batch['pixel_values'].to(self.device)
@@ -313,7 +433,7 @@ class VQATrainer:
                 self.save_checkpoint(f'step_{self.global_step}')
         
         avg_loss = total_loss / len(self.train_loader)
-        logger.info(f"Epoch {epoch + 1} - Avg Train Loss: {avg_loss:.4f}")
+        logger.info(f"Epoch {global_epoch} - Avg Train Loss: {avg_loss:.4f}")
     
     @torch.no_grad()
     def validate(self):
@@ -521,21 +641,20 @@ def main():
     # Data args
     parser.add_argument('--csv_path', type=str, required=True, help='Path to CSV file')
     parser.add_argument('--image_folder', type=str, required=True, help='Folder containing images')
-    parser.add_argument('--val_csv_path', type=str, default=None, help='Validation CSV (optional)')
-    parser.add_argument('--val_split', type=float, default=0.1, help='Validation split if no val_csv')
+    parser.add_argument('--val_split', type=float, default=0.1, help='Validation split ratio (auto split from csv_path)')
     parser.add_argument('--image_ext', type=str, default='.jpg', help='Image file extension')
     
     # Model args
     parser.add_argument('--dinov2_model', type=str, default='facebook/dinov2-base')
     parser.add_argument('--bartpho_model', type=str, default='vinai/bartpho-syllable')
     parser.add_argument('--num_cross_attn_layers', type=int, default=3)
-    parser.add_argument('--freeze_pretrained', action='store_true', help='Freeze pretrained weights')
-    parser.add_argument('--unfreeze_encoder_layers', type=int, default=3, help='Unfreeze last N encoder layers')
     
     # Training args
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=10)
+    parser.add_argument('--stage1_epochs', type=int, default=3, help='Stage 1: Fusion only')
+    parser.add_argument('--stage2_epochs', type=int, default=3, help='Stage 2: + Answer decoder + LM head')
+    parser.add_argument('--stage3_epochs', type=int, default=4, help='Stage 3: + Encoder last 3 layers')
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--warmup_steps', type=int, default=500)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=4)
@@ -568,27 +687,23 @@ def main():
             gradient_checkpointing=True
         )
         
-        # Freeze pretrained weights if requested
-        if args.freeze_pretrained:
-            model.freeze_pretrained_weights(
-                unfreeze_encoder_last_n_layers=args.unfreeze_encoder_layers
-            )
+        # 🔥 ALWAYS freeze pretrained weights cho 3-stage training
+        logger.info("Freezing all pretrained weights (will unfreeze progressively)...")
+        for param in model.parameters():
+            param.requires_grad = False
         
-        # Prepare datasets
-        logger.info("Loading datasets...")
+        # Prepare datasets - 🔥 AUTO SPLIT from csv_path
+        logger.info("Loading dataset and splitting train/val...")
+        full_dataset = ViVQADataset(args.csv_path, args.image_folder, model, image_ext=args.image_ext)
         
-        if args.val_csv_path:
-            # Use separate validation CSV
-            train_dataset = ViVQADataset(args.csv_path, args.image_folder, model, image_ext=args.image_ext)
-            val_dataset = ViVQADataset(args.val_csv_path, args.image_folder, model, image_ext=args.image_ext)
-        else:
-            # Split from training CSV
-            full_dataset = ViVQADataset(args.csv_path, args.image_folder, model, image_ext=args.image_ext)
-            val_size = int(len(full_dataset) * args.val_split)
-            train_size = len(full_dataset) - val_size
-            train_dataset, val_dataset = torch.utils.data.random_split(
-                full_dataset, [train_size, val_size]
-            )
+        val_size = int(len(full_dataset) * args.val_split)
+        train_size = len(full_dataset) - val_size
+        
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, 
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)  # 🔥 Seed for reproducibility
+        )
         
         # Dataloaders
         train_loader = DataLoader(
@@ -607,17 +722,17 @@ def main():
             pin_memory=True
         )
         
-        logger.info(f"Train samples: {len(train_dataset)}")
-        logger.info(f"Val samples: {len(val_dataset)}")
+        logger.info(f"✓ Train samples: {len(train_dataset)}")
+        logger.info(f"✓ Val samples: {len(val_dataset)}")
         
-        # Initialize trainer
+        # Initialize trainer với 3 stages
         trainer = VQATrainer(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
             output_dir=args.output_dir,
             learning_rate=args.learning_rate,
-            num_epochs=args.num_epochs,
+            num_epochs_per_stage=(args.stage1_epochs, args.stage2_epochs, args.stage3_epochs),
             warmup_steps=args.warmup_steps,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             max_grad_norm=args.max_grad_norm,
@@ -626,7 +741,7 @@ def main():
             device=device
         )
         
-        # Train
+        # Train với 3 stages
         trainer.train()
     
     # ========================================================================
