@@ -57,8 +57,8 @@ class ViVQADataset(Dataset):
         csv_path, 
         image_folder, 
         model,
-        max_question_len=128,
-        max_answer_len=16,  # 🔥 Giảm xuống 16 cho short answer (3-5 ký tự)
+        max_question_len=64,  # 🔥 Giảm từ 128 → 64 (Vietnamese questions ngắn)
+        max_answer_len=16,  # 🔥 Short answer (3-5 từ)
         image_ext='.jpg'
     ):
         """
@@ -382,6 +382,10 @@ class VQATrainer:
             answer_input_ids = batch['answer_input_ids'].to(self.device)
             answer_attention_mask = batch['answer_attention_mask'].to(self.device)
             
+            # 🔥 Clear cache every 50 steps
+            if step % 50 == 0:
+                torch.cuda.empty_cache()
+            
             # Forward pass với mixed precision
             with autocast():
                 # Encode image + question
@@ -408,6 +412,9 @@ class VQATrainer:
             
             # Backward
             self.scaler.scale(loss).backward()
+            
+            # 🔥 Delete intermediate tensors to free memory
+            del visual_features, text_features, fused_features, answer_logits
             
             # Update weights
             if (step + 1) % self.gradient_accumulation_steps == 0:
@@ -441,6 +448,9 @@ class VQATrainer:
         self.model.eval()
         total_loss = 0
         
+        # 🔥 Clear cache before validation
+        torch.cuda.empty_cache()
+        
         pbar = tqdm(self.val_loader, desc="Validating")
         for batch in pbar:
             pixel_values = batch['pixel_values'].to(self.device)
@@ -469,6 +479,9 @@ class VQATrainer:
             
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
+            
+            # 🔥 Delete intermediate tensors
+            del visual_features, text_features, fused_features, answer_logits, loss
         
         avg_loss = total_loss / len(self.val_loader)
         return avg_loss, {}
@@ -537,8 +550,9 @@ def generate_answers(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=2,  # 🔥 Giảm workers
+        pin_memory=True,
+        prefetch_factor=2
     )
     
     results = []
@@ -705,21 +719,23 @@ def main():
             generator=torch.Generator().manual_seed(42)  # 🔥 Seed for reproducibility
         )
         
-        # Dataloaders
+        # Dataloaders - 🔥 Giảm workers để save memory
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=4,
-            pin_memory=True
+            num_workers=2,  # 🔥 Giảm từ 4 → 2
+            pin_memory=True,
+            prefetch_factor=2  # 🔥 Giảm prefetch
         )
         
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=4,
-            pin_memory=True
+            num_workers=2,  # 🔥 Giảm từ 4 → 2
+            pin_memory=True,
+            prefetch_factor=2
         )
         
         logger.info(f"✓ Train samples: {len(train_dataset)}")
