@@ -318,7 +318,87 @@ class DINOv2BARTphoVQA(nn.Module):
             self.answer_decoder.gradient_checkpointing_enable()
             print("[INFO] ✓ Gradient checkpointing enabled")
         
+        # === 8. 🇻🇳 VIETNAMESE TOKEN FILTER (Prevent gibberish!) ===
+        self.vietnamese_token_mask = self._build_vietnamese_token_mask()
+        print(f"[INFO] ✓ Vietnamese token filter: {self.vietnamese_token_mask.sum().item()}/{len(self.tokenizer)} tokens allowed")
+        
         print(f"[INFO] ✓ Model initialized: ~681M parameters (with separate decoders)")
+    
+    def _build_vietnamese_token_mask(self):
+        """
+        🇻🇳 Build binary mask for Vietnamese tokens to prevent gibberish generation
+        
+        Strategy:
+        1. Decode all tokens in vocabulary
+        2. Check if contains Vietnamese characters (à, á, ả, ã, ạ, â, ă, đ, ê, ô, ơ, ư...)
+        3. Allow special tokens (BOS, EOS, PAD, numbers, punctuation)
+        4. Mask out: pure English words, Chinese, symbols, rare multilingual tokens
+        
+        Returns:
+            mask: [vocab_size] - True = allowed, False = blocked
+        """
+        vocab_size = len(self.tokenizer)
+        mask = torch.zeros(vocab_size, dtype=torch.bool)
+        
+        # Vietnamese diacritics and special characters
+        vietnamese_chars = set(
+            'àáảãạâầấẩẫậăằắẳẵặèéẻẽẹêềếểễệđìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ'
+            'ÀÁẢÃẠÂẦẤẨẪẬĂẰẮẲẴẶÈÉẺẼẸÊỀẾỂỄỆĐÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴ'
+        )
+        
+        # Common Vietnamese words (high-frequency)
+        common_vietnamese_words = {
+            'là', 'của', 'có', 'và', 'được', 'trong', 'một', 'người', 'với', 'cho',
+            'này', 'đó', 'đã', 'từ', 'không', 'các', 'những', 'như', 'về', 'ra',
+            'hình', 'ảnh', 'màu', 'sắc', 'chiếc', 'con', 'cái', 'đang', 'trên', 'dưới',
+            'bên', 'giữa', 'trái', 'phải', 'đỏ', 'xanh', 'vàng', 'trắng', 'đen',
+            'lớn', 'nhỏ', 'cao', 'thấp', 'dài', 'ngắn', 'rộng', 'hẹp', 'nhiều', 'ít'
+        }
+        
+        # Always allow special tokens
+        special_ids = set([
+            self.tokenizer.bos_token_id,
+            self.tokenizer.eos_token_id,
+            self.tokenizer.pad_token_id,
+            self.tokenizer.unk_token_id
+        ])
+        
+        for token_id in range(vocab_size):
+            # Allow special tokens
+            if token_id in special_ids:
+                mask[token_id] = True
+                continue
+            
+            # Decode token
+            try:
+                token_str = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                token_str = token_str.strip()
+                
+                if not token_str:
+                    mask[token_id] = True  # Empty = punctuation/space
+                    continue
+                
+                # Check Vietnamese criteria
+                has_vietnamese_char = any(c in vietnamese_chars for c in token_str)
+                is_common_word = token_str.lower() in common_vietnamese_words
+                is_number = token_str.isdigit()
+                is_punctuation = all(c in '.,!?;:()[]{}"\'-—–/' for c in token_str)
+                is_short_latin = len(token_str) <= 2 and token_str.isalpha() and token_str.isascii()
+                
+                # Allow if:
+                # - Has Vietnamese diacritics
+                # - Is common Vietnamese word
+                # - Is number/punctuation (universal)
+                # - Is short (a, b, c... may be part of Vietnamese text)
+                if (has_vietnamese_char or is_common_word or is_number or 
+                    is_punctuation or is_short_latin):
+                    mask[token_id] = True
+                
+            except Exception:
+                # If decode fails, skip (likely invalid token)
+                pass
+        
+        return mask
         
     def freeze_pretrained_weights(self):
         """
@@ -544,7 +624,8 @@ class DINOv2BARTphoVQA(nn.Module):
         num_beams=1,
         temperature=1.0,
         top_p=0.9,
-        repetition_penalty=1.2
+        repetition_penalty=1.2,
+        force_vietnamese=True  # 🇻🇳 NEW: Force Vietnamese tokens only
     ):
         """
         Generate reasoning autoregressively (NO teacher forcing)
@@ -557,6 +638,7 @@ class DINOv2BARTphoVQA(nn.Module):
             temperature: Sampling temperature
             top_p: Nucleus sampling
             repetition_penalty: Anti-repetition
+            force_vietnamese: 🇻🇳 If True, block non-Vietnamese tokens
         Returns:
             reasoning_ids: [batch, gen_len] - generated tokens
             reasoning_hidden: [batch, gen_len, 1024] - hidden states
@@ -586,6 +668,11 @@ class DINOv2BARTphoVQA(nn.Module):
             # Get logits for next token
             hidden = decoder_outputs.last_hidden_state[:, -1, :]  # [batch, 1024]
             logits = self.lm_head(hidden)  # [batch, vocab_size]
+            
+            # 🇻🇳 FORCE VIETNAMESE: Mask out non-Vietnamese tokens
+            if force_vietnamese:
+                vietnamese_mask = self.vietnamese_token_mask.to(device)
+                logits = logits.masked_fill(~vietnamese_mask, float('-inf'))
             
             # Apply temperature
             if temperature != 1.0:

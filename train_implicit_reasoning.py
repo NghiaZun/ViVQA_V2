@@ -787,7 +787,8 @@ class ImplicitReasoningTrainer:
                             max_length=96,
                             num_beams=1,
                             temperature=0.7,
-                            repetition_penalty=1.5
+                            repetition_penalty=1.5,
+                            force_vietnamese=True  # 🇻🇳 Force Vietnamese!
                         )
                         
                         # Forward pass with generated IDs (gradients flow!)
@@ -1017,7 +1018,8 @@ class ImplicitReasoningTrainer:
                         max_length=96,
                         num_beams=1,
                         temperature=0.7,
-                        repetition_penalty=1.5
+                        repetition_penalty=1.5,
+                        force_vietnamese=True  # 🇻🇳 Force Vietnamese!
                     )
                     
                     # 🔥 FIX: Compute perplexity on GENERATED reasoning
@@ -1136,7 +1138,8 @@ class ImplicitReasoningTrainer:
                         max_length=96,
                         num_beams=1,
                         temperature=0.7,
-                        repetition_penalty=1.5
+                        repetition_penalty=1.5,
+                        force_vietnamese=True  # 🇻🇳 Force Vietnamese!
                     )
                     
                     # Generate answer using answer_decoder
