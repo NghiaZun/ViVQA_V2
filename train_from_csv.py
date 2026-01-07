@@ -311,12 +311,12 @@ def main():
             print("[INFO] Early stopping triggered.")
             break
 
-    # Save tokenizers once if present in dataset
+    # Save tokenizer once if present in dataset
     try:
-        full_dataset.q_tokenizer.save_pretrained(os.path.join(cfg.save_dir, "phobert_tokenizer"))
-        full_dataset.a_tokenizer.save_pretrained(os.path.join(cfg.save_dir, "vit5_tokenizer"))
-    except Exception:
-        pass
+        full_dataset.dataset.tokenizer.save_pretrained(os.path.join(cfg.save_dir, "bartpho_tokenizer"))
+        print(f"[INFO] Tokenizer saved to {os.path.join(cfg.save_dir, 'bartpho_tokenizer')}")
+    except Exception as e:
+        print(f"[WARN] Could not save tokenizer: {e}")
 
     # Plot curves
     try:
