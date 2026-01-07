@@ -1,1059 +1,329 @@
-"""
-Training Script cho DINOv2-BARTpho VQA từ CSV - FIXED VERSION
-============================================================
-✅ Fixed: OOM issues với proper memory management
-✅ Fixed: Validate ONLY sau mỗi epoch (không validate theo step)
-✅ Fixed: Resume training với proper state restoration
-✅ Fixed: Memory leak do nested computation graph
-
-🔥 KEY FEATURES:
-================
-1. Resume Training:
-   - Sử dụng --resume để load checkpoint và continue training
-   - Tự động restore: model, optimizer, scheduler, training state
-   - Resume từ đúng stage và epoch bị gián đoạn
-
-2. Error Handling:
-   - Catch OOM errors → Save checkpoint + Recommendations
-   - Catch KeyboardInterrupt (Ctrl+C) → Save checkpoint
-   - Catch unexpected errors → Save checkpoint + Traceback
-   - Always save "last_checkpoint" để có thể resume
-
-3. 3-Stage Progressive Training:
-   - Stage 1: Fusion only (~20M params)
-   - Stage 2: + Answer decoder + LM head (~220M params)
-   - Stage 3: + Encoder last 3 layers (~260M params)
-   - Checkpoint sau mỗi epoch + khi bị gián đoạn
-   - Validate ONLY sau mỗi epoch hoàn thành
-
-Usage:
-======
-# First run:
-python train_from_csv_fixed.py \
-    --csv_path data.csv \
-    --image_folder /path/to/images \
-    --output_dir ./outputs \
-    --batch_size 4 \
-    --gradient_accumulation_steps 8 \
-    --stage1_epochs 3 \
-    --stage2_epochs 3 \
-    --stage3_epochs 4
-
-# Nếu bị gián đoạn (OOM, Ctrl+C, crash), resume bằng:
-python train_from_csv_fixed.py \
-    --csv_path data.csv \
-    --image_folder /path/to/images \
-    --output_dir ./outputs \
-    --resume ./outputs/last_checkpoint \
-    --batch_size 2 \
-    --gradient_accumulation_steps 16
-"""
-
 import os
-import argparse
-import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW
-from torch.cuda.amp import autocast, GradScaler
-from transformers import get_cosine_schedule_with_warmup
-from PIL import Image
-from tqdm import tqdm
+import math
+import time
 import json
-from pathlib import Path
-import logging
-import gc
+import random
+import argparse
+from dataclasses import dataclass
 
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import autocast, GradScaler
+
+from transformers import get_cosine_schedule_with_warmup, AutoImageProcessor
+from tqdm import tqdm
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from dataset import VQAGenDataset
 from model_dinov2_bartpho_2 import DINOv2BARTphoVQA
 
+# -----------------------------
+# Repro & cuDNN
+# -----------------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-# ============================================================================
-# LOGGING SETUP
-# ============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+torch.backends.cudnn.benchmark = True
 
+# -----------------------------
+# Configs (CLI-friendly)
+# -----------------------------
+@dataclass
+class TrainConfig:
+    csv_path: str = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
+    image_folder: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
+    checkpoint_dir: str = "/kaggle/input/checkpoint/transformers/default/1/checkpoints"
+    save_dir: str = "/kaggle/working/checkpoints"
 
-# ============================================================================
-# DATASET
-# ============================================================================
-class ViVQADataset(Dataset):
-    """
-    Dataset cho ViVQA từ CSV
-    
-    CSV format:
-        stt, question, answer, img_id, type
-        0, "màu của chiếc bình là gì", "màu xanh lá", 68857, 2
-    """
-    
-    def __init__(
-        self, 
-        csv_path, 
-        image_folder, 
-        model,
-        max_question_len=64,
-        max_answer_len=16,
-        image_ext='.jpg'
-    ):
-        """
-        Args:
-            csv_path: Path to CSV file
-            image_folder: Folder chứa images
-            model: DINOv2BARTphoVQA model (để lấy tokenizer và processor)
-            max_question_len: Max length cho question
-            max_answer_len: Max length cho answer
-            image_ext: Extension của image files (.jpg, .png, etc.)
-        """
-        self.df = pd.read_csv(csv_path)
-        self.image_folder = Path(image_folder)
-        self.tokenizer = model.tokenizer
-        self.vision_processor = model.vision_processor
-        self.max_question_len = max_question_len
-        self.max_answer_len = max_answer_len
-        self.image_ext = image_ext
-        
-        logger.info(f"Loaded {len(self.df)} samples from {csv_path}")
-        logger.info(f"Image folder: {image_folder}")
-        
-        # Validate image files
-        self._validate_images()
-    
-    def _validate_images(self):
-        """Check if all images exist"""
-        missing = []
-        for idx, row in self.df.iterrows():
-            img_path = self.image_folder / f"{row['img_id']}{self.image_ext}"
-            if not img_path.exists():
-                missing.append(str(img_path))
-        
-        if missing:
-            logger.warning(f"Missing {len(missing)} images:")
-            for path in missing[:5]:
-                logger.warning(f"  - {path}")
-            if len(missing) > 5:
-                logger.warning(f"  ... and {len(missing) - 5} more")
-    
-    def __len__(self):
-        return len(self.df)
-    
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        
-        # Load image
-        img_path = self.image_folder / f"{row['img_id']}{self.image_ext}"
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            logger.error(f"Error loading image {img_path}: {e}")
-            # Return black image if error
-            image = Image.new('RGB', (224, 224), color='black')
-        
-        # Process image
-        pixel_values = self.vision_processor(
-            images=image, 
-            return_tensors='pt'
-        )['pixel_values'].squeeze(0)  # [3, 224, 224]
-        
-        # Tokenize question
-        question_encoding = self.tokenizer(
-            row['question'],
-            max_length=self.max_question_len,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        # Tokenize answer
-        answer_encoding = self.tokenizer(
-            row['answer'],
-            max_length=self.max_answer_len,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        return {
-            'pixel_values': pixel_values,
-            'input_ids': question_encoding['input_ids'].squeeze(0),
-            'attention_mask': question_encoding['attention_mask'].squeeze(0),
-            'answer_input_ids': answer_encoding['input_ids'].squeeze(0),
-            'answer_attention_mask': answer_encoding['attention_mask'].squeeze(0),
-            'question_text': row['question'],
-            'answer_text': row['answer'],
-            'img_id': row['img_id'],
-            'type': row['type']
-        }
+    batch_size: int = 4
+    accum_steps: int = 8                # 4 * 8 = effective batch 32
+    num_epochs: int = 60
+    val_split: float = 0.1
+    num_workers: int = 4
+    prefetch_factor: int = 2
+    pin_memory: bool = True
+    persistent_workers: bool = True
 
+    base_lr: float = 2e-4               # for fusion/decoder/text
+    vision_lr: float = 1e-5             # smaller to protect ViT
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
 
-# ============================================================================
-# TRAINER - FIXED VERSION
-# ============================================================================
-class VQATrainer:
-    """
-    Trainer cho VQA model với 3-stage progressive unfreezing
-    
-    ✅ FIXED:
-    - Memory leak do nested computation graph
-    - Validate theo step → Validate ONLY sau mỗi epoch
-    - OOM issues với proper cleanup
-    - Resume training với proper state
-    """
-    
-    def __init__(
-        self,
-        model,
-        train_loader,
-        val_loader,
-        output_dir,
-        learning_rate=2e-5,
-        num_epochs_per_stage=(3, 3, 4),
-        warmup_steps=500,
-        gradient_accumulation_steps=4,
-        max_grad_norm=1.0,
-        save_steps=1000,  # Save checkpoint mỗi N steps
-        device='cuda',
-        resume_checkpoint=None
-    ):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.device = device
-        
-        self.num_epochs_per_stage = num_epochs_per_stage
-        self.total_epochs = sum(num_epochs_per_stage)
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.max_grad_norm = max_grad_norm
-        self.save_steps = save_steps
-        
-        # Optimizer (sẽ được tạo lại cho mỗi stage)
-        self.optimizer = None
-        self.scheduler = None
-        self.learning_rate = learning_rate
-        self.warmup_steps = warmup_steps
-        
-        # Mixed precision
-        self.scaler = GradScaler()
-        
-        # Loss function
-        self.criterion = nn.CrossEntropyLoss(ignore_index=model.tokenizer.pad_token_id)
-        
-        # Metrics
-        self.global_step = 0
-        self.best_val_loss = float('inf')
-        self.current_stage = 1
-        self.current_epoch_in_stage = 0
-        
-        logger.info(f"Trainer initialized:")
-        logger.info(f"  - Device: {device}")
-        logger.info(f"  - Learning rate: {learning_rate}")
-        logger.info(f"  - Stage 1 epochs: {num_epochs_per_stage[0]} (fusion only)")
-        logger.info(f"  - Stage 2 epochs: {num_epochs_per_stage[1]} (+ answer decoder + LM head)")
-        logger.info(f"  - Stage 3 epochs: {num_epochs_per_stage[2]} (+ encoder last 3 layers)")
-        logger.info(f"  - Total epochs: {self.total_epochs}")
-        logger.info(f"  - Gradient accumulation: {gradient_accumulation_steps}")
-        logger.info(f"  - Save checkpoint every {save_steps} steps")
-        logger.info(f"  - Validate: After each epoch (not per step)")
-        
-        # 🔥 Load checkpoint nếu có --resume
-        if resume_checkpoint:
-            self.load_checkpoint(resume_checkpoint)
-    
-    def setup_stage(self, stage):
-        """
-        Setup freezing/unfreezing cho từng stage
-        """
-        logger.info("\n" + "=" * 80)
-        logger.info(f"SETTING UP STAGE {stage}")
-        logger.info("=" * 80)
-        
-        if stage == 1:
-            logger.info("[Stage 1] Freeze all pretrained, train ONLY fusion")
-            logger.info("  Goal: Learn vision-language alignment")
-            
-            # Freeze everything first
-            for param in self.model.parameters():
-                param.requires_grad = False
-            
-            # Unfreeze fusion components
-            for param in self.model.vision_proj.parameters():
-                param.requires_grad = True
-            for param in self.model.cross_attention_fusion.parameters():
-                param.requires_grad = True
-            
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params (fusion only)")
-            
-        elif stage == 2:
-            logger.info("[Stage 2] + Unfreeze Answer Decoder + LM head")
-            logger.info("  Goal: Adapt Vietnamese VQA answer generation")
-            
-            # Unfreeze answer decoder
-            for param in self.model.answer_decoder.parameters():
-                param.requires_grad = True
-            
-            # Unfreeze LM head
-            for param in self.model.lm_head.parameters():
-                param.requires_grad = True
-            
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params")
-            
-        elif stage == 3:
-            logger.info("[Stage 3] + Unfreeze Encoder last 3 layers")
-            logger.info("  Goal: Fine-tune Vietnamese semantic understanding")
-            
-            # Unfreeze last 3 layers của encoder
-            total_layers = len(self.model.encoder.layers)
-            for i, layer in enumerate(self.model.encoder.layers):
-                if i >= total_layers - 3:
-                    for param in layer.parameters():
-                        param.requires_grad = True
-            
-            trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params")
-        
-        # Create optimizer cho stage này
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        self.optimizer = AdamW(
-            trainable_params,
-            lr=self.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=0.01
-        )
-        
-        # Create scheduler
-        num_epochs_this_stage = self.num_epochs_per_stage[stage - 1]
-        total_steps = len(self.train_loader) * num_epochs_this_stage // self.gradient_accumulation_steps
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=total_steps
-        )
-        
-        logger.info(f"  ✅ Optimizer & scheduler created for {num_epochs_this_stage} epochs")
-        logger.info("=" * 80 + "\n")
-    
-    def train(self):
-        """
-        🔥 Main training loop với 3 stages + Error handling + Auto-resume
-        """
-        logger.info("=" * 80)
-        logger.info("Starting 3-Stage Training...")
-        logger.info("=" * 80)
-        
-        try:
-            # Stage 1: Fusion only
-            if self.current_stage <= 1:
-                logger.info(f"\n🔥 STAGE 1: FUSION ONLY")
-                if self.current_stage < 1 or self.current_epoch_in_stage == 0:
-                    self.setup_stage(1)
-                    self.current_stage = 1
-                
-                for epoch in range(self.current_epoch_in_stage, self.num_epochs_per_stage[0]):
-                    self.current_epoch_in_stage = epoch
-                    logger.info(f"\n[Stage 1] Epoch {epoch + 1}/{self.num_epochs_per_stage[0]}")
-                    
-                    # Train epoch
-                    self.train_epoch(epoch + 1)
-                    
-                    # 🔥 Validate ONLY sau epoch hoàn thành
-                    logger.info(f"\n▶ Validating after epoch {epoch + 1}...")
-                    val_loss, _ = self.validate()
-                    logger.info(f"✅ Validation Loss: {val_loss:.4f}")
-                    
-                    if val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
-                        self.save_checkpoint('best_model_stage1')
-                        logger.info(f"⭐ Best Stage 1 model saved! (val_loss={val_loss:.4f})")
-                    
-                    # Save last_checkpoint sau mỗi epoch
-                    self.save_checkpoint('last_checkpoint')
-                    self.save_checkpoint(f'stage1_epoch{epoch + 1}')
-                
-                self.save_checkpoint('stage1_final')
-                self.current_stage = 2
-                self.current_epoch_in_stage = 0
-            
-            # Stage 2: + Answer Decoder + LM head
-            if self.current_stage <= 2:
-                logger.info(f"\n🔥 STAGE 2: + ANSWER DECODER + LM HEAD")
-                if self.current_epoch_in_stage == 0:
-                    self.setup_stage(2)
-                
-                for epoch in range(self.current_epoch_in_stage, self.num_epochs_per_stage[1]):
-                    self.current_epoch_in_stage = epoch
-                    logger.info(f"\n[Stage 2] Epoch {epoch + 1}/{self.num_epochs_per_stage[1]}")
-                    
-                    self.train_epoch(epoch + 1)
-                    
-                    # 🔥 Validate sau epoch
-                    logger.info(f"\n▶ Validating after epoch {epoch + 1}...")
-                    val_loss, _ = self.validate()
-                    logger.info(f"✅ Validation Loss: {val_loss:.4f}")
-                    
-                    if val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
-                        self.save_checkpoint('best_model_stage2')
-                        logger.info(f"⭐ Best Stage 2 model saved! (val_loss={val_loss:.4f})")
-                    
-                    self.save_checkpoint('last_checkpoint')
-                    self.save_checkpoint(f'stage2_epoch{epoch + 1}')
-                
-                self.save_checkpoint('stage2_final')
-                self.current_stage = 3
-                self.current_epoch_in_stage = 0
-            
-            # Stage 3: + Encoder last 3 layers
-            if self.current_stage <= 3:
-                logger.info(f"\n🔥 STAGE 3: + ENCODER LAST 3 LAYERS")
-                if self.current_epoch_in_stage == 0:
-                    self.setup_stage(3)
-                
-                for epoch in range(self.current_epoch_in_stage, self.num_epochs_per_stage[2]):
-                    self.current_epoch_in_stage = epoch
-                    logger.info(f"\n[Stage 3] Epoch {epoch + 1}/{self.num_epochs_per_stage[2]}")
-                    
-                    self.train_epoch(epoch + 1)
-                    
-                    # 🔥 Validate sau epoch
-                    logger.info(f"\n▶ Validating after epoch {epoch + 1}...")
-                    val_loss, _ = self.validate()
-                    logger.info(f"✅ Validation Loss: {val_loss:.4f}")
-                    
-                    if val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
-                        self.save_checkpoint('best_model_final')
-                        logger.info(f"⭐ Best final model saved! (val_loss={val_loss:.4f})")
-                    
-                    self.save_checkpoint('last_checkpoint')
-                    self.save_checkpoint(f'stage3_epoch{epoch + 1}')
-                
-                self.save_checkpoint('stage3_final')
-            
-            logger.info("\n" + "=" * 80)
-            logger.info("✅ 3-Stage Training completed!")
-            logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
-            logger.info("=" * 80)
-            
-        except KeyboardInterrupt:
-            logger.warning("\n" + "=" * 80)
-            logger.warning("⚠️  Training interrupted by user (Ctrl+C)")
-            logger.warning("=" * 80)
-            self._save_interrupted_checkpoint()
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                logger.error("\n" + "=" * 80)
-                logger.error("❌ OUT OF MEMORY ERROR")
-                logger.error("=" * 80)
-                logger.error(f"Error: {e}")
-                logger.error("\n💡 Recommendations:")
-                logger.error("  1. Reduce --batch_size to 1")
-                logger.error("  2. Increase --gradient_accumulation_steps to 32 or 64")
-                logger.error("  3. Reduce max_question_len to 32 and max_answer_len to 8")
-                logger.error("  4. Check GPU memory: nvidia-smi")
-                logger.error("  5. Use smaller model or enable CPU offloading")
-                self._save_interrupted_checkpoint()
+    warmup_ratio: float = 0.06          # % of total steps for warmup
+    use_amp: bool = True
+    resume_epoch: int = 0
+
+    # Early stopping
+    es_patience: int = 6
+    es_min_delta: float = 1e-4
+
+    # Logging/plots
+    log_csv: str = "train_log.csv"
+    curve_png: str = "training_curve.png"
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv_path", type=str)
+    p.add_argument("--image_folder", type=str)
+    p.add_argument("--num_epochs", type=int)
+    p.add_argument("--batch_size", type=int)
+    p.add_argument("--accum_steps", type=int)
+    p.add_argument("--base_lr", type=float)
+    p.add_argument("--vision_lr", type=float)
+    p.add_argument("--resume_epoch", type=int)
+    args = p.parse_args()
+    return args
+
+# -----------------------------
+# Optimizer utils
+# -----------------------------
+def build_optimizer(model: DINOv2BARTphoVQA, cfg: TrainConfig):
+    # Single LR cho tất cả trainable params (vision đã frozen nên không cần)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.base_lr, weight_decay=cfg.weight_decay)
+    return optimizer
+
+def count_trainable_params(model: nn.Module):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+# -----------------------------
+# Train / Val loops
+# -----------------------------
+def run_one_epoch(model, loader, optimizer, scaler, device, cfg, scheduler=None, train=True):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    running_loss = 0.0
+    steps = 0
+
+    pbar = tqdm(loader, disable=False, leave=False)
+    optimizer_zero = optimizer is not None
+    accum_steps = cfg.accum_steps if train else 1
+
+    for step, batch in enumerate(pbar):
+        pixel_values, input_ids, attention_mask, labels = batch
+        pixel_values = pixel_values.to(device, non_blocking=True)
+        input_ids = input_ids.to(device, non_blocking=True)
+        attention_mask = attention_mask.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        with torch.set_grad_enabled(train):
+            if train:  # chỉ backward khi train
+                if cfg.use_amp:
+                    with autocast(dtype=torch.float16):
+                        loss, _ = model(pixel_values, input_ids, attention_mask, labels=labels)
+                        loss = loss / accum_steps
+                    scaler.scale(loss).backward()
+                else:
+                    loss, _ = model(pixel_values, input_ids, attention_mask, labels=labels)
+                    loss = loss / accum_steps
+                    loss.backward()
             else:
-                logger.error(f"\n❌ Runtime Error: {e}")
-                self._save_interrupted_checkpoint()
-                raise
-            
-        except Exception as e:
-            logger.error("\n" + "=" * 80)
-            logger.error(f"❌ UNEXPECTED ERROR: {e}")
-            logger.error("=" * 80)
-            import traceback
-            logger.error(traceback.format_exc())
-            self._save_interrupted_checkpoint()
-            raise
-    
-    def _save_interrupted_checkpoint(self):
-        """
-        🔥 Save checkpoint khi training bị gián đoạn
-        """
-        try:
-            self.save_checkpoint('last_checkpoint')
-            checkpoint_name = f'interrupted_stage{self.current_stage}_epoch{self.current_epoch_in_stage}'
-            self.save_checkpoint(checkpoint_name)
-            
-            logger.warning(f"\n{'='*80}")
-            logger.warning(f"✅ Saved checkpoint for resume:")
-            logger.warning(f"  - {self.output_dir}/last_checkpoint")
-            logger.warning(f"  - {self.output_dir}/{checkpoint_name}")
-            logger.warning(f"{'='*80}")
-            logger.warning(f"\n📌 To resume training, use:")
-            logger.warning(f"   --resume {self.output_dir}/last_checkpoint")
-            logger.warning(f"\n   Training will continue from Stage {self.current_stage}, Epoch {self.current_epoch_in_stage + 1}")
-            logger.warning(f"{'='*80}\n")
-        except Exception as e:
-            logger.error(f"❌ Could not save interrupted checkpoint: {e}")
-    
-    def train_epoch(self, global_epoch):
-        """
-        🔥 Train one epoch - FIXED VERSION
-        
-        FIXES:
-        - Memory leak: detach fused_features khi reuse
-        - Explicit cleanup: del tensors ngay sau backward
-        - Clear cache thường xuyên hơn
-        - Store loss value trước khi delete
-        """
-        self.model.train()
-        total_loss = 0
-        num_batches = 0
-        
-        pbar = tqdm(self.train_loader, desc=f"Training Epoch {global_epoch}")
-        for step, batch in enumerate(pbar):
-            try:
-                # Move to device
-                pixel_values = batch['pixel_values'].to(self.device)
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                answer_input_ids = batch['answer_input_ids'].to(self.device)
-                answer_attention_mask = batch['answer_attention_mask'].to(self.device)
-                
-                # 🔥 Clear cache every 10 steps (was 50)
-                if step % 10 == 0:
-                    torch.cuda.empty_cache()
-                
-                # Forward pass với mixed precision
-                with autocast():
-                    # Encode image + question
-                    visual_features = self.model.encode_image(pixel_values)
-                    text_features = self.model.encode_text(input_ids, attention_mask)
-                    fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
-                    
-                    # 🔥 FIX: Detach để tránh nested computation graph
-                    answer_logits, _ = self.model.generate_answer(
-                        fused_features=fused_features,
-                        reasoning_hidden=fused_features.detach(),  # 🔥 DETACH HERE
-                        answer_input_ids=answer_input_ids,
-                        answer_attention_mask=answer_attention_mask,
-                        use_reasoning_only=False
-                    )
-                    
-                    # Compute loss
-                    loss = self.criterion(
-                        answer_logits.view(-1, answer_logits.size(-1)),
-                        answer_input_ids.view(-1)
-                    )
-                    loss = loss / self.gradient_accumulation_steps
-                
-                # Backward
-                self.scaler.scale(loss).backward()
-                
-                # 🔥 Store loss value BEFORE deleting
-                loss_value = loss.item() * self.gradient_accumulation_steps
-                
-                # 🔥 FIX: Explicitly delete tensors to free memory ASAP
-                del loss, visual_features, text_features, fused_features, answer_logits
-                
-                # Update weights
-                if (step + 1) % self.gradient_accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
-                    self.global_step += 1
-                
-                total_loss += loss_value
-                num_batches += 1
-                pbar.set_postfix({'loss': loss_value, 'avg_loss': total_loss / num_batches})
-                
-                # 🔥 Save checkpoint mỗi save_steps (KHÔNG validate)
-                if self.save_steps > 0 and self.global_step % self.save_steps == 0:
-                    logger.info(f"\n💾 Saving checkpoint at step {self.global_step}...")
-                    self.save_checkpoint(f'step_{self.global_step}')
-                    logger.info(f"✅ Checkpoint saved, continuing training...")
-                    
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    logger.error(f"\n❌ OOM at step {step}/{len(self.train_loader)}")
-                    logger.error("Skipping this batch and clearing cache...")
-                    torch.cuda.empty_cache()
-                    if hasattr(self, 'optimizer'):
-                        self.optimizer.zero_grad()
-                    continue
+                # eval: chỉ forward
+                if cfg.use_amp:
+                    with autocast(dtype=torch.float16):
+                        loss, _ = model(pixel_values, input_ids, attention_mask, labels=labels)
                 else:
-                    raise
-        
-        avg_loss = total_loss / num_batches if num_batches > 0 else 0
-        logger.info(f"\n✅ Epoch {global_epoch} completed - Avg Train Loss: {avg_loss:.4f}")
-        
-        # 🔥 Clear cache sau epoch
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-    @torch.no_grad()
-    def validate(self):
-        """
-        🔥 Validate model - FIXED VERSION
-        
-        FIXES:
-        - Proper memory cleanup
-        - Clear cache trước và sau validation
-        - Explicit deletion of tensors
-        """
-        self.model.eval()
-        total_loss = 0
-        num_batches = 0
-        
-        # 🔥 Clear cache trước validation
-        torch.cuda.empty_cache()
-        
-        pbar = tqdm(self.val_loader, desc="Validating")
-        for batch in pbar:
-            try:
-                pixel_values = batch['pixel_values'].to(self.device)
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                answer_input_ids = batch['answer_input_ids'].to(self.device)
-                answer_attention_mask = batch['answer_attention_mask'].to(self.device)
-                
-                # Forward
-                visual_features = self.model.encode_image(pixel_values)
-                text_features = self.model.encode_text(input_ids, attention_mask)
-                fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
-                
-                answer_logits, _ = self.model.generate_answer(
-                    fused_features=fused_features,
-                    reasoning_hidden=fused_features.detach(),  # 🔥 Detach
-                    answer_input_ids=answer_input_ids,
-                    answer_attention_mask=answer_attention_mask,
-                    use_reasoning_only=False
-                )
-                
-                loss = self.criterion(
-                    answer_logits.view(-1, answer_logits.size(-1)),
-                    answer_input_ids.view(-1)
-                )
-                
-                total_loss += loss.item()
-                num_batches += 1
-                pbar.set_postfix({'loss': loss.item(), 'avg_loss': total_loss / num_batches})
-                
-                # 🔥 Delete intermediate tensors
-                del visual_features, text_features, fused_features, answer_logits, loss
-                
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    logger.warning(f"⚠️  OOM during validation, skipping batch...")
-                    torch.cuda.empty_cache()
-                    continue
+                    loss, _ = model(pixel_values, input_ids, attention_mask, labels=labels)
+
+        if train:
+            if (step + 1) % accum_steps == 0:
+                if cfg.use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    raise
-        
-        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
-        
-        # 🔥 Clear cache sau validation
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        return avg_loss, {}
-    
-    def save_checkpoint(self, name):
-        """Save checkpoint với training state"""
-        try:
-            checkpoint_dir = self.output_dir / name
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save model state
-            torch.save(self.model.state_dict(), checkpoint_dir / 'model.pt')
-            
-            # Save training state
-            training_state = {
-                'global_step': self.global_step,
-                'best_val_loss': self.best_val_loss,
-                'current_stage': self.current_stage,
-                'current_epoch_in_stage': self.current_epoch_in_stage,
-                'optimizer': self.optimizer.state_dict() if self.optimizer else None,
-                'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-                'scaler': self.scaler.state_dict(),
-            }
-            torch.save(training_state, checkpoint_dir / 'training_state.pt')
-            
-            logger.debug(f"✅ Checkpoint saved to {checkpoint_dir}")
-        except Exception as e:
-            logger.error(f"❌ Failed to save checkpoint {name}: {e}")
-    
-    def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint từ path được chỉ định"""
-        checkpoint_path = Path(checkpoint_path)
-        
-        if not checkpoint_path.exists():
-            logger.error(f"❌ Checkpoint not found: {checkpoint_path}")
-            logger.warning("⚠️  Starting training from scratch")
-            return
-        
-        try:
-            logger.info(f"\n{'='*80}")
-            logger.info(f"📂 LOADING CHECKPOINT: {checkpoint_path}")
-            logger.info(f"{'='*80}")
-            
-            # Load model
-            model_path = checkpoint_path / 'model.pt'
-            if not model_path.exists():
-                logger.error(f"❌ Model file not found: {model_path}")
-                return
-            
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-            logger.info(f"✅ Loaded model from {model_path}")
-            
-            # Load training state
-            state_path = checkpoint_path / 'training_state.pt'
-            if not state_path.exists():
-                logger.warning(f"⚠️  Training state not found: {state_path}")
-                logger.warning("⚠️  Will use model only, starting from Stage 1")
-                return
-            
-            state = torch.load(state_path, map_location=self.device)
-            
-            self.global_step = state.get('global_step', 0)
-            self.best_val_loss = state.get('best_val_loss', float('inf'))
-            self.current_stage = state.get('current_stage', 1)
-            self.current_epoch_in_stage = state.get('current_epoch_in_stage', 0)
-            
-            logger.info(f"✅ Loaded training state:")
-            logger.info(f"  - Global step: {self.global_step}")
-            logger.info(f"  - Best val loss: {self.best_val_loss:.4f}")
-            logger.info(f"  - Current stage: {self.current_stage}")
-            logger.info(f"  - Epoch in stage: {self.current_epoch_in_stage}")
-            
-            # Setup stage trước khi load optimizer/scheduler
-            self.setup_stage(self.current_stage)
-            
-            # Load optimizer/scheduler nếu có
-            if state.get('optimizer') and self.optimizer:
-                try:
-                    self.optimizer.load_state_dict(state['optimizer'])
-                    logger.info(f"✅ Loaded optimizer state")
-                except Exception as e:
-                    logger.warning(f"⚠️  Could not load optimizer state: {e}")
-            
-            if state.get('scheduler') and self.scheduler:
-                try:
-                    self.scheduler.load_state_dict(state['scheduler'])
-                    logger.info(f"✅ Loaded scheduler state")
-                except Exception as e:
-                    logger.warning(f"⚠️  Could not load scheduler state: {e}")
-            
-            if state.get('scaler'):
-                try:
-                    self.scaler.load_state_dict(state['scaler'])
-                    logger.info(f"✅ Loaded scaler state")
-                except Exception as e:
-                    logger.warning(f"⚠️  Could not load scaler state: {e}")
-            
-            logger.info(f"{'='*80}")
-            logger.info(f"✅ RESUME FROM CHECKPOINT SUCCESSFUL")
-            logger.info(f"   Will continue from Stage {self.current_stage}, Epoch {self.current_epoch_in_stage + 1}")
-            logger.info(f"{'='*80}\n")
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to load checkpoint {checkpoint_path}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            logger.warning("⚠️  Starting training from scratch")
-            self.global_step = 0
-            self.best_val_loss = float('inf')
-            self.current_stage = 1
-            self.current_epoch_in_stage = 0
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None:
+                    scheduler.step()
 
+        running_loss += loss.item() * accum_steps
+        steps += 1
+        pbar.set_description(f"{'Train' if train else 'Val'} loss: {running_loss/steps:.4f}")
 
-# ============================================================================
-# INFERENCE
-# ============================================================================
-@torch.no_grad()
-def generate_answers(
-    model,
-    csv_path,
-    image_folder,
-    output_path,
-    batch_size=8,
-    max_answer_len=16,
-    num_beams=1,
-    device='cuda'
-):
-    """Generate answers cho toàn bộ dataset và save ra CSV"""
-    logger.info("=" * 80)
-    logger.info("Generating answers...")
-    logger.info("=" * 80)
-    
-    model.eval()
-    model = model.to(device)
-    
-    # Create dataset
-    dataset = ViVQADataset(
-        csv_path=csv_path,
-        image_folder=image_folder,
-        model=model
-    )
-    
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        prefetch_factor=2
-    )
-    
-    results = []
-    
-    pbar = tqdm(loader, desc="Generating")
-    for batch in pbar:
-        pixel_values = batch['pixel_values'].to(device)
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        
-        # Encode
-        visual_features = model.encode_image(pixel_values)
-        text_features = model.encode_text(input_ids, attention_mask)
-        fused_features, _ = model.fuse_multimodal(text_features, visual_features)
-        
-        # Generate answer
-        batch_size_curr = pixel_values.size(0)
-        answer_ids = torch.full(
-            (batch_size_curr, 1),
-            model.tokenizer.bos_token_id,
-            dtype=torch.long,
-            device=device
-        )
-        
-        # Autoregressive generation with repetition penalty
-        for step in range(max_answer_len - 1):
-            decoder_outputs = model.answer_decoder(
-                input_ids=answer_ids,
-                encoder_hidden_states=fused_features,
-                return_dict=True,
-                use_cache=False
-            )
-            
-            hidden = decoder_outputs.last_hidden_state[:, -1, :]
-            logits = model.lm_head(hidden)
-            
-            # Apply repetition penalty
-            for i in range(batch_size_curr):
-                for token_id in set(answer_ids[i].tolist()):
-                    logits[i, token_id] /= 1.5
-            
-            next_token = logits.argmax(dim=-1, keepdim=True)
-            answer_ids = torch.cat([answer_ids, next_token], dim=1)
-            
-            # Early stop if all sequences hit EOS
-            if (next_token == model.tokenizer.eos_token_id).all():
-                break
-        
-        # Decode answers
-        generated_answers = []
-        for i in range(batch_size_curr):
-            tokens = answer_ids[i].tolist()
-            
-            # Remove BOS
-            if tokens and tokens[0] == model.tokenizer.bos_token_id:
-                tokens = tokens[1:]
-            
-            # Remove EOS and padding
-            if model.tokenizer.eos_token_id in tokens:
-                eos_idx = tokens.index(model.tokenizer.eos_token_id)
-                tokens = tokens[:eos_idx]
-            
-            text = model.tokenizer.decode(tokens, skip_special_tokens=True).strip()
-            generated_answers.append(text)
-        
-        # Collect results
-        for i in range(len(generated_answers)):
-            results.append({
-                'stt': len(results),
-                'question': batch['question_text'][i],
-                'answer_gt': batch['answer_text'][i],
-                'answer_pred': generated_answers[i],
-                'img_id': batch['img_id'][i].item(),
-                'type': batch['type'][i].item()
-            })
-        
-        # Cleanup
-        del visual_features, text_features, fused_features, answer_ids
-    
-    # Save to CSV
-    df_results = pd.DataFrame(results)
-    df_results.to_csv(output_path, index=False, encoding='utf-8')
-    logger.info(f"✅ Results saved to {output_path}")
-    logger.info(f"  Total samples: {len(results)}")
-    
-    # Preview
-    logger.info("\nPreview (first 3 samples):")
-    for i in range(min(3, len(results))):
-        logger.info(f"\n  [{i+1}] Question: {results[i]['question']}")
-        logger.info(f"      GT Answer: {results[i]['answer_gt']}")
-        logger.info(f"      Pred Answer: {results[i]['answer_pred']}")
+    return running_loss / max(steps, 1)
 
+# -----------------------------
+# Plot curve
+# -----------------------------
+def plot_curves(csv_path, out_png):
+    df = pd.read_csv(csv_path)
+    plt.figure()
+    plt.plot(df["epoch"], df["train_loss"], label="train_loss")
+    plt.plot(df["epoch"], df["val_loss"], label="val_loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training/Validation Loss")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png)
 
-# ============================================================================
-# MAIN
-# ============================================================================
+# -----------------------------
+# Main
+# -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description='Train DINOv2-BARTpho VQA - FIXED VERSION')
-    
-    # Data args
-    parser.add_argument('--csv_path', type=str, required=True)
-    parser.add_argument('--image_folder', type=str, required=True)
-    parser.add_argument('--val_split', type=float, default=0.1)
-    parser.add_argument('--image_ext', type=str, default='.jpg')
-    
-    # Model args
-    parser.add_argument('--dinov2_model', type=str, default='facebook/dinov2-base')
-    parser.add_argument('--bartpho_model', type=str, default='vinai/bartpho-syllable')
-    parser.add_argument('--num_cross_attn_layers', type=int, default=3)
-    
-    # Training args
-    parser.add_argument('--output_dir', type=str, default='./outputs')
-    parser.add_argument('--batch_size', type=int, default=4, help='Recommended: 2-4 for 24GB GPU')
-    parser.add_argument('--stage1_epochs', type=int, default=3)
-    parser.add_argument('--stage2_epochs', type=int, default=3)
-    parser.add_argument('--stage3_epochs', type=int, default=4)
-    parser.add_argument('--learning_rate', type=float, default=2e-5)
-    parser.add_argument('--warmup_steps', type=int, default=500)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=8, help='Recommended: 8-16')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--save_steps', type=int, default=1000, help='Save checkpoint every N steps')
-    
-    # Resume training
-    parser.add_argument('--resume', type=str, default=None, 
-                        help='Path to checkpoint folder to resume (e.g., ./outputs/last_checkpoint)')
-    
-    # Generation args
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'generate'])
-    parser.add_argument('--checkpoint', type=str, default=None)
-    parser.add_argument('--max_answer_len', type=int, default=16)
-    parser.add_argument('--num_beams', type=int, default=1)
-    
-    args = parser.parse_args()
-    
-    # Device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.info(f"Using device: {device}")
-    
-    if device == 'cuda':
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    
-    # ========================================================================
-    # TRAINING MODE
-    # ========================================================================
-    if args.mode == 'train':
-        # Initialize model
-        logger.info("Initializing model...")
-        model = DINOv2BARTphoVQA(
-            dinov2_model_name=args.dinov2_model,
-            bartpho_model_name=args.bartpho_model,
-            num_cross_attn_layers=args.num_cross_attn_layers,
-            gradient_checkpointing=True
-        )
-        
-        # Freeze all pretrained weights
-        logger.info("Freezing all pretrained weights (will unfreeze progressively)...")
-        for param in model.parameters():
-            param.requires_grad = False
-        
-        # Prepare datasets - AUTO SPLIT
-        logger.info("Loading dataset and splitting train/val...")
-        full_dataset = ViVQADataset(args.csv_path, args.image_folder, model, image_ext=args.image_ext)
-        
-        val_size = int(len(full_dataset) * args.val_split)
-        train_size = len(full_dataset) - val_size
-        
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            full_dataset, 
-            [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
-        
-        # Dataloaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True,
-            prefetch_factor=2
-        )
-        
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True,
-            prefetch_factor=2
-        )
-        
-        logger.info(f"✅ Train samples: {len(train_dataset)}")
-        logger.info(f"✅ Val samples: {len(val_dataset)}")
-        logger.info(f"✅ Train batches per epoch: {len(train_loader)}")
-        logger.info(f"✅ Val batches: {len(val_loader)}")
-        
-        # Initialize trainer
-        trainer = VQATrainer(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            output_dir=args.output_dir,
-            learning_rate=args.learning_rate,
-            num_epochs_per_stage=(args.stage1_epochs, args.stage2_epochs, args.stage3_epochs),
-            warmup_steps=args.warmup_steps,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            max_grad_norm=args.max_grad_norm,
-            save_steps=args.save_steps,
-            device=device,
-            resume_checkpoint=args.resume
-        )
-        
-        # Train
-        trainer.train()
-    
-    # ========================================================================
-    # GENERATION MODE
-    # ========================================================================
-    elif args.mode == 'generate':
-        if not args.checkpoint:
-            raise ValueError("Must provide --checkpoint for generation mode")
-        
-        # Initialize model
-        logger.info("Initializing model...")
-        model = DINOv2BARTphoVQA(
-            dinov2_model_name=args.dinov2_model,
-            bartpho_model_name=args.bartpho_model,
-            num_cross_attn_layers=args.num_cross_attn_layers
-        )
-        
-        # Load checkpoint
-        logger.info(f"Loading checkpoint from {args.checkpoint}")
-        model.load_state_dict(torch.load(args.checkpoint, map_location='cpu'))
-        
-        # Generate answers
-        output_path = os.path.join(args.output_dir, 'predictions.csv')
-        generate_answers(
-            model=model,
-            csv_path=args.csv_path,
-            image_folder=args.image_folder,
-            output_path=output_path,
-            batch_size=args.batch_size,
-            max_answer_len=args.max_answer_len,
-            num_beams=args.num_beams,
-            device=device
-        )
+    set_seed(42)
+    cfg = TrainConfig()
+    # Optional CLI overrides
+    try:
+        args = parse_args()
+        if args.csv_path: cfg.csv_path = args.csv_path
+        if args.image_folder: cfg.image_folder = args.image_folder
+        if args.num_epochs: cfg.num_epochs = args.num_epochs
+        if args.batch_size: cfg.batch_size = args.batch_size
+        if args.accum_steps: cfg.accum_steps = args.accum_steps
+        if args.base_lr: cfg.base_lr = args.base_lr
+        if args.vision_lr: cfg.vision_lr = args.vision_lr
+        if args.resume_epoch is not None: cfg.resume_epoch = args.resume_epoch
+    except SystemExit:
+        # when running in notebooks w/o args
+        pass
 
+    os.makedirs(cfg.save_dir, exist_ok=True)
 
-if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
+
+    # Dataset & Dataloaders
+    vision_processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+    full_dataset = VQAGenDataset(cfg.csv_path, cfg.image_folder, vision_processor)
+
+    val_size = int(len(full_dataset) * cfg.val_split)
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+        persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
+        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
+        persistent_workers=cfg.persistent_workers if cfg.num_workers > 0 else False,
+        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+    )
+
+    # Model
+    model = DINOv2BARTphoVQA(
+        dinov2_model_name='facebook/dinov2-base',
+        bartpho_model_name='vinai/bartpho-syllable',
+        num_cross_attn_layers=3,
+        num_heads=16,
+        dropout=0.1,
+        gradient_checkpointing=True
+    ).to(device)
+    
+    # Optional: Freeze pretrained weights for faster training
+    # model.freeze_pretrained_weights(unfreeze_encoder_last_n_layers=3)
+    
+    print(f"[INFO] Model initialized successfully")
+
+    # Resume?
+    if cfg.resume_epoch > 0:
+        model_path = os.path.join(cfg.checkpoint_dir, "best_model.pth")
+        print(f"[INFO] Resuming weights from {model_path}")
+        model.load_state_dict(torch.load(model_path, map_location=device))
+
+    # Logs
+    log_path = os.path.join(cfg.save_dir, cfg.log_csv)
+    if not os.path.exists(log_path):
+        pd.DataFrame(columns=["epoch","trainable_params","lr","train_loss","val_loss","best_val","es_counter"]).to_csv(log_path, index=False)
+
+    best_val = float("inf")
+    es_counter = 0
+
+    scaler = GradScaler(enabled=cfg.use_amp)
+    
+    # Build optimizer once (no stage changes)
+    optimizer = build_optimizer(model, cfg)
+    
+    # Scheduler for entire training
+    total_train_steps = math.ceil(len(train_loader) / cfg.accum_steps) * cfg.num_epochs
+    warmup_steps = max(1, int(total_train_steps * cfg.warmup_ratio))
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_train_steps
+    )
+
+    for epoch in range(cfg.resume_epoch, cfg.num_epochs):
+        trainable_params = count_trainable_params(model)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Train & Val
+        train_loss = run_one_epoch(model, train_loader, optimizer, scaler, device, cfg, scheduler, train=True)
+        val_loss   = run_one_epoch(model, val_loader, optimizer=None, scaler=scaler, device=device, cfg=cfg, scheduler=None, train=False)
+
+        # Early stopping
+        improved = (best_val - val_loss) > cfg.es_min_delta
+        if improved:
+            best_val = val_loss
+            es_counter = 0
+            # Save best
+            torch.save(model.state_dict(), os.path.join(cfg.save_dir, "best_model.pth"))
+            # Optimizer/scheduler states are not critical across stages (different heads),
+            # keep code simple and robust.
+            print(f"[INFO] New best @ epoch {epoch+1}: val={val_loss:.4f}")
+        else:
+            es_counter += 1
+
+        # Save last (light)
+        torch.save(model.state_dict(), os.path.join(cfg.save_dir, "last_model.pth"))
+
+        # Append logs
+        row = {
+            "epoch": epoch + 1,
+            "trainable_params": trainable_params,
+            "lr": current_lr,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "best_val": best_val,
+            "es_counter": es_counter
+        }
+        df = pd.read_csv(log_path)
+        df.loc[len(df)] = row
+        df.to_csv(log_path, index=False)
+
+        print(f"[EPOCH {epoch+1}/{cfg.num_epochs}] "
+              f"params={trainable_params/1e6:.2f}M | "
+              f"LR={current_lr:.2e} | Train={train_loss:.4f} | Val={val_loss:.4f} | "
+              f"Best={best_val:.4f} | ES={es_counter}/{cfg.es_patience}")
+
+        if es_counter >= cfg.es_patience:
+            print("[INFO] Early stopping triggered.")
+            break
+
+    # Save tokenizers once if present in dataset
+    try:
+        full_dataset.q_tokenizer.save_pretrained(os.path.join(cfg.save_dir, "phobert_tokenizer"))
+        full_dataset.a_tokenizer.save_pretrained(os.path.join(cfg.save_dir, "vit5_tokenizer"))
+    except Exception:
+        pass
+
+    # Plot curves
+    try:
+        plot_curves(log_path, os.path.join(cfg.save_dir, cfg.curve_png))
+        print(f"[INFO] Curves saved to {os.path.join(cfg.save_dir, cfg.curve_png)}")
+    except Exception as e:
+        print(f"[WARN] Plot failed: {e}")
+
+if __name__ == "__main__":
     main()

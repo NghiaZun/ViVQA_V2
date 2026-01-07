@@ -51,14 +51,11 @@ def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start
 
 
 @dataclass
-class CoTOutput:
-    """Chain-of-Thought output với reasoning + answer"""
-    reasoning_logits: torch.Tensor  # [batch, seq_len, vocab_size]
-    answer_logits: torch.Tensor     # [batch, seq_len, vocab_size]
-    reasoning_hidden: Optional[torch.Tensor] = None  # [batch, seq_len, hidden]
-    answer_hidden: Optional[torch.Tensor] = None     # [batch, seq_len, hidden]
-    reasoning_confidence: Optional[torch.Tensor] = None  # [batch] scalar confidence
+class VQAOutput:
+    """VQA output với answer only (no reasoning)"""
+    logits: torch.Tensor  # [batch, seq_len, vocab_size]
     loss: Optional[torch.Tensor] = None
+    hidden_states: Optional[torch.Tensor] = None  # [batch, seq_len, hidden]
 
 
 class GatedCrossAttentionLayer(nn.Module):
@@ -180,53 +177,20 @@ class MultiLayerCrossAttention(nn.Module):
         return text_features, all_attn_weights
 
 
-class ReasoningQualityChecker(nn.Module):
-    """
-    Đánh giá quality của reasoning trước khi generate answer
-    
-    Ý tưởng: Reasoning tốt phải:
-    1. Có information từ cả image và question
-    2. Coherent (không contradictory)
-    3. Relevant to question
-    
-    Output: confidence score [0, 1]
-    """
-    
-    def __init__(self, hidden_dim, dropout=0.1):
-        super().__init__()
-        self.scorer = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()  # Output confidence [0, 1]
-        )
-        
-    def forward(self, reasoning_hidden):
-        """
-        Args:
-            reasoning_hidden: [batch, seq_len, hidden_dim]
-        Returns:
-            confidence: [batch] scalar confidence scores
-        """
-        # Use [CLS] token or mean pooling
-        reasoning_repr = reasoning_hidden.mean(dim=1)  # [batch, hidden_dim]
-        confidence = self.scorer(reasoning_repr).squeeze(-1)  # [batch]
-        return confidence
+# Removed ReasoningQualityChecker - không cần cho answer-only model
 
 
 class DINOv2BARTphoVQA(nn.Module):
     """
-    SOTA VQA Model: DINOv2 + BARTpho + Gated Cross-Attention
+    Simplified VQA Model: DINOv2 + BARTpho + Gated Cross-Attention
     
     Architecture:
     1. Vision: DINOv2-base (86M) - SOTA self-supervised vision
-    2. Language: BARTpho-large encoder (197M) - Vietnamese understanding
+    2. Language: BARTpho encoder (197M) - Vietnamese understanding
     3. Fusion: 3-layer Gated Cross-Attention - Multi-modal alignment
-    4. Generation: BARTpho-large decoder (199M) - Vietnamese generation
-    5. Chain-of-Thought: Reasoning → Quality Check → Answer
+    4. Generation: BARTpho decoder (199M) - Direct answer generation
     
-    Total: ~482M params
+    Total: ~482M params (single decoder)
     """
     
     def __init__(
@@ -236,9 +200,7 @@ class DINOv2BARTphoVQA(nn.Module):
         num_cross_attn_layers=3,  # SOTA: 3 layers
         num_heads=16,  # 1024 dim ÷ 16 heads = 64 (BARTpho standard)
         dropout=0.1,
-        use_reasoning_quality_check=True,
-        gradient_checkpointing=True,
-        reasoning_bottleneck_tokens=None  # None = no bottleneck, 4-8 = compress reasoning
+        gradient_checkpointing=True
     ):
         super().__init__()
         
@@ -265,12 +227,8 @@ class DINOv2BARTphoVQA(nn.Module):
         
         # Split into components
         self.encoder = bartpho_full.model.encoder  # Shared encoder
-        self.reasoning_decoder = bartpho_full.model.decoder  # Reasoning-specific decoder
-        
-        # Clone decoder for answer (separate parameters!)
-        import copy
-        self.answer_decoder = copy.deepcopy(self.reasoning_decoder)
-        print("[INFO] ✓ Created separate decoders: reasoning + answer")
+        self.decoder = bartpho_full.model.decoder  # Single decoder for answer
+        print("[INFO] ✓ Using single decoder for direct answer generation")
         
         # Shared lm_head (vocabulary projection)
         self.lm_head = bartpho_full.lm_head
@@ -308,63 +266,29 @@ class DINOv2BARTphoVQA(nn.Module):
             dropout=dropout
         )
         
-        # === 5. REASONING QUALITY CHECKER ===
-        self.use_quality_check = use_reasoning_quality_check
-        if use_reasoning_quality_check:
-            self.reasoning_quality_checker = ReasoningQualityChecker(
-                hidden_dim=bart_hidden_dim,
-                dropout=dropout
-            )
-        
-        # === 6. REASONING BOTTLENECK (optional) ===
-        # Compress reasoning hidden từ [B, T, 1024] → [B, k, 1024]
-        # Giúp reasoning trừu tượng hơn, không chỉ copy fused_features
-        self.reasoning_bottleneck_tokens = reasoning_bottleneck_tokens
-        if reasoning_bottleneck_tokens is not None:
-            print(f"[INFO] Using reasoning bottleneck: {reasoning_bottleneck_tokens} tokens")
-            # Learned query tokens (similar to Perceiver/BLIP Q-Former)
-            self.reasoning_queries = nn.Parameter(
-                torch.randn(1, reasoning_bottleneck_tokens, bart_hidden_dim)
-            )
-            self.reasoning_bottleneck_attn = nn.MultiheadAttention(
-                embed_dim=bart_hidden_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=True
-            )
-            self.reasoning_bottleneck_norm = nn.LayerNorm(bart_hidden_dim)
-        
-        # === 7. USE BARTPHO's LM_HEAD ===
-        # Use pretrained lm_head for both reasoning and answer
-        # Different encoder contexts → different outputs despite same head
-        # Reasoning: condition on fused_features
-        # Answer: condition on fused_features + reasoning_hidden
-        
-        # === 7. GRADIENT CHECKPOINTING (Save memory) ===
+        # === 5. GRADIENT CHECKPOINTING (Save memory) ===
         if gradient_checkpointing:
             self.vision_encoder.gradient_checkpointing_enable()
             self.encoder.gradient_checkpointing_enable()
-            self.reasoning_decoder.gradient_checkpointing_enable()
-            self.answer_decoder.gradient_checkpointing_enable()
+            self.decoder.gradient_checkpointing_enable()
             print("[INFO] ✓ Gradient checkpointing enabled")
         
-        print(f"[INFO] ✓ Model initialized: ~681M parameters (with separate decoders)")
+        print(f"[INFO] ✓ Model initialized: ~482M parameters (single decoder)")
         
     def freeze_pretrained_weights(self, unfreeze_encoder_last_n_layers=3):
         """
-        🔥 FIX: Freeze pretrained nhưng UNFREEZE last N layers của encoder
+        Freeze pretrained nhưng UNFREEZE last N layers của encoder
         
         FROZEN (giữ pretrained knowledge):
         - Vision encoder (DINOv2)
-        - BARTpho Encoder (EXCEPT last N layers) ← 🔥 FIX
-        - Reasoning decoder (BARTpho)
-        - Answer decoder (BARTpho)
+        - BARTpho Encoder (EXCEPT last N layers)
+        - BARTpho Decoder
         
         TRAINABLE (task-specific + semantic adaptation):
         - Vision projection
         - Cross-attention fusion
-        - BARTpho Encoder last N layers ← 🔥 FIX: Học Vietnamese semantics
-        - LM head (optional)
+        - BARTpho Encoder last N layers (học Vietnamese semantics)
+        - LM head
         """
         print("\n[INFO] 🔒 FREEZING PRETRAINED WEIGHTS (Feature Extraction Mode)")
         
@@ -393,17 +317,11 @@ class DINOv2BARTphoVQA(nn.Module):
         print(f"  ❄️  BARTpho Encoder: {frozen_encoder_params/1e6:.1f}M params frozen")
         print(f"  🔥 BARTpho Encoder (last {unfreeze_encoder_last_n_layers} layers): {unfrozen_encoder_params/1e6:.1f}M params TRAINABLE")
         
-        # Freeze reasoning decoder
-        for param in self.reasoning_decoder.parameters():
+        # Freeze decoder
+        for param in self.decoder.parameters():
             param.requires_grad = False
-        reasoning_params = sum(p.numel() for p in self.reasoning_decoder.parameters())
-        print(f"  ❄️  Reasoning Decoder: {reasoning_params/1e6:.1f}M params frozen")
-        
-        # Freeze answer decoder
-        for param in self.answer_decoder.parameters():
-            param.requires_grad = False
-        answer_params = sum(p.numel() for p in self.answer_decoder.parameters())
-        print(f"  ❄️  Answer Decoder: {answer_params/1e6:.1f}M params frozen")
+        decoder_params = sum(p.numel() for p in self.decoder.parameters())
+        print(f"  ❄️  Decoder: {decoder_params/1e6:.1f}M params frozen")
         
         # Keep trainable: projection, fusion, lm_head, encoder last layers
         proj_params = sum(p.numel() for p in self.vision_proj.parameters())
@@ -414,7 +332,7 @@ class DINOv2BARTphoVQA(nn.Module):
         print(f"  ✅ Cross-Attention Fusion: {fusion_params/1e6:.1f}M params trainable")
         print(f"  ✅ LM Head: {lmhead_params/1e6:.1f}M params trainable")
         
-        total_frozen = vision_params + frozen_encoder_params + reasoning_params + answer_params
+        total_frozen = vision_params + frozen_encoder_params + decoder_params
         total_trainable = proj_params + fusion_params + lmhead_params + unfrozen_encoder_params
         
         print(f"\n  📊 Summary:")
@@ -478,211 +396,24 @@ class DINOv2BARTphoVQA(nn.Module):
         
         return fused_features, attention_weights
     
-    def generate_reasoning(
+    def generate_answer(
         self, 
         fused_features, 
-        reasoning_input_ids=None,
-        reasoning_attention_mask=None
-    ):
-        """
-        Generate reasoning từ fused features
-        
-        Args:
-            fused_features: [batch, seq_len, 1024] - encoder output
-            reasoning_input_ids: [batch, target_len] - teacher forcing labels
-            reasoning_attention_mask: [batch, target_len]
-        Returns:
-            reasoning_logits: [batch, target_len, vocab_size]
-            reasoning_hidden: [batch, target_len, 1024]
-            reasoning_confidence: [batch] - quality score
-        """
-        # 🔥 FIX: Shift decoder input tokens để đúng teacher forcing
-        # Decoder input phải là shifted version của labels
-        if reasoning_input_ids is not None:
-            decoder_input_ids = shift_tokens_right(
-                reasoning_input_ids,
-                self.config.pad_token_id,
-                self.config.decoder_start_token_id
-            )
-        else:
-            decoder_input_ids = reasoning_input_ids
-        
-        # Decoder forward pass for reasoning
-        decoder_outputs = self.reasoning_decoder(
-            input_ids=decoder_input_ids,  # 🔥 Shifted input!
-            attention_mask=reasoning_attention_mask,
-            encoder_hidden_states=fused_features,
-            return_dict=True,
-            use_cache=False
-        )
-        
-        reasoning_hidden = decoder_outputs.last_hidden_state  # [batch, target_len, 1024]
-        reasoning_logits = self.lm_head(reasoning_hidden)  # [batch, target_len, vocab_size]
-        
-        # BOTTLENECK: Compress reasoning hidden if enabled
-        if self.reasoning_bottleneck_tokens is not None:
-            batch_size = reasoning_hidden.size(0)
-            # Expand queries: [1, k, 1024] → [batch, k, 1024]
-            queries = self.reasoning_queries.expand(batch_size, -1, -1)
-            
-            # Cross-attention: queries attend to reasoning_hidden
-            compressed, _ = self.reasoning_bottleneck_attn(
-                query=queries,
-                key=reasoning_hidden,
-                value=reasoning_hidden
-            )
-            reasoning_hidden = self.reasoning_bottleneck_norm(compressed)
-            # Now reasoning_hidden: [batch, k, 1024] where k << T
-        
-        # Quality check
-        reasoning_confidence = None
-        if self.use_quality_check:
-            reasoning_confidence = self.reasoning_quality_checker(reasoning_hidden)
-        
-        return reasoning_logits, reasoning_hidden, reasoning_confidence
-    
-    def generate_reasoning_autoregressive(
-        self,
-        fused_features,
-        max_length=96,
-        num_beams=1,
-        temperature=1.0,
-        top_p=0.9,
-        repetition_penalty=1.2,
-        no_repeat_ngram_size=3  # 🔥 FIX: Thêm ngăn lặp n-gram
-    ):
-        """
-        Generate reasoning autoregressively (NO teacher forcing)
-        Used for TRUE validation/inference
-        
-        Args:
-            fused_features: [batch, seq_len, 1024] - encoder output
-            max_length: Max reasoning length
-            num_beams: Beam search width (1 = greedy)
-            temperature: Sampling temperature
-            top_p: Nucleus sampling
-            repetition_penalty: Anti-repetition
-            no_repeat_ngram_size: Ngăn lặp n-gram (0 = tắt, 2-3 recommended)
-        Returns:
-            reasoning_ids: [batch, gen_len] - generated tokens
-            reasoning_hidden: [batch, gen_len, 1024] - hidden states
-        """
-        batch_size = fused_features.size(0)
-        device = fused_features.device
-        
-        # Manual generation with reasoning_decoder
-        # Start with BOS token
-        reasoning_ids = torch.full(
-            (batch_size, 1), 
-            self.tokenizer.bos_token_id, 
-            dtype=torch.long, 
-            device=device
-        )
-        
-        # 🔥 FIX: Track n-grams để ngăn lặp
-        banned_ngrams = [{} for _ in range(batch_size)]
-        
-        # Greedy/sampling generation
-        for step in range(max_length - 1):
-            # Forward through reasoning_decoder
-            decoder_outputs = self.reasoning_decoder(
-                input_ids=reasoning_ids,
-                encoder_hidden_states=fused_features,
-                return_dict=True,
-                use_cache=False
-            )
-            
-            # Get logits for next token
-            hidden = decoder_outputs.last_hidden_state[:, -1, :]  # [batch, 1024]
-            logits = self.lm_head(hidden)  # [batch, vocab_size]
-            
-            # Apply temperature
-            if temperature != 1.0:
-                logits = logits / temperature
-            
-            # Apply repetition penalty
-            if repetition_penalty != 1.0:
-                for i in range(batch_size):
-                    for token_id in set(reasoning_ids[i].tolist()):
-                        logits[i, token_id] /= repetition_penalty
-            
-            # 🔥 FIX: Ngăn lặp n-gram
-            if no_repeat_ngram_size > 0 and step >= no_repeat_ngram_size:
-                for i in range(batch_size):
-                    # Lấy n-1 tokens cuối
-                    prefix = tuple(reasoning_ids[i, -(no_repeat_ngram_size-1):].tolist())
-                    # Check tokens nào đã tạo ngram lặp
-                    if prefix in banned_ngrams[i]:
-                        for banned_token in banned_ngrams[i][prefix]:
-                            logits[i, banned_token] = float('-inf')
-            
-            # Sample next token
-            if num_beams == 1 and temperature > 0:
-                probs = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = logits.argmax(dim=-1, keepdim=True)
-            
-            # 🔥 FIX: Update banned n-grams
-            if no_repeat_ngram_size > 0:
-                for i in range(batch_size):
-                    if step >= no_repeat_ngram_size - 1:
-                        prefix = tuple(reasoning_ids[i, -(no_repeat_ngram_size-1):].tolist())
-                        token = next_token[i].item()
-                        if prefix not in banned_ngrams[i]:
-                            banned_ngrams[i][prefix] = set()
-                        banned_ngrams[i][prefix].add(token)
-            
-            # Append to sequence
-            reasoning_ids = torch.cat([reasoning_ids, next_token], dim=1)
-            
-            # Stop if all sequences generated EOS
-            if (next_token == self.tokenizer.eos_token_id).all():
-                break
-        
-        # Get final hidden states
-        decoder_outputs = self.reasoning_decoder(
-            input_ids=reasoning_ids,
-            encoder_hidden_states=fused_features,
-            return_dict=True,
-            use_cache=False
-        )
-        reasoning_hidden = decoder_outputs.last_hidden_state
-        
-        # Apply bottleneck if enabled
-        if self.reasoning_bottleneck_tokens is not None:
-            queries = self.reasoning_queries.expand(batch_size, -1, -1)
-            compressed, _ = self.reasoning_bottleneck_attn(
-                query=queries,
-                key=reasoning_hidden,
-                value=reasoning_hidden
-            )
-            reasoning_hidden = self.reasoning_bottleneck_norm(compressed)
-        
-        return reasoning_ids, reasoning_hidden
-    
-    def generate_answer(
-        self,
-        fused_features,
-        reasoning_hidden,
         answer_input_ids=None,
-        answer_attention_mask=None,
-        use_reasoning_only=True
+        answer_attention_mask=None
     ):
         """
-        Generate answer conditioned on reasoning
+        Generate answer directly từ fused features
         
         Args:
-            fused_features: [batch, seq_len, 1024] - encoder output (image+question)
-            reasoning_hidden: [batch, reason_len, 1024] - reasoning context
+            fused_features: [batch, seq_len, 1024] - encoder output
             answer_input_ids: [batch, target_len] - teacher forcing labels
             answer_attention_mask: [batch, target_len]
-            use_reasoning_only: If True, answer ONLY uses reasoning_hidden (no shortcut)
         Returns:
-            answer_logits: [batch, target_len, vocab_size]
-            answer_hidden: [batch, target_len, 1024]
+            logits: [batch, target_len, vocab_size]
+            hidden_states: [batch, target_len, 1024]
         """
-        # 🔥 FIX: Shift decoder input tokens để đúng teacher forcing
+        # Shift decoder input tokens cho teacher forcing
         if answer_input_ids is not None:
             decoder_input_ids = shift_tokens_right(
                 answer_input_ids,
@@ -692,51 +423,65 @@ class DINOv2BARTphoVQA(nn.Module):
         else:
             decoder_input_ids = answer_input_ids
         
-        # FIX: Answer must DEPEND on reasoning_hidden, not bypass it!
-        if use_reasoning_only:
-            # Answer ONLY uses reasoning hidden (forces dependency)
-            encoder_hidden_states = reasoning_hidden
-        else:
-            # Old behavior: concatenate both (allows shortcut → reasoning ignored!)
-            encoder_hidden_states = torch.cat([fused_features, reasoning_hidden], dim=1)
-        
-        # Decoder forward pass for answer (SEPARATE ANSWER DECODER)
-        decoder_outputs = self.answer_decoder(
-            input_ids=decoder_input_ids,  # 🔥 Shifted input!
+        # Decoder forward pass
+        decoder_outputs = self.decoder(
+            input_ids=decoder_input_ids,
             attention_mask=answer_attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states=fused_features,
             return_dict=True,
             use_cache=False
         )
         
-        answer_hidden = decoder_outputs.last_hidden_state  # [batch, target_len, 1024]
-        answer_logits = self.lm_head(answer_hidden)  # [batch, target_len, vocab_size]
+        hidden_states = decoder_outputs.last_hidden_state  # [batch, target_len, 1024]
+        logits = self.lm_head(hidden_states)  # [batch, target_len, vocab_size]
         
-        return answer_logits, answer_hidden
+        return logits, hidden_states
+    
+    def compute_loss(self, logits, labels):
+        """
+        Tính loss cho answer generation
+        
+        Args:
+            logits: [batch, seq_len, vocab_size]
+            labels: [batch, seq_len] - target tokens
+        Returns:
+            loss: scalar
+        """
+        # Shift: logits[:, :-1] vs labels[:, 1:] (standard seq2seq)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        
+        # Cross entropy loss (ignore padding)
+        loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)), 
+            shift_labels.view(-1)
+        )
+        
+        return loss
     
     def forward(
         self,
         pixel_values,
         input_ids,
         attention_mask,
-        reasoning_input_ids=None,
-        reasoning_attention_mask=None,
-        answer_input_ids=None,
-        answer_attention_mask=None
+        labels=None  # Answer labels (tương thích với train code)
     ):
         """
-        Full forward pass: Image + Question → Reasoning → Answer
+        Forward pass: Image + Question → Answer
+        
+        Compatible với train_from_csv.py:
+        - Input: pixel_values, input_ids, attention_mask, labels
+        - Output: (loss, logits) nếu labels provided, else logits only
         
         Args:
             pixel_values: [batch, 3, 224, 224]
             input_ids: [batch, seq_len] - question tokens
             attention_mask: [batch, seq_len]
-            reasoning_input_ids: [batch, reason_len] - reasoning target (for training)
-            reasoning_attention_mask: [batch, reason_len]
-            answer_input_ids: [batch, ans_len] - answer target (for training)
-            answer_attention_mask: [batch, ans_len]
+            labels: [batch, ans_len] - answer target (optional, for training)
         Returns:
-            CoTOutput with reasoning_logits, answer_logits, hidden states, confidence
+            If labels: (loss, logits)
+            Else: VQAOutput(logits, hidden_states)
         """
         # 1. Encode vision
         visual_features = self.encode_image(pixel_values)
@@ -747,28 +492,22 @@ class DINOv2BARTphoVQA(nn.Module):
         # 3. Fuse multimodal features
         fused_features, _ = self.fuse_multimodal(text_features, visual_features)
         
-        # 4. Generate reasoning
-        reasoning_logits, reasoning_hidden, reasoning_confidence = self.generate_reasoning(
+        # 4. Generate answer directly từ fused features
+        logits, hidden_states = self.generate_answer(
             fused_features=fused_features,
-            reasoning_input_ids=reasoning_input_ids,
-            reasoning_attention_mask=reasoning_attention_mask
+            answer_input_ids=labels,
+            answer_attention_mask=(labels != self.config.pad_token_id) if labels is not None else None
         )
         
-        # 5. Generate answer (conditioned on reasoning)
-        answer_logits, answer_hidden = self.generate_answer(
-            fused_features=fused_features,
-            reasoning_hidden=reasoning_hidden,
-            answer_input_ids=answer_input_ids,
-            answer_attention_mask=answer_attention_mask
-        )
-        
-        return CoTOutput(
-            reasoning_logits=reasoning_logits,
-            answer_logits=answer_logits,
-            reasoning_hidden=reasoning_hidden,
-            answer_hidden=answer_hidden,
-            reasoning_confidence=reasoning_confidence
-        )
+        # 5. Compute loss nếu có labels (training mode)
+        if labels is not None:
+            loss = self.compute_loss(logits, labels)
+            return loss, logits
+        else:
+            return VQAOutput(
+                logits=logits,
+                hidden_states=hidden_states
+            )
     
     @torch.no_grad()
     def generate(
@@ -776,165 +515,65 @@ class DINOv2BARTphoVQA(nn.Module):
         pixel_values,
         input_ids,
         attention_mask,
-        max_reasoning_len=128,
-        max_answer_len=32,
+        max_length=32,
         num_beams=4,
         repetition_penalty=1.2,
         length_penalty=1.0,
-        no_repeat_ngram_size=0,     # 🔥 Thêm: ngăn lặp n-gram
-        early_stopping=True,         # 🔥 Thêm: dừng sớm
-        temperature=1.0,             # 🔥 Thêm: control randomness
-        top_k=50,                    # 🔥 Thêm: top-k sampling
-        top_p=1.0                    # 🔥 Thêm: nucleus sampling
+        early_stopping=True
     ):
         """
-        Inference mode: Generate reasoning → answer using lm_head
-        
-        Strategy:
-        1. Generate reasoning from fused_features (lm_head)
-        2. Generate answer from fused_features + reasoning (lm_head)
-        
-        Same head, different encoder contexts → different outputs
+        Inference mode: Generate answer directly
         
         Args:
             pixel_values: [batch, 3, 224, 224]
             input_ids: [batch, seq_len]
             attention_mask: [batch, seq_len]
-            max_reasoning_len: Max length for reasoning
-            max_answer_len: Max length for answer
+            max_length: Max answer length
             num_beams: Beam search width
-            repetition_penalty: Penalty for repetition (default 1.2)
-            length_penalty: Length penalty (default 1.0)
-            no_repeat_ngram_size: Ngăn lặp n-gram (0 = tắt, 2-3 recommended)
-            early_stopping: Dừng sớm khi đủ beam candidates
-            temperature: Temperature for sampling (1.0 = no change)
-            top_k: Top-k sampling (50 = reasonable)
-            top_p: Nucleus sampling (1.0 = tắt)
+            repetition_penalty: Anti-repetition
+            length_penalty: Length penalty
+            early_stopping: Stop when enough candidates
         Returns:
-            reasoning_text: List[str]
-            answer_text: List[str]
-            reasoning_confidence: Tensor[batch]
+            answer_texts: List[str]
         """
-        batch_size = pixel_values.size(0)
-        device = pixel_values.device
-        
         # 1. Encode
         visual_features = self.encode_image(pixel_values)
         text_features = self.encode_text(input_ids, attention_mask)
         fused_features, _ = self.fuse_multimodal(text_features, visual_features)
         
-        # 2. Generate reasoning using reasoning_decoder
-        reasoning_ids, reasoning_hidden = self.generate_reasoning_autoregressive(
-            fused_features=fused_features,
-            max_length=max_reasoning_len,
-            num_beams=num_beams,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size  # 🔥 Pass parameter
-        )
+        # 2. Generate using decoder.generate() - efficient!
+        batch_size = fused_features.size(0)
         
-        # 🔥 FIX: Decode reasoning từng sample, remove BOS token
-        reasoning_text = []
-        for i in range(batch_size):
-            tokens = reasoning_ids[i].tolist()
-            
-            # Remove BOS token ở đầu
-            if tokens and tokens[0] == self.tokenizer.bos_token_id:
-                tokens = tokens[1:]
-            
-            # Remove EOS và padding
-            if self.tokenizer.eos_token_id in tokens:
-                eos_idx = tokens.index(self.tokenizer.eos_token_id)
-                tokens = tokens[:eos_idx]
-            
-            # Decode clean tokens
-            text = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
-            reasoning_text.append(text)
-        
-        reasoning_confidence = None
-        if self.use_quality_check:
-            reasoning_confidence = self.reasoning_quality_checker(reasoning_hidden)
-        
-        # 3. Generate answer using answer_decoder (conditioned on reasoning only)
-        # Use reasoning_hidden as encoder context (forces dependency!)
-        answer_ids = torch.full(
+        # Create dummy decoder input (BOS tokens)
+        decoder_input_ids = torch.full(
             (batch_size, 1),
             self.tokenizer.bos_token_id,
             dtype=torch.long,
-            device=device
+            device=fused_features.device
         )
         
-        # 🔥 FIX: Track n-grams để ngăn lặp (cho answer)
-        banned_ngrams_ans = [{} for _ in range(batch_size)]
+        # Use decoder's built-in generation
+        generated_ids = self.decoder.generate(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=fused_features,
+            max_length=max_length,
+            num_beams=num_beams,
+            repetition_penalty=repetition_penalty,
+            length_penalty=length_penalty,
+            early_stopping=early_stopping,
+            pad_token_id=self.config.pad_token_id,
+            eos_token_id=self.config.eos_token_id,
+            bos_token_id=self.tokenizer.bos_token_id,
+            use_cache=True  # Enable KV cache for faster generation
+        )
         
-        for step in range(max_answer_len - 1):
-            decoder_outputs = self.answer_decoder(
-                input_ids=answer_ids,
-                encoder_hidden_states=reasoning_hidden,  # ← ONLY reasoning!
-                return_dict=True,
-                use_cache=False
-            )
-            
-            hidden = decoder_outputs.last_hidden_state[:, -1, :]
-            logits = self.lm_head(hidden)
-            
-            if temperature != 1.0:
-                logits = logits / temperature
-            
-            if repetition_penalty != 1.0:
-                for i in range(batch_size):
-                    for token_id in set(answer_ids[i].tolist()):
-                        logits[i, token_id] /= repetition_penalty
-            
-            # 🔥 FIX: Ngăn lặp n-gram cho answer
-            if no_repeat_ngram_size > 0 and step >= no_repeat_ngram_size:
-                for i in range(batch_size):
-                    prefix = tuple(answer_ids[i, -(no_repeat_ngram_size-1):].tolist())
-                    if prefix in banned_ngrams_ans[i]:
-                        for banned_token in banned_ngrams_ans[i][prefix]:
-                            logits[i, banned_token] = float('-inf')
-            
-            if num_beams == 1 and temperature > 0:
-                probs = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = logits.argmax(dim=-1, keepdim=True)
-            
-            # 🔥 FIX: Update banned n-grams
-            if no_repeat_ngram_size > 0:
-                for i in range(batch_size):
-                    if step >= no_repeat_ngram_size - 1:
-                        prefix = tuple(answer_ids[i, -(no_repeat_ngram_size-1):].tolist())
-                        token = next_token[i].item()
-                        if prefix not in banned_ngrams_ans[i]:
-                            banned_ngrams_ans[i][prefix] = set()
-                        banned_ngrams_ans[i][prefix].add(token)
-            
-            answer_ids = torch.cat([answer_ids, next_token], dim=1)
-            
-            if (next_token == self.tokenizer.eos_token_id).all():
-                break
+        # 3. Decode answers
+        answer_texts = []
+        for ids in generated_ids:
+            text = self.tokenizer.decode(ids, skip_special_tokens=True).strip()
+            answer_texts.append(text)
         
-        # 🔥 FIX: Decode từng sample và remove BOS token thủ công
-        answer_text = []
-        for i in range(batch_size):
-            tokens = answer_ids[i].tolist()
-            
-            # Remove BOS token ở đầu (gây ra ký tự rác!)
-            if tokens and tokens[0] == self.tokenizer.bos_token_id:
-                tokens = tokens[1:]
-            
-            # Remove EOS và padding
-            if self.tokenizer.eos_token_id in tokens:
-                eos_idx = tokens.index(self.tokenizer.eos_token_id)
-                tokens = tokens[:eos_idx]
-            
-            # Decode clean tokens
-            text = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
-            answer_text.append(text)
-        
-        return reasoning_text, answer_text, reasoning_confidence
+        return answer_texts
 
 
 # ============================================================================
