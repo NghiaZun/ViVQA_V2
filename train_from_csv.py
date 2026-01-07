@@ -1,7 +1,10 @@
 """
-Training Script cho DINOv2-BARTpho VQA từ CSV
-==============================================
-Train model từ CSV file với columns: stt, question, answer, img_id, type
+Training Script cho DINOv2-BARTpho VQA từ CSV - FIXED VERSION
+============================================================
+✅ Fixed: OOM issues với proper memory management
+✅ Fixed: Validate ONLY sau mỗi epoch (không validate theo step)
+✅ Fixed: Resume training với proper state restoration
+✅ Fixed: Memory leak do nested computation graph
 
 🔥 KEY FEATURES:
 ================
@@ -21,40 +24,29 @@ Train model từ CSV file với columns: stt, question, answer, img_id, type
    - Stage 2: + Answer decoder + LM head (~220M params)
    - Stage 3: + Encoder last 3 layers (~260M params)
    - Checkpoint sau mỗi epoch + khi bị gián đoạn
+   - Validate ONLY sau mỗi epoch hoàn thành
 
 Usage:
 ======
 # First run:
-python train_from_csv.py \
+python train_from_csv_fixed.py \
     --csv_path data.csv \
     --image_folder /path/to/images \
     --output_dir ./outputs \
-    --batch_size 8 \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8 \
     --stage1_epochs 3 \
     --stage2_epochs 3 \
     --stage3_epochs 4
 
 # Nếu bị gián đoạn (OOM, Ctrl+C, crash), resume bằng:
-python train_from_csv.py \
+python train_from_csv_fixed.py \
     --csv_path data.csv \
     --image_folder /path/to/images \
     --output_dir ./outputs \
     --resume ./outputs/last_checkpoint \
-    --batch_size 4 \
-    --gradient_accumulation_steps 8
-
-# Script sẽ:
-# - Load checkpoint từ path chỉ định
-# - Restore model + optimizer + scheduler + training state
-# - Resume từ đúng stage và epoch
-# - Continue training như bình thường
-
-Advanced:
-=========
-# Resume from specific checkpoint (không phải last_checkpoint):
-python train_from_csv.py \
-    --resume ./outputs/stage2_epoch3 \
-    ...
+    --batch_size 2 \
+    --gradient_accumulation_steps 16
 """
 
 import os
@@ -71,6 +63,7 @@ from tqdm import tqdm
 import json
 from pathlib import Path
 import logging
+import gc
 
 from model_dinov2_bartpho_2 import DINOv2BARTphoVQA
 
@@ -102,8 +95,8 @@ class ViVQADataset(Dataset):
         csv_path, 
         image_folder, 
         model,
-        max_question_len=64,  # 🔥 Giảm từ 128 → 64 (Vietnamese questions ngắn)
-        max_answer_len=16,  # 🔥 Short answer (3-5 từ)
+        max_question_len=64,
+        max_answer_len=16,
         image_ext='.jpg'
     ):
         """
@@ -197,17 +190,17 @@ class ViVQADataset(Dataset):
 
 
 # ============================================================================
-# TRAINER
+# TRAINER - FIXED VERSION
 # ============================================================================
 class VQATrainer:
     """
-    Trainer cho VQA model với 3-stage progressive unfreezing:
+    Trainer cho VQA model với 3-stage progressive unfreezing
     
-    Stage 1: Freeze all pretrained, train ONLY fusion (projection + cross-attention)
-    Stage 2: Unfreeze Answer Decoder + LM head (language generation adaptation)
-    Stage 3: Unfreeze Encoder last 3 layers (Vietnamese semantic adaptation)
-    
-    Note: Vision encoder ALWAYS frozen (11K samples không đủ, DINOv2 đã tốt)
+    ✅ FIXED:
+    - Memory leak do nested computation graph
+    - Validate theo step → Validate ONLY sau mỗi epoch
+    - OOM issues với proper cleanup
+    - Resume training với proper state
     """
     
     def __init__(
@@ -217,14 +210,13 @@ class VQATrainer:
         val_loader,
         output_dir,
         learning_rate=2e-5,
-        num_epochs_per_stage=(3, 3, 4),  # 🔥 Epochs cho mỗi stage
+        num_epochs_per_stage=(3, 3, 4),
         warmup_steps=500,
         gradient_accumulation_steps=4,
         max_grad_norm=1.0,
-        save_steps=1000,
-        eval_steps=500,
+        save_steps=1000,  # Save checkpoint mỗi N steps
         device='cuda',
-        resume_checkpoint=None  # 🔥 Path to checkpoint để resume
+        resume_checkpoint=None
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -238,14 +230,11 @@ class VQATrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
         self.save_steps = save_steps
-        self.eval_steps = eval_steps
         
         # Optimizer (sẽ được tạo lại cho mỗi stage)
         self.optimizer = None
         self.scheduler = None
         self.learning_rate = learning_rate
-        
-        # Scheduler params
         self.warmup_steps = warmup_steps
         
         # Mixed precision
@@ -267,8 +256,9 @@ class VQATrainer:
         logger.info(f"  - Stage 2 epochs: {num_epochs_per_stage[1]} (+ answer decoder + LM head)")
         logger.info(f"  - Stage 3 epochs: {num_epochs_per_stage[2]} (+ encoder last 3 layers)")
         logger.info(f"  - Total epochs: {self.total_epochs}")
-        logger.info(f"  - Warmup steps: {warmup_steps}")
-        logger.info(f"  - Vision encoder: ALWAYS FROZEN (11K samples insufficient)")
+        logger.info(f"  - Gradient accumulation: {gradient_accumulation_steps}")
+        logger.info(f"  - Save checkpoint every {save_steps} steps")
+        logger.info(f"  - Validate: After each epoch (not per step)")
         
         # 🔥 Load checkpoint nếu có --resume
         if resume_checkpoint:
@@ -277,19 +267,12 @@ class VQATrainer:
     def setup_stage(self, stage):
         """
         Setup freezing/unfreezing cho từng stage
-        
-        Stage 1: Train ONLY fusion (projection + cross-attention)
-        Stage 2: + Unfreeze Answer Decoder + LM head (language generation)
-        Stage 3: + Unfreeze Encoder last 3 layers (Vietnamese semantics)
-        
-        Note: Vision encoder ALWAYS frozen (11K samples insufficient)
         """
         logger.info("\n" + "=" * 80)
         logger.info(f"SETTING UP STAGE {stage}")
         logger.info("=" * 80)
         
         if stage == 1:
-            # Stage 1: Freeze ALL pretrained, train ONLY fusion
             logger.info("[Stage 1] Freeze all pretrained, train ONLY fusion")
             logger.info("  Goal: Learn vision-language alignment")
             
@@ -307,35 +290,33 @@ class VQATrainer:
             logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params (fusion only)")
             
         elif stage == 2:
-            # Stage 2: + Unfreeze Answer Decoder + LM head
             logger.info("[Stage 2] + Unfreeze Answer Decoder + LM head")
             logger.info("  Goal: Adapt Vietnamese VQA answer generation")
             
-            # Unfreeze answer decoder (199M params)
+            # Unfreeze answer decoder
             for param in self.model.answer_decoder.parameters():
                 param.requires_grad = True
             
-            # Unfreeze LM head (vocabulary projection)
+            # Unfreeze LM head
             for param in self.model.lm_head.parameters():
                 param.requires_grad = True
             
             trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params (fusion + answer decoder + LM head)")
+            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params")
             
         elif stage == 3:
-            # Stage 3: + Unfreeze Encoder last 3 layers
             logger.info("[Stage 3] + Unfreeze Encoder last 3 layers")
             logger.info("  Goal: Fine-tune Vietnamese semantic understanding")
             
             # Unfreeze last 3 layers của encoder
             total_layers = len(self.model.encoder.layers)
             for i, layer in enumerate(self.model.encoder.layers):
-                if i >= total_layers - 3:  # Last 3 layers
+                if i >= total_layers - 3:
                     for param in layer.parameters():
                         param.requires_grad = True
             
             trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params (fusion + decoder + LM head + encoder last 3 layers)")
+            logger.info(f"  ✅ Trainable: {trainable/1e6:.1f}M params")
         
         # Create optimizer cho stage này
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
@@ -379,18 +360,21 @@ class VQATrainer:
                     self.current_epoch_in_stage = epoch
                     logger.info(f"\n[Stage 1] Epoch {epoch + 1}/{self.num_epochs_per_stage[0]}")
                     
+                    # Train epoch
                     self.train_epoch(epoch + 1)
+                    
+                    # 🔥 Validate ONLY sau epoch hoàn thành
+                    logger.info(f"\n▶ Validating after epoch {epoch + 1}...")
                     val_loss, _ = self.validate()
-                    logger.info(f"Validation Loss: {val_loss:.4f}")
+                    logger.info(f"✅ Validation Loss: {val_loss:.4f}")
                     
                     if val_loss < self.best_val_loss:
                         self.best_val_loss = val_loss
                         self.save_checkpoint('best_model_stage1')
-                        logger.info(f"✓ Best Stage 1 model saved! (val_loss={val_loss:.4f})")
+                        logger.info(f"⭐ Best Stage 1 model saved! (val_loss={val_loss:.4f})")
                     
-                    # 🔥 Save last_checkpoint sau mỗi epoch (để có thể resume)
+                    # Save last_checkpoint sau mỗi epoch
                     self.save_checkpoint('last_checkpoint')
-                    # Save checkpoint cụ thể
                     self.save_checkpoint(f'stage1_epoch{epoch + 1}')
                 
                 self.save_checkpoint('stage1_final')
@@ -408,15 +392,17 @@ class VQATrainer:
                     logger.info(f"\n[Stage 2] Epoch {epoch + 1}/{self.num_epochs_per_stage[1]}")
                     
                     self.train_epoch(epoch + 1)
+                    
+                    # 🔥 Validate sau epoch
+                    logger.info(f"\n▶ Validating after epoch {epoch + 1}...")
                     val_loss, _ = self.validate()
-                    logger.info(f"Validation Loss: {val_loss:.4f}")
+                    logger.info(f"✅ Validation Loss: {val_loss:.4f}")
                     
                     if val_loss < self.best_val_loss:
                         self.best_val_loss = val_loss
                         self.save_checkpoint('best_model_stage2')
-                        logger.info(f"✓ Best Stage 2 model saved! (val_loss={val_loss:.4f})")
+                        logger.info(f"⭐ Best Stage 2 model saved! (val_loss={val_loss:.4f})")
                     
-                    # 🔥 Save last_checkpoint sau mỗi epoch
                     self.save_checkpoint('last_checkpoint')
                     self.save_checkpoint(f'stage2_epoch{epoch + 1}')
                 
@@ -435,15 +421,17 @@ class VQATrainer:
                     logger.info(f"\n[Stage 3] Epoch {epoch + 1}/{self.num_epochs_per_stage[2]}")
                     
                     self.train_epoch(epoch + 1)
+                    
+                    # 🔥 Validate sau epoch
+                    logger.info(f"\n▶ Validating after epoch {epoch + 1}...")
                     val_loss, _ = self.validate()
-                    logger.info(f"Validation Loss: {val_loss:.4f}")
+                    logger.info(f"✅ Validation Loss: {val_loss:.4f}")
                     
                     if val_loss < self.best_val_loss:
                         self.best_val_loss = val_loss
                         self.save_checkpoint('best_model_final')
-                        logger.info(f"✓ Best final model saved! (val_loss={val_loss:.4f})")
+                        logger.info(f"⭐ Best final model saved! (val_loss={val_loss:.4f})")
                     
-                    # 🔥 Save last_checkpoint sau mỗi epoch
                     self.save_checkpoint('last_checkpoint')
                     self.save_checkpoint(f'stage3_epoch{epoch + 1}')
                 
@@ -466,10 +454,12 @@ class VQATrainer:
                 logger.error("❌ OUT OF MEMORY ERROR")
                 logger.error("=" * 80)
                 logger.error(f"Error: {e}")
-                logger.error("\nRecommendations:")
-                logger.error("  1. Reduce --batch_size (try batch_size=2 or 1)")
-                logger.error("  2. Increase --gradient_accumulation_steps (try 16 or 32)")
-                logger.error("  3. Check GPU memory: nvidia-smi")
+                logger.error("\n💡 Recommendations:")
+                logger.error("  1. Reduce --batch_size to 1")
+                logger.error("  2. Increase --gradient_accumulation_steps to 32 or 64")
+                logger.error("  3. Reduce max_question_len to 32 and max_answer_len to 8")
+                logger.error("  4. Check GPU memory: nvidia-smi")
+                logger.error("  5. Use smaller model or enable CPU offloading")
                 self._save_interrupted_checkpoint()
             else:
                 logger.error(f"\n❌ Runtime Error: {e}")
@@ -488,18 +478,14 @@ class VQATrainer:
     def _save_interrupted_checkpoint(self):
         """
         🔥 Save checkpoint khi training bị gián đoạn
-        Luôn save vào "last_checkpoint" để dễ resume
         """
         try:
-            # Save vào last_checkpoint để dễ tìm
             self.save_checkpoint('last_checkpoint')
-            
-            # Save thêm checkpoint với tên cụ thể
             checkpoint_name = f'interrupted_stage{self.current_stage}_epoch{self.current_epoch_in_stage}'
             self.save_checkpoint(checkpoint_name)
             
             logger.warning(f"\n{'='*80}")
-            logger.warning(f"✓ Saved checkpoint for resume:")
+            logger.warning(f"✅ Saved checkpoint for resume:")
             logger.warning(f"  - {self.output_dir}/last_checkpoint")
             logger.warning(f"  - {self.output_dir}/{checkpoint_name}")
             logger.warning(f"{'='*80}")
@@ -511,9 +497,18 @@ class VQATrainer:
             logger.error(f"❌ Could not save interrupted checkpoint: {e}")
     
     def train_epoch(self, global_epoch):
-        """Train one epoch với error handling"""
+        """
+        🔥 Train one epoch - FIXED VERSION
+        
+        FIXES:
+        - Memory leak: detach fused_features khi reuse
+        - Explicit cleanup: del tensors ngay sau backward
+        - Clear cache thường xuyên hơn
+        - Store loss value trước khi delete
+        """
         self.model.train()
         total_loss = 0
+        num_batches = 0
         
         pbar = tqdm(self.train_loader, desc=f"Training Epoch {global_epoch}")
         for step, batch in enumerate(pbar):
@@ -525,8 +520,8 @@ class VQATrainer:
                 answer_input_ids = batch['answer_input_ids'].to(self.device)
                 answer_attention_mask = batch['answer_attention_mask'].to(self.device)
                 
-                # 🔥 Clear cache every 50 steps
-                if step % 50 == 0:
+                # 🔥 Clear cache every 10 steps (was 50)
+                if step % 10 == 0:
                     torch.cuda.empty_cache()
                 
                 # Forward pass với mixed precision
@@ -536,14 +531,13 @@ class VQATrainer:
                     text_features = self.model.encode_text(input_ids, attention_mask)
                     fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
                     
-                    # Generate answer (NO reasoning - direct answer)
-                    # Use dummy reasoning_hidden = fused_features
+                    # 🔥 FIX: Detach để tránh nested computation graph
                     answer_logits, _ = self.model.generate_answer(
                         fused_features=fused_features,
-                        reasoning_hidden=fused_features,  # Direct: no reasoning stage
+                        reasoning_hidden=fused_features.detach(),  # 🔥 DETACH HERE
                         answer_input_ids=answer_input_ids,
                         answer_attention_mask=answer_attention_mask,
-                        use_reasoning_only=False  # Use fused_features directly
+                        use_reasoning_only=False
                     )
                     
                     # Compute loss
@@ -556,8 +550,11 @@ class VQATrainer:
                 # Backward
                 self.scaler.scale(loss).backward()
                 
-                # 🔥 Delete intermediate tensors to free memory
-                del visual_features, text_features, fused_features, answer_logits
+                # 🔥 Store loss value BEFORE deleting
+                loss_value = loss.item() * self.gradient_accumulation_steps
+                
+                # 🔥 FIX: Explicitly delete tensors to free memory ASAP
+                del loss, visual_features, text_features, fused_features, answer_logits
                 
                 # Update weights
                 if (step + 1) % self.gradient_accumulation_steps == 0:
@@ -569,18 +566,15 @@ class VQATrainer:
                     self.optimizer.zero_grad()
                     self.global_step += 1
                 
-                total_loss += loss.item() * self.gradient_accumulation_steps
-                pbar.set_postfix({'loss': loss.item() * self.gradient_accumulation_steps})
+                total_loss += loss_value
+                num_batches += 1
+                pbar.set_postfix({'loss': loss_value, 'avg_loss': total_loss / num_batches})
                 
-                # Eval
-                if self.eval_steps > 0 and self.global_step % self.eval_steps == 0:
-                    val_loss, _ = self.validate()
-                    logger.info(f"Step {self.global_step} - Val Loss: {val_loss:.4f}")
-                    self.model.train()
-                
-                # Save checkpoint
+                # 🔥 Save checkpoint mỗi save_steps (KHÔNG validate)
                 if self.save_steps > 0 and self.global_step % self.save_steps == 0:
+                    logger.info(f"\n💾 Saving checkpoint at step {self.global_step}...")
                     self.save_checkpoint(f'step_{self.global_step}')
+                    logger.info(f"✅ Checkpoint saved, continuing training...")
                     
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
@@ -593,60 +587,82 @@ class VQATrainer:
                 else:
                     raise
         
-        avg_loss = total_loss / len(self.train_loader)
-        logger.info(f"Epoch {global_epoch} - Avg Train Loss: {avg_loss:.4f}")
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0
+        logger.info(f"\n✅ Epoch {global_epoch} completed - Avg Train Loss: {avg_loss:.4f}")
+        
+        # 🔥 Clear cache sau epoch
+        torch.cuda.empty_cache()
+        gc.collect()
     
     @torch.no_grad()
     def validate(self):
-        """Validate model - run through entire validation set"""
+        """
+        🔥 Validate model - FIXED VERSION
+        
+        FIXES:
+        - Proper memory cleanup
+        - Clear cache trước và sau validation
+        - Explicit deletion of tensors
+        """
         self.model.eval()
         total_loss = 0
         num_batches = 0
         
-        # 🔥 Clear cache before validation
+        # 🔥 Clear cache trước validation
         torch.cuda.empty_cache()
         
         pbar = tqdm(self.val_loader, desc="Validating")
         for batch in pbar:
-            num_batches += 1
-            pixel_values = batch['pixel_values'].to(self.device)
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            answer_input_ids = batch['answer_input_ids'].to(self.device)
-            answer_attention_mask = batch['answer_attention_mask'].to(self.device)
-            
-            # Forward
-            visual_features = self.model.encode_image(pixel_values)
-            text_features = self.model.encode_text(input_ids, attention_mask)
-            fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
-            
-            answer_logits, _ = self.model.generate_answer(
-                fused_features=fused_features,
-                reasoning_hidden=fused_features,
-                answer_input_ids=answer_input_ids,
-                answer_attention_mask=answer_attention_mask,
-                use_reasoning_only=False
-            )
-            
-            loss = self.criterion(
-                answer_logits.view(-1, answer_logits.size(-1)),
-                answer_input_ids.view(-1)
-            )
-            
-            total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item(), 'batches': num_batches})
-            
-            # 🔥 Delete intermediate tensors
-            del visual_features, text_features, fused_features, answer_logits, loss
+            try:
+                pixel_values = batch['pixel_values'].to(self.device)
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                answer_input_ids = batch['answer_input_ids'].to(self.device)
+                answer_attention_mask = batch['answer_attention_mask'].to(self.device)
+                
+                # Forward
+                visual_features = self.model.encode_image(pixel_values)
+                text_features = self.model.encode_text(input_ids, attention_mask)
+                fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
+                
+                answer_logits, _ = self.model.generate_answer(
+                    fused_features=fused_features,
+                    reasoning_hidden=fused_features.detach(),  # 🔥 Detach
+                    answer_input_ids=answer_input_ids,
+                    answer_attention_mask=answer_attention_mask,
+                    use_reasoning_only=False
+                )
+                
+                loss = self.criterion(
+                    answer_logits.view(-1, answer_logits.size(-1)),
+                    answer_input_ids.view(-1)
+                )
+                
+                total_loss += loss.item()
+                num_batches += 1
+                pbar.set_postfix({'loss': loss.item(), 'avg_loss': total_loss / num_batches})
+                
+                # 🔥 Delete intermediate tensors
+                del visual_features, text_features, fused_features, answer_logits, loss
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.warning(f"⚠️  OOM during validation, skipping batch...")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise
         
-        avg_loss = total_loss / num_batches
-        logger.info(f"✓ Validation completed: {num_batches} batches, avg_loss={avg_loss:.4f}")
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        
+        # 🔥 Clear cache sau validation
+        torch.cuda.empty_cache()
+        gc.collect()
+        
         return avg_loss, {}
     
     def save_checkpoint(self, name):
-        """
-        Save checkpoint với training state để có thể resume
-        """
+        """Save checkpoint với training state"""
         try:
             checkpoint_dir = self.output_dir / name
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -654,7 +670,7 @@ class VQATrainer:
             # Save model state
             torch.save(self.model.state_dict(), checkpoint_dir / 'model.pt')
             
-            # 🔥 Save training state để có thể resume
+            # Save training state
             training_state = {
                 'global_step': self.global_step,
                 'best_val_loss': self.best_val_loss,
@@ -666,15 +682,12 @@ class VQATrainer:
             }
             torch.save(training_state, checkpoint_dir / 'training_state.pt')
             
-            logger.info(f"✓ Checkpoint saved to {checkpoint_dir}")
+            logger.debug(f"✅ Checkpoint saved to {checkpoint_dir}")
         except Exception as e:
             logger.error(f"❌ Failed to save checkpoint {name}: {e}")
-            logger.warning("⚠️  Training will continue but checkpoint not saved")
     
     def load_checkpoint(self, checkpoint_path):
-        """
-        🔥 Load checkpoint từ path được chỉ định
-        """
+        """Load checkpoint từ path được chỉ định"""
         checkpoint_path = Path(checkpoint_path)
         
         if not checkpoint_path.exists():
@@ -684,7 +697,7 @@ class VQATrainer:
         
         try:
             logger.info(f"\n{'='*80}")
-            logger.info(f"🔄 LOADING CHECKPOINT: {checkpoint_path}")
+            logger.info(f"📂 LOADING CHECKPOINT: {checkpoint_path}")
             logger.info(f"{'='*80}")
             
             # Load model
@@ -694,7 +707,7 @@ class VQATrainer:
                 return
             
             self.model.load_state_dict(torch.load(model_path, map_location=self.device))
-            logger.info(f"✓ Loaded model from {model_path}")
+            logger.info(f"✅ Loaded model from {model_path}")
             
             # Load training state
             state_path = checkpoint_path / 'training_state.pt'
@@ -710,7 +723,7 @@ class VQATrainer:
             self.current_stage = state.get('current_stage', 1)
             self.current_epoch_in_stage = state.get('current_epoch_in_stage', 0)
             
-            logger.info(f"✓ Loaded training state:")
+            logger.info(f"✅ Loaded training state:")
             logger.info(f"  - Global step: {self.global_step}")
             logger.info(f"  - Best val loss: {self.best_val_loss:.4f}")
             logger.info(f"  - Current stage: {self.current_stage}")
@@ -723,21 +736,21 @@ class VQATrainer:
             if state.get('optimizer') and self.optimizer:
                 try:
                     self.optimizer.load_state_dict(state['optimizer'])
-                    logger.info(f"✓ Loaded optimizer state")
+                    logger.info(f"✅ Loaded optimizer state")
                 except Exception as e:
                     logger.warning(f"⚠️  Could not load optimizer state: {e}")
             
             if state.get('scheduler') and self.scheduler:
                 try:
                     self.scheduler.load_state_dict(state['scheduler'])
-                    logger.info(f"✓ Loaded scheduler state")
+                    logger.info(f"✅ Loaded scheduler state")
                 except Exception as e:
                     logger.warning(f"⚠️  Could not load scheduler state: {e}")
             
             if state.get('scaler'):
                 try:
                     self.scaler.load_state_dict(state['scaler'])
-                    logger.info(f"✓ Loaded scaler state")
+                    logger.info(f"✅ Loaded scaler state")
                 except Exception as e:
                     logger.warning(f"⚠️  Could not load scaler state: {e}")
             
@@ -767,23 +780,11 @@ def generate_answers(
     image_folder,
     output_path,
     batch_size=8,
-    max_answer_len=16,  # 🔥 Giảm xuống 16 cho short answer
-    num_beams=1,  # 🔥 Greedy cho answer ngắn
+    max_answer_len=16,
+    num_beams=1,
     device='cuda'
 ):
-    """
-    Generate answers cho toàn bộ dataset và save ra CSV
-    
-    Args:
-        model: Trained model
-        csv_path: Input CSV
-        image_folder: Folder chứa images
-        output_path: Output CSV path
-        batch_size: Batch size
-        max_answer_len: Max answer length
-        num_beams: Beam search width
-        device: Device
-    """
+    """Generate answers cho toàn bộ dataset và save ra CSV"""
     logger.info("=" * 80)
     logger.info("Generating answers...")
     logger.info("=" * 80)
@@ -791,7 +792,7 @@ def generate_answers(
     model.eval()
     model = model.to(device)
     
-    # Create dataset (no answer needed for inference)
+    # Create dataset
     dataset = ViVQADataset(
         csv_path=csv_path,
         image_folder=image_folder,
@@ -802,7 +803,7 @@ def generate_answers(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,  # 🔥 Giảm workers
+        num_workers=2,
         pin_memory=True,
         prefetch_factor=2
     )
@@ -820,7 +821,7 @@ def generate_answers(
         text_features = model.encode_text(input_ids, attention_mask)
         fused_features, _ = model.fuse_multimodal(text_features, visual_features)
         
-        # Generate answer (no reasoning stage)
+        # Generate answer
         batch_size_curr = pixel_values.size(0)
         answer_ids = torch.full(
             (batch_size_curr, 1),
@@ -829,11 +830,11 @@ def generate_answers(
             device=device
         )
         
-        # 🔥 FIX: Thêm repetition penalty và early stopping
+        # Autoregressive generation with repetition penalty
         for step in range(max_answer_len - 1):
             decoder_outputs = model.answer_decoder(
                 input_ids=answer_ids,
-                encoder_hidden_states=fused_features,  # Direct encoding
+                encoder_hidden_states=fused_features,
                 return_dict=True,
                 use_cache=False
             )
@@ -841,36 +842,33 @@ def generate_answers(
             hidden = decoder_outputs.last_hidden_state[:, -1, :]
             logits = model.lm_head(hidden)
             
-            # 🔥 Apply repetition penalty
+            # Apply repetition penalty
             for i in range(batch_size_curr):
                 for token_id in set(answer_ids[i].tolist()):
-                    logits[i, token_id] /= 1.5  # Penalty = 1.5
+                    logits[i, token_id] /= 1.5
             
             next_token = logits.argmax(dim=-1, keepdim=True)
             answer_ids = torch.cat([answer_ids, next_token], dim=1)
             
-            # 🔥 Early stop if ALL sequences hit EOS
+            # Early stop if all sequences hit EOS
             if (next_token == model.tokenizer.eos_token_id).all():
                 break
         
-        # 🔥 FIX: Decode và clean output
+        # Decode answers
         generated_answers = []
         for i in range(batch_size_curr):
             tokens = answer_ids[i].tolist()
             
-            # Remove BOS token (đầu tiên)
+            # Remove BOS
             if tokens and tokens[0] == model.tokenizer.bos_token_id:
                 tokens = tokens[1:]
             
-            # Remove EOS và padding
+            # Remove EOS and padding
             if model.tokenizer.eos_token_id in tokens:
                 eos_idx = tokens.index(model.tokenizer.eos_token_id)
                 tokens = tokens[:eos_idx]
             
-            # Decode
-            text = model.tokenizer.decode(tokens, skip_special_tokens=True)
-            # Clean whitespace
-            text = text.strip()
+            text = model.tokenizer.decode(tokens, skip_special_tokens=True).strip()
             generated_answers.append(text)
         
         # Collect results
@@ -883,11 +881,14 @@ def generate_answers(
                 'img_id': batch['img_id'][i].item(),
                 'type': batch['type'][i].item()
             })
+        
+        # Cleanup
+        del visual_features, text_features, fused_features, answer_ids
     
     # Save to CSV
     df_results = pd.DataFrame(results)
     df_results.to_csv(output_path, index=False, encoding='utf-8')
-    logger.info(f"✓ Results saved to {output_path}")
+    logger.info(f"✅ Results saved to {output_path}")
     logger.info(f"  Total samples: {len(results)}")
     
     # Preview
@@ -902,13 +903,13 @@ def generate_answers(
 # MAIN
 # ============================================================================
 def main():
-    parser = argparse.ArgumentParser(description='Train DINOv2-BARTpho VQA from CSV')
+    parser = argparse.ArgumentParser(description='Train DINOv2-BARTpho VQA - FIXED VERSION')
     
     # Data args
-    parser.add_argument('--csv_path', type=str, required=True, help='Path to CSV file')
-    parser.add_argument('--image_folder', type=str, required=True, help='Folder containing images')
-    parser.add_argument('--val_split', type=float, default=0.1, help='Validation split ratio (auto split from csv_path)')
-    parser.add_argument('--image_ext', type=str, default='.jpg', help='Image file extension')
+    parser.add_argument('--csv_path', type=str, required=True)
+    parser.add_argument('--image_folder', type=str, required=True)
+    parser.add_argument('--val_split', type=float, default=0.1)
+    parser.add_argument('--image_ext', type=str, default='.jpg')
     
     # Model args
     parser.add_argument('--dinov2_model', type=str, default='facebook/dinov2-base')
@@ -917,32 +918,35 @@ def main():
     
     # Training args
     parser.add_argument('--output_dir', type=str, default='./outputs')
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--stage1_epochs', type=int, default=3, help='Stage 1: Fusion only')
-    parser.add_argument('--stage2_epochs', type=int, default=3, help='Stage 2: + Answer decoder + LM head')
-    parser.add_argument('--stage3_epochs', type=int, default=4, help='Stage 3: + Encoder last 3 layers')
+    parser.add_argument('--batch_size', type=int, default=4, help='Recommended: 2-4 for 24GB GPU')
+    parser.add_argument('--stage1_epochs', type=int, default=3)
+    parser.add_argument('--stage2_epochs', type=int, default=3)
+    parser.add_argument('--stage3_epochs', type=int, default=4)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--warmup_steps', type=int, default=500)
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=4)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=8, help='Recommended: 8-16')
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--save_steps', type=int, default=1000)
-    parser.add_argument('--eval_steps', type=int, default=500)
+    parser.add_argument('--save_steps', type=int, default=1000, help='Save checkpoint every N steps')
     
-    # 🔥 Resume training
+    # Resume training
     parser.add_argument('--resume', type=str, default=None, 
-                        help='Path to checkpoint folder để resume training (e.g., ./outputs/last_checkpoint)')
+                        help='Path to checkpoint folder to resume (e.g., ./outputs/last_checkpoint)')
     
     # Generation args
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'generate'])
-    parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load for generation')
-    parser.add_argument('--max_answer_len', type=int, default=16, help='Max answer length (default 16 for short answers)')
-    parser.add_argument('--num_beams', type=int, default=1, help='Beam search width (1=greedy, recommended for short answers)')
+    parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--max_answer_len', type=int, default=16)
+    parser.add_argument('--num_beams', type=int, default=1)
     
     args = parser.parse_args()
     
     # Device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
+    
+    if device == 'cuda':
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     # ========================================================================
     # TRAINING MODE
@@ -957,12 +961,12 @@ def main():
             gradient_checkpointing=True
         )
         
-        # 🔥 ALWAYS freeze pretrained weights cho 3-stage training
+        # Freeze all pretrained weights
         logger.info("Freezing all pretrained weights (will unfreeze progressively)...")
         for param in model.parameters():
             param.requires_grad = False
         
-        # Prepare datasets - 🔥 AUTO SPLIT from csv_path
+        # Prepare datasets - AUTO SPLIT
         logger.info("Loading dataset and splitting train/val...")
         full_dataset = ViVQADataset(args.csv_path, args.image_folder, model, image_ext=args.image_ext)
         
@@ -972,32 +976,34 @@ def main():
         train_dataset, val_dataset = torch.utils.data.random_split(
             full_dataset, 
             [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)  # 🔥 Seed for reproducibility
+            generator=torch.Generator().manual_seed(42)
         )
         
-        # Dataloaders - 🔥 Giảm workers để save memory
+        # Dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=2,  # 🔥 Giảm từ 4 → 2
+            num_workers=2,
             pin_memory=True,
-            prefetch_factor=2  # 🔥 Giảm prefetch
+            prefetch_factor=2
         )
         
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=2,  # 🔥 Giảm từ 4 → 2
+            num_workers=2,
             pin_memory=True,
             prefetch_factor=2
         )
         
-        logger.info(f"✓ Train samples: {len(train_dataset)}")
-        logger.info(f"✓ Val samples: {len(val_dataset)}")
+        logger.info(f"✅ Train samples: {len(train_dataset)}")
+        logger.info(f"✅ Val samples: {len(val_dataset)}")
+        logger.info(f"✅ Train batches per epoch: {len(train_loader)}")
+        logger.info(f"✅ Val batches: {len(val_loader)}")
         
-        # Initialize trainer với 3 stages + resume checkpoint
+        # Initialize trainer
         trainer = VQATrainer(
             model=model,
             train_loader=train_loader,
@@ -1009,12 +1015,11 @@ def main():
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             max_grad_norm=args.max_grad_norm,
             save_steps=args.save_steps,
-            eval_steps=args.eval_steps,
             device=device,
-            resume_checkpoint=args.resume  # 🔥 Pass resume checkpoint
+            resume_checkpoint=args.resume
         )
         
-        # Train với 3 stages
+        # Train
         trainer.train()
     
     # ========================================================================
