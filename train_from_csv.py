@@ -3,13 +3,58 @@ Training Script cho DINOv2-BARTpho VQA từ CSV
 ==============================================
 Train model từ CSV file với columns: stt, question, answer, img_id, type
 
+🔥 KEY FEATURES:
+================
+1. Resume Training:
+   - Sử dụng --resume để load checkpoint và continue training
+   - Tự động restore: model, optimizer, scheduler, training state
+   - Resume từ đúng stage và epoch bị gián đoạn
+
+2. Error Handling:
+   - Catch OOM errors → Save checkpoint + Recommendations
+   - Catch KeyboardInterrupt (Ctrl+C) → Save checkpoint
+   - Catch unexpected errors → Save checkpoint + Traceback
+   - Always save "last_checkpoint" để có thể resume
+
+3. 3-Stage Progressive Training:
+   - Stage 1: Fusion only (~20M params)
+   - Stage 2: + Answer decoder + LM head (~220M params)
+   - Stage 3: + Encoder last 3 layers (~260M params)
+   - Checkpoint sau mỗi epoch + khi bị gián đoạn
+
 Usage:
-    python train_from_csv.py \
-        --csv_path data.csv \
-        --image_folder /path/to/images \
-        --output_dir ./outputs \
-        --batch_size 8 \
-        --num_epochs 10
+======
+# First run:
+python train_from_csv.py \
+    --csv_path data.csv \
+    --image_folder /path/to/images \
+    --output_dir ./outputs \
+    --batch_size 8 \
+    --stage1_epochs 3 \
+    --stage2_epochs 3 \
+    --stage3_epochs 4
+
+# Nếu bị gián đoạn (OOM, Ctrl+C, crash), resume bằng:
+python train_from_csv.py \
+    --csv_path data.csv \
+    --image_folder /path/to/images \
+    --output_dir ./outputs \
+    --resume ./outputs/last_checkpoint \
+    --batch_size 4 \
+    --gradient_accumulation_steps 8
+
+# Script sẽ:
+# - Load checkpoint từ path chỉ định
+# - Restore model + optimizer + scheduler + training state
+# - Resume từ đúng stage và epoch
+# - Continue training như bình thường
+
+Advanced:
+=========
+# Resume from specific checkpoint (không phải last_checkpoint):
+python train_from_csv.py \
+    --resume ./outputs/stage2_epoch3 \
+    ...
 """
 
 import os
@@ -178,7 +223,8 @@ class VQATrainer:
         max_grad_norm=1.0,
         save_steps=1000,
         eval_steps=500,
-        device='cuda'
+        device='cuda',
+        resume_checkpoint=None  # 🔥 Path to checkpoint để resume
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -211,6 +257,8 @@ class VQATrainer:
         # Metrics
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.current_stage = 1
+        self.current_epoch_in_stage = 0
         
         logger.info(f"Trainer initialized:")
         logger.info(f"  - Device: {device}")
@@ -221,6 +269,10 @@ class VQATrainer:
         logger.info(f"  - Total epochs: {self.total_epochs}")
         logger.info(f"  - Warmup steps: {warmup_steps}")
         logger.info(f"  - Vision encoder: ALWAYS FROZEN (11K samples insufficient)")
+        
+        # 🔥 Load checkpoint nếu có --resume
+        if resume_checkpoint:
+            self.load_checkpoint(resume_checkpoint)
     
     def setup_stage(self, stage):
         """
@@ -308,143 +360,244 @@ class VQATrainer:
         logger.info("=" * 80 + "\n")
     
     def train(self):
-        """Main training loop với 3 stages"""
+        """
+        🔥 Main training loop với 3 stages + Error handling + Auto-resume
+        """
         logger.info("=" * 80)
         logger.info("Starting 3-Stage Training...")
         logger.info("=" * 80)
         
-        epoch_counter = 0
-        
-        # Stage 1: Fusion only
-        self.setup_stage(1)
-        for epoch in range(self.num_epochs_per_stage[0]):
-            epoch_counter += 1
-            logger.info(f"\n[Stage 1] Epoch {epoch + 1}/{self.num_epochs_per_stage[0]} (Global: {epoch_counter}/{self.total_epochs})")
-            self.train_epoch(epoch_counter)
-            val_loss, _ = self.validate()
-            logger.info(f"Validation Loss: {val_loss:.4f}")
+        try:
+            # Stage 1: Fusion only
+            if self.current_stage <= 1:
+                logger.info(f"\n🔥 STAGE 1: FUSION ONLY")
+                if self.current_stage < 1 or self.current_epoch_in_stage == 0:
+                    self.setup_stage(1)
+                    self.current_stage = 1
+                
+                for epoch in range(self.current_epoch_in_stage, self.num_epochs_per_stage[0]):
+                    self.current_epoch_in_stage = epoch
+                    logger.info(f"\n[Stage 1] Epoch {epoch + 1}/{self.num_epochs_per_stage[0]}")
+                    
+                    self.train_epoch(epoch + 1)
+                    val_loss, _ = self.validate()
+                    logger.info(f"Validation Loss: {val_loss:.4f}")
+                    
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint('best_model_stage1')
+                        logger.info(f"✓ Best Stage 1 model saved! (val_loss={val_loss:.4f})")
+                    
+                    # 🔥 Save last_checkpoint sau mỗi epoch (để có thể resume)
+                    self.save_checkpoint('last_checkpoint')
+                    # Save checkpoint cụ thể
+                    self.save_checkpoint(f'stage1_epoch{epoch + 1}')
+                
+                self.save_checkpoint('stage1_final')
+                self.current_stage = 2
+                self.current_epoch_in_stage = 0
             
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.save_checkpoint('best_model_stage1')
-                logger.info(f"✓ Best Stage 1 model saved! (val_loss={val_loss:.4f})")
-        
-        self.save_checkpoint('stage1_final')
-        
-        # Stage 2: + LM head
-        self.setup_stage(2)
-        for epoch in range(self.num_epochs_per_stage[1]):
-            epoch_counter += 1
-            logger.info(f"\n[Stage 2] Epoch {epoch + 1}/{self.num_epochs_per_stage[1]} (Global: {epoch_counter}/{self.total_epochs})")
-            self.train_epoch(epoch_counter)
-            val_loss, _ = self.validate()
-            logger.info(f"Validation Loss: {val_loss:.4f}")
+            # Stage 2: + Answer Decoder + LM head
+            if self.current_stage <= 2:
+                logger.info(f"\n🔥 STAGE 2: + ANSWER DECODER + LM HEAD")
+                if self.current_epoch_in_stage == 0:
+                    self.setup_stage(2)
+                
+                for epoch in range(self.current_epoch_in_stage, self.num_epochs_per_stage[1]):
+                    self.current_epoch_in_stage = epoch
+                    logger.info(f"\n[Stage 2] Epoch {epoch + 1}/{self.num_epochs_per_stage[1]}")
+                    
+                    self.train_epoch(epoch + 1)
+                    val_loss, _ = self.validate()
+                    logger.info(f"Validation Loss: {val_loss:.4f}")
+                    
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint('best_model_stage2')
+                        logger.info(f"✓ Best Stage 2 model saved! (val_loss={val_loss:.4f})")
+                    
+                    # 🔥 Save last_checkpoint sau mỗi epoch
+                    self.save_checkpoint('last_checkpoint')
+                    self.save_checkpoint(f'stage2_epoch{epoch + 1}')
+                
+                self.save_checkpoint('stage2_final')
+                self.current_stage = 3
+                self.current_epoch_in_stage = 0
             
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.save_checkpoint('best_model_stage2')
-                logger.info(f"✓ Best Stage 2 model saved! (val_loss={val_loss:.4f})")
-        
-        self.save_checkpoint('stage2_final')
-        
-        # Stage 3: + Vision projection
-        self.setup_stage(3)
-        for epoch in range(self.num_epochs_per_stage[2]):
-            epoch_counter += 1
-            logger.info(f"\n[Stage 3] Epoch {epoch + 1}/{self.num_epochs_per_stage[2]} (Global: {epoch_counter}/{self.total_epochs})")
-            self.train_epoch(epoch_counter)
-            val_loss, _ = self.validate()
-            logger.info(f"Validation Loss: {val_loss:.4f}")
+            # Stage 3: + Encoder last 3 layers
+            if self.current_stage <= 3:
+                logger.info(f"\n🔥 STAGE 3: + ENCODER LAST 3 LAYERS")
+                if self.current_epoch_in_stage == 0:
+                    self.setup_stage(3)
+                
+                for epoch in range(self.current_epoch_in_stage, self.num_epochs_per_stage[2]):
+                    self.current_epoch_in_stage = epoch
+                    logger.info(f"\n[Stage 3] Epoch {epoch + 1}/{self.num_epochs_per_stage[2]}")
+                    
+                    self.train_epoch(epoch + 1)
+                    val_loss, _ = self.validate()
+                    logger.info(f"Validation Loss: {val_loss:.4f}")
+                    
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint('best_model_final')
+                        logger.info(f"✓ Best final model saved! (val_loss={val_loss:.4f})")
+                    
+                    # 🔥 Save last_checkpoint sau mỗi epoch
+                    self.save_checkpoint('last_checkpoint')
+                    self.save_checkpoint(f'stage3_epoch{epoch + 1}')
+                
+                self.save_checkpoint('stage3_final')
             
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.save_checkpoint('best_model_final')
-                logger.info(f"✓ Best final model saved! (val_loss={val_loss:.4f})")
-        
-        self.save_checkpoint('stage3_final')
-        
-        logger.info("\n" + "=" * 80)
-        logger.info("3-Stage Training completed!")
-        logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
-        logger.info("=" * 80)
+            logger.info("\n" + "=" * 80)
+            logger.info("✅ 3-Stage Training completed!")
+            logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+            logger.info("=" * 80)
+            
+        except KeyboardInterrupt:
+            logger.warning("\n" + "=" * 80)
+            logger.warning("⚠️  Training interrupted by user (Ctrl+C)")
+            logger.warning("=" * 80)
+            self._save_interrupted_checkpoint()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error("\n" + "=" * 80)
+                logger.error("❌ OUT OF MEMORY ERROR")
+                logger.error("=" * 80)
+                logger.error(f"Error: {e}")
+                logger.error("\nRecommendations:")
+                logger.error("  1. Reduce --batch_size (try batch_size=2 or 1)")
+                logger.error("  2. Increase --gradient_accumulation_steps (try 16 or 32)")
+                logger.error("  3. Check GPU memory: nvidia-smi")
+                self._save_interrupted_checkpoint()
+            else:
+                logger.error(f"\n❌ Runtime Error: {e}")
+                self._save_interrupted_checkpoint()
+                raise
+            
+        except Exception as e:
+            logger.error("\n" + "=" * 80)
+            logger.error(f"❌ UNEXPECTED ERROR: {e}")
+            logger.error("=" * 80)
+            import traceback
+            logger.error(traceback.format_exc())
+            self._save_interrupted_checkpoint()
+            raise
+    
+    def _save_interrupted_checkpoint(self):
+        """
+        🔥 Save checkpoint khi training bị gián đoạn
+        Luôn save vào "last_checkpoint" để dễ resume
+        """
+        try:
+            # Save vào last_checkpoint để dễ tìm
+            self.save_checkpoint('last_checkpoint')
+            
+            # Save thêm checkpoint với tên cụ thể
+            checkpoint_name = f'interrupted_stage{self.current_stage}_epoch{self.current_epoch_in_stage}'
+            self.save_checkpoint(checkpoint_name)
+            
+            logger.warning(f"\n{'='*80}")
+            logger.warning(f"✓ Saved checkpoint for resume:")
+            logger.warning(f"  - {self.output_dir}/last_checkpoint")
+            logger.warning(f"  - {self.output_dir}/{checkpoint_name}")
+            logger.warning(f"{'='*80}")
+            logger.warning(f"\n📌 To resume training, use:")
+            logger.warning(f"   --resume {self.output_dir}/last_checkpoint")
+            logger.warning(f"\n   Training will continue from Stage {self.current_stage}, Epoch {self.current_epoch_in_stage + 1}")
+            logger.warning(f"{'='*80}\n")
+        except Exception as e:
+            logger.error(f"❌ Could not save interrupted checkpoint: {e}")
     
     def train_epoch(self, global_epoch):
-        """Train one epoch"""
+        """Train one epoch với error handling"""
         self.model.train()
         total_loss = 0
         
         pbar = tqdm(self.train_loader, desc=f"Training Epoch {global_epoch}")
         for step, batch in enumerate(pbar):
-            # Move to device
-            pixel_values = batch['pixel_values'].to(self.device)
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            answer_input_ids = batch['answer_input_ids'].to(self.device)
-            answer_attention_mask = batch['answer_attention_mask'].to(self.device)
-            
-            # 🔥 Clear cache every 50 steps
-            if step % 50 == 0:
-                torch.cuda.empty_cache()
-            
-            # Forward pass với mixed precision
-            with autocast():
-                # Encode image + question
-                visual_features = self.model.encode_image(pixel_values)
-                text_features = self.model.encode_text(input_ids, attention_mask)
-                fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
+            try:
+                # Move to device
+                pixel_values = batch['pixel_values'].to(self.device)
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                answer_input_ids = batch['answer_input_ids'].to(self.device)
+                answer_attention_mask = batch['answer_attention_mask'].to(self.device)
                 
-                # Generate answer (NO reasoning - direct answer)
-                # Use dummy reasoning_hidden = fused_features
-                answer_logits, _ = self.model.generate_answer(
-                    fused_features=fused_features,
-                    reasoning_hidden=fused_features,  # Direct: no reasoning stage
-                    answer_input_ids=answer_input_ids,
-                    answer_attention_mask=answer_attention_mask,
-                    use_reasoning_only=False  # Use fused_features directly
-                )
+                # 🔥 Clear cache every 50 steps
+                if step % 50 == 0:
+                    torch.cuda.empty_cache()
                 
-                # Compute loss
-                loss = self.criterion(
-                    answer_logits.view(-1, answer_logits.size(-1)),
-                    answer_input_ids.view(-1)
-                )
-                loss = loss / self.gradient_accumulation_steps
-            
-            # Backward
-            self.scaler.scale(loss).backward()
-            
-            # 🔥 Delete intermediate tensors to free memory
-            del visual_features, text_features, fused_features, answer_logits
-            
-            # Update weights
-            if (step + 1) % self.gradient_accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
-                self.global_step += 1
-            
-            total_loss += loss.item() * self.gradient_accumulation_steps
-            pbar.set_postfix({'loss': loss.item() * self.gradient_accumulation_steps})
-            
-            # Eval
-            if self.eval_steps > 0 and self.global_step % self.eval_steps == 0:
-                val_loss, _ = self.validate()
-                logger.info(f"Step {self.global_step} - Val Loss: {val_loss:.4f}")
-                self.model.train()
-            
-            # Save checkpoint
-            if self.save_steps > 0 and self.global_step % self.save_steps == 0:
-                self.save_checkpoint(f'step_{self.global_step}')
+                # Forward pass với mixed precision
+                with autocast():
+                    # Encode image + question
+                    visual_features = self.model.encode_image(pixel_values)
+                    text_features = self.model.encode_text(input_ids, attention_mask)
+                    fused_features, _ = self.model.fuse_multimodal(text_features, visual_features)
+                    
+                    # Generate answer (NO reasoning - direct answer)
+                    # Use dummy reasoning_hidden = fused_features
+                    answer_logits, _ = self.model.generate_answer(
+                        fused_features=fused_features,
+                        reasoning_hidden=fused_features,  # Direct: no reasoning stage
+                        answer_input_ids=answer_input_ids,
+                        answer_attention_mask=answer_attention_mask,
+                        use_reasoning_only=False  # Use fused_features directly
+                    )
+                    
+                    # Compute loss
+                    loss = self.criterion(
+                        answer_logits.view(-1, answer_logits.size(-1)),
+                        answer_input_ids.view(-1)
+                    )
+                    loss = loss / self.gradient_accumulation_steps
+                
+                # Backward
+                self.scaler.scale(loss).backward()
+                
+                # 🔥 Delete intermediate tensors to free memory
+                del visual_features, text_features, fused_features, answer_logits
+                
+                # Update weights
+                if (step + 1) % self.gradient_accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    self.global_step += 1
+                
+                total_loss += loss.item() * self.gradient_accumulation_steps
+                pbar.set_postfix({'loss': loss.item() * self.gradient_accumulation_steps})
+                
+                # Eval
+                if self.eval_steps > 0 and self.global_step % self.eval_steps == 0:
+                    val_loss, _ = self.validate()
+                    logger.info(f"Step {self.global_step} - Val Loss: {val_loss:.4f}")
+                    self.model.train()
+                
+                # Save checkpoint
+                if self.save_steps > 0 and self.global_step % self.save_steps == 0:
+                    self.save_checkpoint(f'step_{self.global_step}')
+                    
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.error(f"\n❌ OOM at step {step}/{len(self.train_loader)}")
+                    logger.error("Skipping this batch and clearing cache...")
+                    torch.cuda.empty_cache()
+                    if hasattr(self, 'optimizer'):
+                        self.optimizer.zero_grad()
+                    continue
+                else:
+                    raise
         
         avg_loss = total_loss / len(self.train_loader)
         logger.info(f"Epoch {global_epoch} - Avg Train Loss: {avg_loss:.4f}")
     
     @torch.no_grad()
     def validate(self):
-        """Validate model"""
         self.model.eval()
         total_loss = 0
         
@@ -478,31 +631,127 @@ class VQATrainer:
             )
             
             total_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            pbar.set_postfix({'loss': loss.item(), 'batches': num_batches})
             
             # 🔥 Delete intermediate tensors
             del visual_features, text_features, fused_features, answer_logits, loss
         
-        avg_loss = total_loss / len(self.val_loader)
+        avg_loss = total_loss / num_batches
+        logger.info(f"✓ Validation completed: {num_batches} batches, avg_loss={avg_loss:.4f}")
         return avg_loss, {}
     
     def save_checkpoint(self, name):
-        """Save checkpoint"""
-        checkpoint_dir = self.output_dir / name
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        """
+        Save checkpoint với training state để có thể resume
+        """
+        try:
+            checkpoint_dir = self.output_dir / name
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Save model state
+            torch.save(self.model.state_dict(), checkpoint_dir / 'model.pt')
+            
+            # 🔥 Save training state để có thể resume
+            training_state = {
+                'global_step': self.global_step,
+                'best_val_loss': self.best_val_loss,
+                'current_stage': self.current_stage,
+                'current_epoch_in_stage': self.current_epoch_in_stage,
+                'optimizer': self.optimizer.state_dict() if self.optimizer else None,
+                'scheduler': self.scheduler.state_dict() if self.scheduler else None,
+                'scaler': self.scaler.state_dict(),
+            }
+            torch.save(training_state, checkpoint_dir / 'training_state.pt')
+            
+            logger.info(f"✓ Checkpoint saved to {checkpoint_dir}")
+        except Exception as e:
+            logger.error(f"❌ Failed to save checkpoint {name}: {e}")
+            logger.warning("⚠️  Training will continue but checkpoint not saved")
+    
+    def load_checkpoint(self, checkpoint_path):
+        """
+        🔥 Load checkpoint từ path được chỉ định
+        """
+        checkpoint_path = Path(checkpoint_path)
         
-        # Save model state
-        torch.save(self.model.state_dict(), checkpoint_dir / 'model.pt')
+        if not checkpoint_path.exists():
+            logger.error(f"❌ Checkpoint not found: {checkpoint_path}")
+            logger.warning("⚠️  Starting training from scratch")
+            return
         
-        # Save optimizer & scheduler
-        torch.save({
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'global_step': self.global_step,
-            'best_val_loss': self.best_val_loss
-        }, checkpoint_dir / 'training_state.pt')
-        
-        logger.info(f"Checkpoint saved to {checkpoint_dir}")
+        try:
+            logger.info(f"\n{'='*80}")
+            logger.info(f"🔄 LOADING CHECKPOINT: {checkpoint_path}")
+            logger.info(f"{'='*80}")
+            
+            # Load model
+            model_path = checkpoint_path / 'model.pt'
+            if not model_path.exists():
+                logger.error(f"❌ Model file not found: {model_path}")
+                return
+            
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            logger.info(f"✓ Loaded model from {model_path}")
+            
+            # Load training state
+            state_path = checkpoint_path / 'training_state.pt'
+            if not state_path.exists():
+                logger.warning(f"⚠️  Training state not found: {state_path}")
+                logger.warning("⚠️  Will use model only, starting from Stage 1")
+                return
+            
+            state = torch.load(state_path, map_location=self.device)
+            
+            self.global_step = state.get('global_step', 0)
+            self.best_val_loss = state.get('best_val_loss', float('inf'))
+            self.current_stage = state.get('current_stage', 1)
+            self.current_epoch_in_stage = state.get('current_epoch_in_stage', 0)
+            
+            logger.info(f"✓ Loaded training state:")
+            logger.info(f"  - Global step: {self.global_step}")
+            logger.info(f"  - Best val loss: {self.best_val_loss:.4f}")
+            logger.info(f"  - Current stage: {self.current_stage}")
+            logger.info(f"  - Epoch in stage: {self.current_epoch_in_stage}")
+            
+            # Setup stage trước khi load optimizer/scheduler
+            self.setup_stage(self.current_stage)
+            
+            # Load optimizer/scheduler nếu có
+            if state.get('optimizer') and self.optimizer:
+                try:
+                    self.optimizer.load_state_dict(state['optimizer'])
+                    logger.info(f"✓ Loaded optimizer state")
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not load optimizer state: {e}")
+            
+            if state.get('scheduler') and self.scheduler:
+                try:
+                    self.scheduler.load_state_dict(state['scheduler'])
+                    logger.info(f"✓ Loaded scheduler state")
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not load scheduler state: {e}")
+            
+            if state.get('scaler'):
+                try:
+                    self.scaler.load_state_dict(state['scaler'])
+                    logger.info(f"✓ Loaded scaler state")
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not load scaler state: {e}")
+            
+            logger.info(f"{'='*80}")
+            logger.info(f"✅ RESUME FROM CHECKPOINT SUCCESSFUL")
+            logger.info(f"   Will continue from Stage {self.current_stage}, Epoch {self.current_epoch_in_stage + 1}")
+            logger.info(f"{'='*80}\n")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load checkpoint {checkpoint_path}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            logger.warning("⚠️  Starting training from scratch")
+            self.global_step = 0
+            self.best_val_loss = float('inf')
+            self.current_stage = 1
+            self.current_epoch_in_stage = 0
 
 
 # ============================================================================
@@ -676,6 +925,10 @@ def main():
     parser.add_argument('--save_steps', type=int, default=1000)
     parser.add_argument('--eval_steps', type=int, default=500)
     
+    # 🔥 Resume training
+    parser.add_argument('--resume', type=str, default=None, 
+                        help='Path to checkpoint folder để resume training (e.g., ./outputs/last_checkpoint)')
+    
     # Generation args
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'generate'])
     parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint to load for generation')
@@ -741,7 +994,7 @@ def main():
         logger.info(f"✓ Train samples: {len(train_dataset)}")
         logger.info(f"✓ Val samples: {len(val_dataset)}")
         
-        # Initialize trainer với 3 stages
+        # Initialize trainer với 3 stages + resume checkpoint
         trainer = VQATrainer(
             model=model,
             train_loader=train_loader,
@@ -754,7 +1007,8 @@ def main():
             max_grad_norm=args.max_grad_norm,
             save_steps=args.save_steps,
             eval_steps=args.eval_steps,
-            device=device
+            device=device,
+            resume_checkpoint=args.resume  # 🔥 Pass resume checkpoint
         )
         
         # Train với 3 stages
