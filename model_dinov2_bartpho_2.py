@@ -441,21 +441,21 @@ class DINOv2BARTphoVQA(nn.Module):
         """
         Tính loss cho answer generation
         
+        IMPORTANT: logits đã aligned với labels (generate_answer đã shift rồi)
+        
         Args:
-            logits: [batch, seq_len, vocab_size]
-            labels: [batch, seq_len] - target tokens
+            logits: [batch, seq_len, vocab_size] - decoder outputs
+            labels: [batch, seq_len] - original target tokens (chưa shift)
         Returns:
             loss: scalar
         """
-        # Shift: logits[:, :-1] vs labels[:, 1:] (standard seq2seq)
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        
-        # Cross entropy loss (ignore padding)
-        loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+        # KHÔNG shift nữa vì generate_answer() đã shift decoder_input_ids rồi!
+        # Logits từ decoder aligned với labels gốc
+        # Chỉ cần ignore padding (-100 hoặc pad_token_id)
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100)  # Dataset đã set pad=-100
         loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), 
-            shift_labels.view(-1)
+            logits.view(-1, logits.size(-1)), 
+            labels.view(-1)
         )
         
         return loss

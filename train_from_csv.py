@@ -9,7 +9,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 
 from transformers import get_cosine_schedule_with_warmup, AutoImageProcessor
 from tqdm import tqdm
@@ -117,7 +118,7 @@ def run_one_epoch(model, loader, optimizer, scaler, device, cfg, scheduler=None,
         with torch.set_grad_enabled(train):
             if train:  # chỉ backward khi train
                 if cfg.use_amp:
-                    with autocast(dtype=torch.float16):
+                    with autocast('cuda', dtype=torch.float16):
                         loss, _ = model(pixel_values, input_ids, attention_mask, labels=labels)
                         loss = loss / accum_steps
                     scaler.scale(loss).backward()
@@ -128,7 +129,7 @@ def run_one_epoch(model, loader, optimizer, scaler, device, cfg, scheduler=None,
             else:
                 # eval: chỉ forward
                 if cfg.use_amp:
-                    with autocast(dtype=torch.float16):
+                    with autocast('cuda', dtype=torch.float16):
                         loss, _ = model(pixel_values, input_ids, attention_mask, labels=labels)
                 else:
                     loss, _ = model(pixel_values, input_ids, attention_mask, labels=labels)
