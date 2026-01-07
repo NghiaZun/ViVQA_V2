@@ -598,14 +598,17 @@ class VQATrainer:
     
     @torch.no_grad()
     def validate(self):
+        """Validate model - run through entire validation set"""
         self.model.eval()
         total_loss = 0
+        num_batches = 0
         
         # 🔥 Clear cache before validation
         torch.cuda.empty_cache()
         
         pbar = tqdm(self.val_loader, desc="Validating")
         for batch in pbar:
+            num_batches += 1
             pixel_values = batch['pixel_values'].to(self.device)
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
