@@ -213,8 +213,8 @@ class TrainConfig:
     warmup_ratio: float = 0.1  # 10% warmup
     use_amp: bool = True
     
-    # Early stopping per stage
-    es_patience: int = 5
+    # Early stopping per stage - AGGRESSIVE to prevent overfitting
+    es_patience: int = 3  # 🔥 Giảm từ 5 → 3 (stop sớm hơn)
     es_min_delta: float = 1e-4
     
     # Logging
@@ -222,13 +222,13 @@ class TrainConfig:
     curve_png: str = "training_staged_curve.png"
 
 
-# Define 3 stages
+# Define 3 stages - ULTRA CONSERVATIVE (based on analysis)
 STAGES = [
-    # Stage 1: Fusion Only (warm-up, khởi động task-specific components)
+    # Stage 1: Fusion Only - REDUCED to prevent overfitting after epoch 6
     StageConfig(
         name="Stage 1: Fusion Warm-up",
         start_epoch=0,
-        end_epoch=10,
+        end_epoch=8,  # 🔥 Giảm từ 10 → 8 (stop trước khi overfit)
         learning_rate=5e-4,  # Cao vì random init
         weight_decay=0.01,
         dropout=0.2,
@@ -239,34 +239,34 @@ STAGES = [
         unfreeze_vision_head=False
     ),
     
-    # Stage 2: + Language Models (fine-tune Vietnamese understanding)
+    # Stage 2: + Language Models - SUPER GENTLE (prevent catastrophic forgetting)
     StageConfig(
         name="Stage 2: Language Fine-tune",
-        start_epoch=10,
-        end_epoch=25,
-        learning_rate=1e-4,  # Giảm xuống cho pretrained weights
-        weight_decay=0.02,
-        dropout=0.3,  # Tăng dropout vì thêm params
-        description="Unfreeze language models (encoder last 6 layers + full decoder)",
+        start_epoch=8,
+        end_epoch=13,  # 🔥 Giảm từ 25 → 13 (chỉ 5 epochs, dừng sớm)
+        learning_rate=1e-5,  # 🔥 Giảm 10x: 1e-4 → 1e-5 (prevent distribution shift)
+        weight_decay=0.03,  # 🔥 Tăng regularization
+        dropout=0.4,  # 🔥 Tăng dropout 0.3 → 0.4 (364M params!)
+        description="GENTLE language fine-tune (encoder last 3 layers + decoder only)",
         unfreeze_fusion=True,
-        unfreeze_encoder_last_n=6,  # Half của 12 layers
+        unfreeze_encoder_last_n=3,  # 🔥 Giảm từ 6 → 3 layers (more conservative)
         unfreeze_decoder=True,
         unfreeze_vision_head=False
     ),
     
-    # Stage 3: + Vision Head (fine-tune high-level vision features)
+    # Stage 3: MICRO POLISH - Chỉ để polish, không expect cải thiện lớn
     StageConfig(
-        name="Stage 3: Vision Head Fine-tune",
-        start_epoch=25,
-        end_epoch=40,
-        learning_rate=5e-5,  # Giảm tiếp, cẩn thận với vision
-        weight_decay=0.03,
-        dropout=0.3,
-        description="Unfreeze vision head (last block + norm) for semantic adaptation",
+        name="Stage 3: Micro Polish",
+        start_epoch=13,
+        end_epoch=18,  # 🔥 Giảm từ 40 → 18 (chỉ 5 epochs)
+        learning_rate=5e-6,  # 🔥 Giảm 10x: 5e-5 → 5e-6 (cực kỳ nhẹ nhàng)
+        weight_decay=0.04,  # 🔥 Tăng tiếp
+        dropout=0.4,
+        description="Micro-polish all components with minimal LR (expect minimal gain)",
         unfreeze_fusion=True,
-        unfreeze_encoder_last_n=6,
+        unfreeze_encoder_last_n=3,
         unfreeze_decoder=True,
-        unfreeze_vision_head=True
+        unfreeze_vision_head=True  # Allow but with tiny LR
     ),
 ]
 
