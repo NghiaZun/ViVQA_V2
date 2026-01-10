@@ -675,28 +675,37 @@ class FixedLatentReasoningVQA(nn.Module):
         batch_size = reasoning_latents.size(0)
         device = reasoning_latents.device
         
-        # Start token for decoder
-        decoder_input_ids = torch.full(
+        # Autoregressive greedy decoding (fast, simple)
+        # Start with BOS token
+        generated = torch.full(
             (batch_size, 1), self.tokenizer.bos_token_id,
             dtype=torch.long, device=device
         )
         
-        # Generate
-        generated_ids = self.decoder.generate(
-            input_ids=decoder_input_ids,
-            encoder_hidden_states=reasoning_latents,
-            max_length=max_length,
-            num_beams=num_beams,
-            pad_token_id=self.config.pad_token_id,
-            eos_token_id=self.config.eos_token_id,
-            bos_token_id=self.tokenizer.bos_token_id,
-            use_cache=True
-        )
+        for _ in range(max_length - 1):
+            # Forward through decoder
+            decoder_outputs = self.decoder(
+                input_ids=generated,
+                encoder_hidden_states=reasoning_latents,
+                return_dict=True,
+                use_cache=False
+            )
+            
+            # Get logits and predict next token
+            logits = self.lm_head(decoder_outputs.last_hidden_state)
+            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            
+            # Append to sequence
+            generated = torch.cat([generated, next_token], dim=1)
+            
+            # Check if all sequences have EOS
+            if (next_token == self.config.eos_token_id).all():
+                break
         
         # Decode
         answers = [
             self.tokenizer.decode(ids, skip_special_tokens=True).strip()
-            for ids in generated_ids
+            for ids in generated
         ]
         
         return answers
