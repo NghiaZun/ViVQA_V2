@@ -765,19 +765,21 @@ class TeacherEvaluator:
             try:
                 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
                 
-                print("[Teacher] Loading Qwen2.5-VL-7B-Instruct (CPU offload mode)...")
-                # Use CPU offload to save GPU memory
+                print("[Teacher] Loading Qwen2.5-VL-7B-Instruct...")
+                # Load on GPU with optimization for speed
                 self.vlm_model = Qwen2VLForConditionalGeneration.from_pretrained(
                     "Qwen/Qwen2-VL-7B-Instruct",
                     torch_dtype=torch.float16,
-                    device_map={"": "cpu"},  # Offload to CPU
+                    device_map="auto",  # Auto GPU allocation
                     low_cpu_mem_usage=True
                 )
+                self.vlm_model.eval()  # Inference mode
+                
                 self.vlm_processor = AutoProcessor.from_pretrained(
                     "Qwen/Qwen2-VL-7B-Instruct"
                 )
                 
-                print("[Teacher] ✅ Qwen2.5-VL loaded successfully")
+                print("[Teacher] ✅ Qwen2.5-VL loaded on GPU (faster inference)")
                 
             except Exception as e:
                 print(f"[Teacher] ❌ Failed to load VLM: {e}")
