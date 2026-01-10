@@ -651,6 +651,53 @@ class FixedLatentReasoningVQA(nn.Module):
         ]
         
         return answers
+    
+    def generate_from_reasoning(
+        self,
+        reasoning_latents: torch.Tensor,
+        max_length: int = 10,  # VQA answers are short (1-3 words typically)
+        num_beams: int = 1  # Greedy by default for training speed
+    ):
+        """
+        Generate answers from pre-computed reasoning latents.
+        Used during training to avoid re-encoding.
+        
+        Args:
+            reasoning_latents: Pre-computed reasoning representations [batch, num_tokens, dim]
+            max_length: Maximum generation length (default 10 for short VQA answers)
+            num_beams: Number of beams (1 = greedy, >1 = beam search)
+        
+        Returns:
+            List of decoded answer strings
+        """
+        batch_size = reasoning_latents.size(0)
+        device = reasoning_latents.device
+        
+        # Start token for decoder
+        decoder_input_ids = torch.full(
+            (batch_size, 1), self.tokenizer.bos_token_id,
+            dtype=torch.long, device=device
+        )
+        
+        # Generate
+        generated_ids = self.decoder.generate(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=reasoning_latents,
+            max_length=max_length,
+            num_beams=num_beams,
+            pad_token_id=self.config.pad_token_id,
+            eos_token_id=self.config.eos_token_id,
+            bos_token_id=self.tokenizer.bos_token_id,
+            use_cache=True
+        )
+        
+        # Decode
+        answers = [
+            self.tokenizer.decode(ids, skip_special_tokens=True).strip()
+            for ids in generated_ids
+        ]
+        
+        return answers
 
 
 # ============================================================================

@@ -329,12 +329,13 @@ def run_one_epoch(
                         kl_weight=0.0  # No KL loss for sampling
                     )
                     
-                    # Decode answer from this reasoning path
-                    pred_ids = sample_out.answer_logits.argmax(dim=-1)
-                    answers = [
-                        model.tokenizer.decode(ids, skip_special_tokens=True).strip()
-                        for ids in pred_ids
-                    ]
+                    # Generate answer from reasoning latents using beam search/greedy
+                    # NOTE: Changed from argmax to generate() for train/inference consistency
+                    answers = model.generate_from_reasoning(
+                        reasoning_latents=sample_out.reasoning_latents,
+                        max_length=10,  # VQA answers are short
+                        num_beams=1  # Greedy for speed (can increase for better quality)
+                    )
                     
                     candidate_outputs.append(sample_out)
                     candidate_answers.append(answers)
