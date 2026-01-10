@@ -108,8 +108,8 @@ def main():
     full_dataset = VQAGenDataset(
         csv_path=cfg.csv_path,
         image_folder=cfg.image_folder,
-        tokenizer=model.tokenizer,
         vision_processor=vision_processor,
+        tokenizer_name='vinai/bartpho-syllable',  # Pass name, not object
         max_q_len=cfg.max_q_len,
         max_a_len=cfg.max_a_len
     )
