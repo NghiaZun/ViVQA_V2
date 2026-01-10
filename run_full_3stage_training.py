@@ -280,11 +280,9 @@ def main():
                         kl_weight=0.0
                     )
                     
-                    # Generate prediction
-                    prediction = model.generate(
-                        pixel_values=pixel_values,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
+                    # Generate prediction from reasoning latents
+                    prediction = model.generate_from_reasoning(
+                        reasoning_latents=outputs.reasoning_latents,
                         max_length=10,
                         num_beams=1
                     )[0]
