@@ -538,22 +538,24 @@ class FixedLatentReasoningVQA(nn.Module):
         encoder_hidden_states = reasoning_latents  # NOT concat with fused!
         
         # 8. Decode
+        # NOTE: Skip decoder if no labels (will use generate_from_reasoning() instead)
         if labels is not None:
             decoder_input_ids = shift_tokens_right(
                 labels, self.config.pad_token_id, self.config.decoder_start_token_id
             )
+            
+            decoder_outputs = self.decoder(
+                input_ids=decoder_input_ids,
+                attention_mask=(labels != self.config.pad_token_id),
+                encoder_hidden_states=encoder_hidden_states,
+                return_dict=True,
+                use_cache=False
+            )
+            
+            logits = self.lm_head(decoder_outputs.last_hidden_state)
         else:
-            decoder_input_ids = None
-        
-        decoder_outputs = self.decoder(
-            input_ids=decoder_input_ids,
-            attention_mask=(labels != self.config.pad_token_id) if labels is not None else None,
-            encoder_hidden_states=encoder_hidden_states,
-            return_dict=True,
-            use_cache=False
-        )
-        
-        logits = self.lm_head(decoder_outputs.last_hidden_state)
+            # No labels = no decoder forward (use generate_from_reasoning() instead)
+            logits = None
         
         # 9. Losses
         answer_loss = None
