@@ -60,6 +60,11 @@ def main():
     cfg.teacher_type = args.teacher_type
     cfg.num_reasoning_samples = args.num_reasoning_samples
     
+    # Add missing attributes
+    cfg.max_q_len = 64  # Max question length
+    cfg.max_a_len = 10  # Max answer length (VQA answers are short: 1-3 words)
+    cfg.learning_rate = cfg.base_lr  # Add learning_rate alias
+    
     # Total epochs
     total_epochs = args.stage1_epochs + args.stage2_epochs + args.stage3_epochs
     stage1_end = args.stage1_epochs
