@@ -541,31 +541,40 @@ class DINOv2BARTphoVQA(nn.Module):
         text_features = self.encode_text(input_ids, attention_mask)
         fused_features, _ = self.fuse_multimodal(text_features, visual_features)
         
-        # 2. Generate using decoder.generate() - efficient!
+        # 2. Generate using manual autoregressive decoding
         batch_size = fused_features.size(0)
         
-        # Create dummy decoder input (BOS tokens)
-        decoder_input_ids = torch.full(
+        # Create decoder input starting with BOS token
+        generated_ids = torch.full(
             (batch_size, 1),
             self.tokenizer.bos_token_id,
             dtype=torch.long,
             device=fused_features.device
         )
         
-        # Use decoder's built-in generation
-        generated_ids = self.decoder.generate(
-            input_ids=decoder_input_ids,
-            encoder_hidden_states=fused_features,
-            max_length=max_length,
-            num_beams=num_beams,
-            repetition_penalty=repetition_penalty,
-            length_penalty=length_penalty,
-            early_stopping=early_stopping,
-            pad_token_id=self.config.pad_token_id,
-            eos_token_id=self.config.eos_token_id,
-            bos_token_id=self.tokenizer.bos_token_id,
-            use_cache=True  # Enable KV cache for faster generation
-        )
+        # Autoregressive generation
+        for _ in range(max_length - 1):
+            # Get decoder outputs
+            decoder_outputs = self.decoder(
+                input_ids=generated_ids,
+                encoder_hidden_states=fused_features,
+                use_cache=False,
+                return_dict=True
+            )
+            
+            # Get logits for next token
+            hidden_states = decoder_outputs.last_hidden_state
+            logits = self.lm_head(hidden_states[:, -1:, :])  # [batch, 1, vocab_size]
+            
+            # Sample next token (greedy for simplicity, can add beam search later)
+            next_token = logits.argmax(dim=-1)  # [batch, 1]
+            
+            # Append to generated sequence
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            
+            # Stop if all sequences generated EOS
+            if (next_token == self.config.eos_token_id).all():
+                break
         
         # 3. Decode answers
         answer_texts = []

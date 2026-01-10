@@ -1022,7 +1022,7 @@ def main():
         'batch_size': 1,  # Reduced to save GPU memory
         'gradient_accumulation_steps': 64,  # Increased to maintain effective batch size
         'num_epochs': 54,  # Total epochs across all stages
-        'learning_rate': 3e-5,  # Lower LR cho large model
+        'learning_rate': 5e-5,  # 🔥 FIXED: Increased from 3e-5 for better learning
         'weight_decay': 0.01,
         'warmup_ratio': 0.1,
         'max_grad_norm': 1.0,
@@ -1030,8 +1030,8 @@ def main():
         # Loss weights
         'alpha_reasoning': 0.6,
         'alpha_answer': 0.4,
-        'alpha_quality': 0.1,
-        'label_smoothing': 0.0,  # Removed to lower loss (was causing artificially high loss)
+        'alpha_quality': 0.05,  # 🔥 FIXED: Reduced from 0.1 to balance training
+        'label_smoothing': 0.1,  # 🔥 FIXED: Re-enabled for better generalization
         
         # Advanced
         'use_amp': True,
@@ -1126,13 +1126,13 @@ def main():
     # Define stage milestones: {epoch: (stage_name, lr_scale, unfreeze_actions)}
     # unfreeze_actions: [(action_type, module_name, *args), ...]
     stage_milestones = {
-        15: ('Stage 2: Unfreeze DINOv2 last 4 layers', 0.8, [
+        15: ('Stage 2: Unfreeze DINOv2 last 4 layers', 1.0, [  # 🔥 FIXED: Keep full LR
             ('unfreeze_last_n', 'vision_encoder', 4)
         ]),
-        27: ('Stage 3: Unfreeze BARTpho encoder last 6 layers', 0.5, [
+        27: ('Stage 3: Unfreeze BARTpho encoder last 6 layers', 0.8, [  # 🔥 FIXED: 0.5→0.8
             ('unfreeze_last_n', 'bartpho_encoder', 6)
         ]),
-        39: ('Stage 4: Full fine-tuning', 0.2, [
+        39: ('Stage 4: Full fine-tuning', 0.5, [  # 🔥 FIXED: 0.2→0.5 for better fine-tuning
             ('unfreeze_all', 'vision_encoder'),
             ('unfreeze_all', 'bartpho_encoder'),
             ('unfreeze_last_n', 'bartpho_decoder', 6)
