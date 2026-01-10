@@ -319,7 +319,11 @@ class DiversityRegularizer:
         max_sim = off_diag_sim.max().item()
         
         # Token std (within each token across batch)
-        token_std = tokens.std(dim=0).mean().item()
+        # 🔥 FIX: Check batch size to avoid std() warning
+        if batch_size > 1:
+            token_std = tokens.std(dim=0, unbiased=False).mean().item()
+        else:
+            token_std = 0.0  # Can't compute std with single sample
         
         return {
             'mean_similarity': mean_sim,
@@ -704,35 +708,41 @@ class FixedLatentReasoningVQA(nn.Module):
         device = reasoning_latents.device
         
         # Start with BOS token
-        decoder_input_ids = torch.full(
+        generated_ids = torch.full(
             (batch_size, 1), 
             self.tokenizer.bos_token_id,
             dtype=torch.long, 
             device=device
         )
         
-        # Use decoder's native generate() with KV caching (O(n) instead of O(n²))
-        generated_ids = self.decoder.generate(
-            input_ids=decoder_input_ids,
-            encoder_hidden_states=reasoning_latents,
-            max_length=max_length,
-            num_beams=num_beams,
-            pad_token_id=self.config.pad_token_id,
-            eos_token_id=self.config.eos_token_id,
-            bos_token_id=self.tokenizer.bos_token_id,
-            use_cache=True  # CRITICAL: Enable KV caching for O(n) complexity
-        )
+        # 🔥 FIX: Manual autoregressive decoding (MBartDecoder doesn't have .generate())
+        for _ in range(max_length - 1):
+            # Get decoder outputs
+            decoder_outputs = self.decoder(
+                input_ids=generated_ids,
+                encoder_hidden_states=reasoning_latents,
+                use_cache=False,
+                return_dict=True
+            )
+            
+            # Get logits for next token
+            hidden_states = decoder_outputs.last_hidden_state
+            logits = self.lm_head(hidden_states[:, -1:, :])  # [batch, 1, vocab_size]
+            
+            # Sample next token (greedy decoding)
+            next_token = logits.argmax(dim=-1)  # [batch, 1]
+            
+            # Append to sequence
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            
+            # Stop if all sequences hit EOS
+            if (next_token == self.config.eos_token_id).all():
+                break
         
         # Decode to strings
         answers = [
             self.tokenizer.decode(ids, skip_special_tokens=True).strip()
             for ids in generated_ids
-        ]
-        
-        return answers
-        answers = [
-            self.tokenizer.decode(ids, skip_special_tokens=True).strip()
-            for ids in generated
         ]
         
         return answers
