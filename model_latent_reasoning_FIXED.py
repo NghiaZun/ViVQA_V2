@@ -185,8 +185,11 @@ class CompressedLatentReasoning(nn.Module):
         kl_per_token = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
         # kl_per_token shape: [batch_size, num_tokens]
         
-        # Free bits: only penalize if KL < free_bits (per token)
-        kl_per_token = torch.clamp(kl_per_token - self.free_bits, min=0.0)
+        # Free bits: only penalize if KL > free_bits (per token)
+        # With MEAN computation, typical KL ~ 0.1-0.5, so free_bits should be small
+        # Set to 0.0 to disable (warmup schedule handles collapse prevention)
+        if self.free_bits > 0:
+            kl_per_token = torch.clamp(kl_per_token - self.free_bits, min=0.0)
         
         # Average over tokens and batch
         return kl_per_token.mean()
@@ -1019,7 +1022,8 @@ class TrainingCurriculum:
     def __init__(self, total_steps_per_stage: int = 1000, max_kl_weight: float = 15.0):
         """
         Args:
-            total_steps_per_stage: Steps for warmup in stage 2
+            total_steps_per_stage: Total steps for ENTIRE STAGE 2 (not per epoch!)
+                                  Should be: batches_per_epoch * num_stage2_epochs
             max_kl_weight: Maximum KL weight (default 15.0)
                           Note: Loss uses `kl_weight * 0.01 * kl_loss`
                           So effective weight = 15.0 * 0.01 = 0.15

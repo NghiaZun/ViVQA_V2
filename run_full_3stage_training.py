@@ -152,9 +152,10 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs)
     scaler = GradScaler(enabled=cfg.use_amp)
     
-    # Curriculum
+    # Curriculum (warmup over ENTIRE Stage 2, not just 1 epoch!)
+    total_stage2_steps = len(train_loader) * args.stage2_epochs
     curriculum = TrainingCurriculum(
-        total_steps_per_stage=len(train_loader),
+        total_steps_per_stage=total_stage2_steps,  # Total batches in Stage 2
         max_kl_weight=args.max_kl_weight  # Tunable KL weight
     )
     
@@ -242,6 +243,72 @@ def main():
         # Save last checkpoint (overwrite each epoch to save disk space)
         last_path = os.path.join(cfg.save_dir, "last.pt")
         torch.save(checkpoint, last_path)
+        
+        # Sample predictions every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            print("\n" + "="*80)
+            print(f"📝 SAMPLE PREDICTIONS (Epoch {epoch+1}, Stage {current_stage})")
+            print("="*80)
+            model.eval()
+            with torch.no_grad():
+                # Get 3 random samples from validation set
+                import random
+                sample_indices = random.sample(range(len(val_loader.dataset)), min(3, len(val_loader.dataset)))
+                
+                for i, idx in enumerate(sample_indices):
+                    # Get sample from dataset
+                    sample = val_loader.dataset[idx]
+                    pixel_values = sample[0].unsqueeze(0).to(device)
+                    input_ids = sample[1].unsqueeze(0).to(device)
+                    attention_mask = sample[2].unsqueeze(0).to(device)
+                    labels = sample[3].unsqueeze(0)
+                    
+                    # Get ground truth
+                    gt_tokens = labels[0][labels[0] != -100]
+                    ground_truth = model.tokenizer.decode(gt_tokens, skip_special_tokens=True)
+                    
+                    # Get question
+                    question = model.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                    
+                    # Forward pass to get reasoning info
+                    outputs = model(
+                        pixel_values=pixel_values,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=None,
+                        deterministic_reasoning=True,
+                        kl_weight=0.0
+                    )
+                    
+                    # Generate prediction
+                    prediction = model.generate(
+                        pixel_values=pixel_values,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_length=10,
+                        num_beams=1
+                    )[0]
+                    
+                    # Check match
+                    match = prediction.lower().strip() == ground_truth.lower().strip()
+                    partial_match = ground_truth.lower().strip() in prediction.lower().strip() or \
+                                   prediction.lower().strip() in ground_truth.lower().strip()
+                    
+                    print(f"\n📋 Sample {i+1}:")
+                    print(f"  ❓ Question: {question}")
+                    print(f"  ✓ Ground Truth: {ground_truth}")
+                    print(f"  🤖 Prediction: {prediction}")
+                    if outputs.kl_loss is not None:
+                        print(f"  📊 KL: {outputs.kl_loss.item():.4f}")
+                    if match:
+                        print(f"  ✅ EXACT MATCH")
+                    elif partial_match:
+                        print(f"  🟡 PARTIAL MATCH")
+                    else:
+                        print(f"  ❌ WRONG")
+            
+            print("="*80 + "\n")
+            model.train()
         
         scheduler.step()
         curriculum.step()

@@ -73,7 +73,7 @@ class FixedTrainConfig:
     latent_dim: int = 256  # FIX #4: Compressed!
     num_reasoning_layers: int = 2
     num_fusion_layers: int = 2
-    free_bits: float = 0.5  # FIX #2
+    free_bits: float = 0.05  # FIX #2 - Disabled (warmup handles collapse prevention)
     ortho_weight: float = 0.1  # FIX #5
     image_dropout_prob: float = 0.1  # FIX #3
     token_dropout_prob: float = 0.3  # FIX #5
