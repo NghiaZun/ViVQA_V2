@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--stage2_epochs", type=int, default=10)
     parser.add_argument("--stage3_epochs", type=int, default=20)
     parser.add_argument("--num_reasoning_samples", type=int, default=3)
+    parser.add_argument("--max_kl_weight", type=float, default=15.0,
+                       help="Max KL weight (15.0 with 0.01 factor → effective 0.15)")
     
     args = parser.parse_args()
     
@@ -78,6 +80,11 @@ def main():
     print(f"  Stage 2 (Warmup):   Epochs {stage1_end}-{stage2_end-1}")
     print(f"  Stage 3 (Full):     Epochs {stage2_end}-{total_epochs-1}")
     print(f"  TOTAL: {total_epochs} epochs")
+    print(f"\nKL weight config:")
+    print(f"  Max KL weight: {args.max_kl_weight} (effective = {args.max_kl_weight * 0.01:.3f} due to 0.01 factor in loss)")
+    print(f"  Stage 1: KL weight = 0.0")
+    print(f"  Stage 2: KL weight = 0.0 → {args.max_kl_weight} (linear warmup)")
+    print(f"  Stage 3: KL weight = {args.max_kl_weight}")
     print("="*80 + "\n")
     
     # Setup
@@ -146,7 +153,10 @@ def main():
     scaler = GradScaler(enabled=cfg.use_amp)
     
     # Curriculum
-    curriculum = TrainingCurriculum(total_steps_per_stage=len(train_loader))
+    curriculum = TrainingCurriculum(
+        total_steps_per_stage=len(train_loader),
+        max_kl_weight=args.max_kl_weight  # Tunable KL weight
+    )
     
     # Training loop
     print("\n[5/6] Starting continuous training...")
@@ -209,7 +219,7 @@ def main():
               f"KL: {val_losses['kl']:.4f}")
         print(f"  LR: {current_lr:.6f}, KL weight: {kl_weight:.2f}, Stage: {current_stage}")
         
-        # Save checkpoint
+        # Prepare checkpoint dict
         os.makedirs(cfg.save_dir, exist_ok=True)
         checkpoint = {
             'epoch': epoch + 1,
@@ -222,15 +232,16 @@ def main():
             'config': cfg.__dict__
         }
         
-        checkpoint_path = os.path.join(cfg.save_dir, f"checkpoint_epoch_{epoch+1}.pt")
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best model
+        # Save best model (always check and update)
         if val_losses['total'] < best_val_loss:
             best_val_loss = val_losses['total']
             best_path = os.path.join(cfg.save_dir, "best.pt")
             torch.save(checkpoint, best_path)
             print(f"  ✅ New best model saved! (val_loss: {best_val_loss:.4f})")
+        
+        # Save last checkpoint (overwrite each epoch to save disk space)
+        last_path = os.path.join(cfg.save_dir, "last.pt")
+        torch.save(checkpoint, last_path)
         
         scheduler.step()
         curriculum.step()
@@ -240,10 +251,8 @@ def main():
     print("✅ ALL 3 STAGES COMPLETED!")
     print("="*80)
     print(f"\nCheckpoints saved in: {cfg.save_dir}/")
-    print(f"  - checkpoint_epoch_{stage1_end}.pt (end of Stage 1)")
-    print(f"  - checkpoint_epoch_{stage2_end}.pt (end of Stage 2)")
-    print(f"  - checkpoint_epoch_{total_epochs}.pt (end of Stage 3)")
-    print(f"  - best.pt (best validation model)")
+    print(f"  - best.pt (best validation model - use for inference)")
+    print(f"  - last.pt (last epoch checkpoint - use for resume)")
     print()
 
 

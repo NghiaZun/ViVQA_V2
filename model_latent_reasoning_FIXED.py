@@ -172,14 +172,24 @@ class CompressedLatentReasoning(nn.Module):
     def compute_kl_with_free_bits(self, mu, logvar):
         """
         FIX #2: Free bits to prevent posterior collapse
+        
+        Computes KL divergence: KL(q(z|x) || p(z)) where p(z) = N(0, I)
+        Formula: -0.5 * sum(1 + log(var) - mu^2 - var)
+        
+        Shape:
+            mu, logvar: [batch_size, num_tokens, latent_dim]
+            output: scalar (mean over batch)
         """
-        # Standard KL
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+        # Standard KL per dimension: -0.5 * (1 + logvar - mu^2 - exp(logvar))
+        # Use MEAN over latent_dim (not SUM) to avoid scaling by dimension size
+        kl_per_token = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+        # kl_per_token shape: [batch_size, num_tokens]
         
-        # Free bits: only penalize if KL < free_bits
-        kl = torch.clamp(kl - self.free_bits, min=0.0)
+        # Free bits: only penalize if KL < free_bits (per token)
+        kl_per_token = torch.clamp(kl_per_token - self.free_bits, min=0.0)
         
-        return kl.mean()
+        # Average over tokens and batch
+        return kl_per_token.mean()
     
     def forward(
         self, 
@@ -690,34 +700,33 @@ class FixedLatentReasoningVQA(nn.Module):
         batch_size = reasoning_latents.size(0)
         device = reasoning_latents.device
         
-        # Autoregressive greedy decoding (fast, simple)
         # Start with BOS token
-        generated = torch.full(
-            (batch_size, 1), self.tokenizer.bos_token_id,
-            dtype=torch.long, device=device
+        decoder_input_ids = torch.full(
+            (batch_size, 1), 
+            self.tokenizer.bos_token_id,
+            dtype=torch.long, 
+            device=device
         )
         
-        for _ in range(max_length - 1):
-            # Forward through decoder
-            decoder_outputs = self.decoder(
-                input_ids=generated,
-                encoder_hidden_states=reasoning_latents,
-                return_dict=True,
-                use_cache=False
-            )
-            
-            # Get logits and predict next token
-            logits = self.lm_head(decoder_outputs.last_hidden_state)
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            
-            # Append to sequence
-            generated = torch.cat([generated, next_token], dim=1)
-            
-            # Check if all sequences have EOS
-            if (next_token == self.config.eos_token_id).all():
-                break
+        # Use decoder's native generate() with KV caching (O(n) instead of O(n²))
+        generated_ids = self.decoder.generate(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=reasoning_latents,
+            max_length=max_length,
+            num_beams=num_beams,
+            pad_token_id=self.config.pad_token_id,
+            eos_token_id=self.config.eos_token_id,
+            bos_token_id=self.tokenizer.bos_token_id,
+            use_cache=True  # CRITICAL: Enable KV caching for O(n) complexity
+        )
         
-        # Decode
+        # Decode to strings
+        answers = [
+            self.tokenizer.decode(ids, skip_special_tokens=True).strip()
+            for ids in generated_ids
+        ]
+        
+        return answers
         answers = [
             self.tokenizer.decode(ids, skip_special_tokens=True).strip()
             for ids in generated
@@ -1005,26 +1014,35 @@ class TrainingCurriculum:
     Stage 2: Warmup reasoning (KL warmup, no teacher)
     Stage 3: Full (with teacher)
     """
-    def __init__(self, total_steps_per_stage: int = 1000):
+    def __init__(self, total_steps_per_stage: int = 1000, max_kl_weight: float = 15.0):
+        """
+        Args:
+            total_steps_per_stage: Steps for warmup in stage 2
+            max_kl_weight: Maximum KL weight (default 15.0)
+                          Note: Loss uses `kl_weight * 0.01 * kl_loss`
+                          So effective weight = 15.0 * 0.01 = 0.15
+                          Target KL contribution: ~0.05-0.1
+        """
         self.total_steps = total_steps_per_stage
         self.current_step = 0
+        self.max_kl_weight = max_kl_weight
     
     def get_kl_weight(self, stage: int):
         """
         FIX #2: KL warmup to prevent collapse
         
         Stage 1: KL = 0 (no reasoning)
-        Stage 2: KL = 0 → 1 (gradual warmup)
-        Stage 3: KL = 1 (full)
+        Stage 2: KL = 0 → max_kl_weight (gradual warmup)
+        Stage 3: KL = max_kl_weight (full)
         """
         if stage == 1:
             return 0.0
         elif stage == 2:
-            # Linear warmup
+            # Linear warmup to max_kl_weight
             progress = min(self.current_step / self.total_steps, 1.0)
-            return progress
+            return progress * self.max_kl_weight
         else:  # stage 3
-            return 1.0
+            return self.max_kl_weight
     
     def get_stop_gradient(self, stage: int):
         """

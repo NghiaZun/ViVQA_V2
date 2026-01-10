@@ -527,14 +527,14 @@ def main():
         max_a_len=32
     )
     
-    # Teacher evaluator (after dataset for tokenizer)
+    # Teacher evaluator (use model's tokenizer, not dataset's)
     teacher_evaluator = None
     if cfg.use_teacher:
         print(f"\n[Teacher] Initializing {cfg.teacher_type} teacher (weight={cfg.teacher_weight}, samples={cfg.num_reasoning_samples})...")
         teacher_evaluator = TeacherEvaluator(
             teacher_type=cfg.teacher_type,
             device=device,
-            tokenizer=full_dataset.tokenizer if hasattr(full_dataset, 'tokenizer') else None
+            tokenizer=model.tokenizer  # Get from model, not dataset (Subset doesn't have it)
         )
     
     # FIX #7: Filter hard examples if requested
