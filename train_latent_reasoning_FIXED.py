@@ -27,7 +27,8 @@ import numpy as np
 from dataset import VQAGenDataset
 from model_latent_reasoning_FIXED import (
     FixedLatentReasoningVQA,
-    TrainingCurriculum
+    TrainingCurriculum,
+    TeacherEvaluator
 )
 
 
@@ -82,6 +83,16 @@ class FixedTrainConfig:
     run_intervention_tests: bool = True
     intervention_interval: int = 2  # Run every N epochs
     
+    # Teacher distillation (PROPOSAL REQUIREMENT!)
+    use_teacher: bool = False  # Enable in stage 3
+    teacher_type: str = 'rule_based'  # or 'vlm'
+    teacher_weight: float = 0.5  # Loss weight for teacher
+    
+    # PROPOSAL Section 7: Online Reasoning Distillation
+    num_reasoning_samples: int = 5  # Sample multiple reasoning paths
+    reasoning_temperature: float = 0.7  # Temperature for stochastic sampling
+    preference_margin: float = 0.1  # Margin for ranking loss
+    
     # Early stopping
     es_patience: int = 6
     es_min_delta: float = 1e-4
@@ -100,6 +111,10 @@ def parse_args():
     p.add_argument("--batch_size", type=int)
     p.add_argument("--use_hard_examples_only", type=int)
     p.add_argument("--run_intervention_tests", type=int)
+    p.add_argument("--use_teacher", type=int, help="Enable teacher distillation")
+    p.add_argument("--teacher_type", type=str, choices=['rule_based', 'vlm'], help="Teacher type")
+    p.add_argument("--teacher_weight", type=float, help="Teacher loss weight")
+    p.add_argument("--num_reasoning_samples", type=int, help="Number of reasoning paths to sample")
     p.add_argument("--resume_epoch", type=int)
     return p.parse_args()
 
@@ -227,14 +242,22 @@ def run_intervention_tests(model, val_loader, device, num_samples=100):
 
 
 # ============================================================================
-# TRAINING LOOP
+# TRAINING LOOP (WITH TEACHER!)
 # ============================================================================
 
 def run_one_epoch(
     model, loader, optimizer, scaler, device, cfg,
-    curriculum, stage, scheduler=None, train=True
+    curriculum, stage, teacher_evaluator=None, scheduler=None, train=True
 ):
-    """Run one epoch with curriculum"""
+    """
+    Run one epoch with curriculum and teacher
+    
+    PROPOSAL Implementation (Section 7):
+    - Sample multiple reasoning representations
+    - Generate candidate answers from each reasoning
+    - Teacher ranks candidates
+    - Train with preference-based loss
+    """
     if train:
         model.train()
     else:
@@ -244,6 +267,7 @@ def run_one_epoch(
     answer_loss_sum = 0.0
     kl_loss_sum = 0.0
     ortho_loss_sum = 0.0
+    teacher_loss_sum = 0.0
     num_batches = 0
     
     if train:
@@ -262,6 +286,7 @@ def run_one_epoch(
         stop_grad = curriculum.get_stop_gradient(stage)
         
         with autocast(device_type='cuda', enabled=cfg.use_amp):
+            # Standard forward pass for base loss
             outputs = model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
@@ -273,6 +298,87 @@ def run_one_epoch(
             )
             
             loss = outputs.total_loss
+            
+            # ================================================================
+            # PROPOSAL SECTION 7: ONLINE REASONING DISTILLATION
+            # ================================================================
+            teacher_loss = torch.tensor(0.0, device=device)
+            
+            if cfg.use_teacher and teacher_evaluator is not None and train:
+                # Get ground truths for teacher evaluation
+                ground_truths = []
+                for i in range(labels.size(0)):
+                    label_ids = labels[i][labels[i] != -100]
+                    gt = model.tokenizer.decode(label_ids, skip_special_tokens=True).strip()
+                    ground_truths.append(gt)
+                
+                # STEP 1: Sample MULTIPLE reasoning representations (stochastic)
+                candidate_outputs = []
+                candidate_answers = []
+                
+                for sample_idx in range(cfg.num_reasoning_samples):
+                    # Sample reasoning with temperature (stochastic!)
+                    sample_out = model(
+                        pixel_values=pixel_values,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=None,  # No teacher forcing for candidates
+                        deterministic_reasoning=False,  # STOCHASTIC!
+                        temperature=cfg.reasoning_temperature,
+                        stop_gradient_to_latent=stop_grad,
+                        kl_weight=0.0  # No KL loss for sampling
+                    )
+                    
+                    # Decode answer from this reasoning path
+                    pred_ids = sample_out.answer_logits.argmax(dim=-1)
+                    answers = [
+                        model.tokenizer.decode(ids, skip_special_tokens=True).strip()
+                        for ids in pred_ids
+                    ]
+                    
+                    candidate_outputs.append(sample_out)
+                    candidate_answers.append(answers)
+                
+                # STEP 2: Teacher evaluates and ranks ALL candidates
+                # For each example in batch, we have num_reasoning_samples candidates
+                batch_teacher_losses = []
+                
+                for batch_i in range(len(ground_truths)):
+                    # Collect all answers for this example
+                    answers_for_example = [
+                        candidate_answers[sample_idx][batch_i]
+                        for sample_idx in range(cfg.num_reasoning_samples)
+                    ]
+                    
+                    # Teacher scores all candidates
+                    # VLM teacher can optionally use images for better evaluation
+                    teacher_scores = teacher_evaluator.evaluate_answers(
+                        answers_for_example,
+                        [ground_truths[batch_i]] * cfg.num_reasoning_samples,
+                        images=pixel_values[batch_i:batch_i+1].repeat(cfg.num_reasoning_samples, 1, 1, 1) if cfg.teacher_type == 'vlm' else None,
+                        questions=None  # Could pass decoded questions if needed
+                    )  # Shape: [num_reasoning_samples]
+                    
+                    # STEP 3: Preference-based loss (best vs worst)
+                    best_idx = teacher_scores.argmax()
+                    worst_idx = teacher_scores.argmin()
+                    
+                    # Encourage model to prefer better reasoning paths
+                    # Higher score = better answer
+                    preference_loss = F.margin_ranking_loss(
+                        teacher_scores[best_idx].unsqueeze(0),
+                        teacher_scores[worst_idx].unsqueeze(0),
+                        target=torch.ones(1, device=device),
+                        margin=cfg.preference_margin
+                    )
+                    
+                    batch_teacher_losses.append(preference_loss)
+                
+                # Average teacher loss across batch
+                teacher_loss = torch.stack(batch_teacher_losses).mean()
+                
+                # Add to total loss
+                loss = loss + cfg.teacher_weight * teacher_loss
             
             if train:
                 loss = loss / cfg.accum_steps
@@ -295,17 +401,19 @@ def run_one_epoch(
                 curriculum.step()
         
         # Accumulate
-        total_loss += outputs.total_loss.item() if outputs.total_loss is not None else 0
+        total_loss += loss.item() * cfg.accum_steps if train else loss.item()
         answer_loss_sum += outputs.answer_loss.item() if outputs.answer_loss is not None else 0
         kl_loss_sum += outputs.kl_loss.item() if outputs.kl_loss is not None else 0
         ortho_loss_sum += outputs.ortho_loss.item() if outputs.ortho_loss is not None else 0
+        teacher_loss_sum += teacher_loss.item() if isinstance(teacher_loss, torch.Tensor) else 0
         num_batches += 1
         
         pbar.set_postfix({
-            'L': f"{outputs.total_loss.item():.3f}",
+            'L': f"{loss.item() * cfg.accum_steps if train else loss.item():.3f}",
             'A': f"{outputs.answer_loss.item():.3f}",
             'KL': f"{outputs.kl_loss.item():.3f}",
             'O': f"{outputs.ortho_loss.item():.3f}",
+            'T': f"{teacher_loss.item():.3f}",
             'KLw': f"{kl_weight:.2f}"
         })
     
@@ -313,7 +421,8 @@ def run_one_epoch(
         'total': total_loss / num_batches,
         'answer': answer_loss_sum / num_batches,
         'kl': kl_loss_sum / num_batches,
-        'ortho': ortho_loss_sum / num_batches
+        'ortho': ortho_loss_sum / num_batches,
+        'teacher': teacher_loss_sum / num_batches
     }
 
 
@@ -337,19 +446,32 @@ def main():
         cfg.use_hard_examples_only = bool(args.use_hard_examples_only)
     if args.run_intervention_tests is not None:
         cfg.run_intervention_tests = bool(args.run_intervention_tests)
+    if args.use_teacher is not None:
+        cfg.use_teacher = bool(args.use_teacher)
+    if args.teacher_type is not None:
+        cfg.teacher_type = args.teacher_type
+    if args.teacher_weight is not None:
+        cfg.teacher_weight = args.teacher_weight
+    if args.num_reasoning_samples is not None:
+        cfg.num_reasoning_samples = args.num_reasoning_samples
     if args.resume_epoch:
         cfg.resume_epoch = args.resume_epoch
     
     # Configure stage
     if cfg.stage == 1:
         cfg.save_dir = cfg.save_dir + "_stage1_baseline"
-        print("\n🔵 STAGE 1: BASELINE (No Reasoning)")
+        cfg.use_teacher = False  # No teacher in baseline
+        print("\n🔵 STAGE 1: BASELINE (No Reasoning, No Teacher)")
     elif cfg.stage == 2:
         cfg.save_dir = cfg.save_dir + "_stage2_warmup"
-        print("\n🟡 STAGE 2: WARMUP (Reasoning KL Warmup)")
+        cfg.use_teacher = False  # No teacher in warmup
+        print("\n🟡 STAGE 2: WARMUP (Reasoning KL Warmup, No Teacher)")
     elif cfg.stage == 3:
         cfg.save_dir = cfg.save_dir + "_stage3_full"
-        print("\n🟢 STAGE 3: FULL (Complete Training)")
+        # Teacher enabled by default in stage 3 (unless overridden)
+        if args.use_teacher is None:
+            cfg.use_teacher = True
+        print(f"\n🟢 STAGE 3: FULL (Complete Training + Teacher={cfg.use_teacher})")
     
     # Setup
     set_seed(42)
@@ -384,7 +506,7 @@ def main():
     model.freeze_pretrained(unfreeze_encoder_layers=cfg.unfreeze_encoder_layers)
     model = model.to(device)
     
-    # Dataset
+    # Dataset (load before teacher to get tokenizer)
     print("\n[2/6] Loading dataset...")
     vision_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
     
@@ -396,6 +518,16 @@ def main():
         max_q_len=32,
         max_a_len=32
     )
+    
+    # Teacher evaluator (after dataset for tokenizer)
+    teacher_evaluator = None
+    if cfg.use_teacher:
+        print(f"\n[Teacher] Initializing {cfg.teacher_type} teacher (weight={cfg.teacher_weight}, samples={cfg.num_reasoning_samples})...")
+        teacher_evaluator = TeacherEvaluator(
+            teacher_type=cfg.teacher_type,
+            device=device,
+            tokenizer=full_dataset.tokenizer if hasattr(full_dataset, 'tokenizer') else None
+        )
     
     # FIX #7: Filter hard examples if requested
     if cfg.use_hard_examples_only:
@@ -453,6 +585,7 @@ def main():
         'train_answer': [], 'val_answer': [],
         'train_kl': [], 'val_kl': [],
         'train_ortho': [], 'val_ortho': [],
+        'train_teacher': [], 'val_teacher': [],  # NEW: Teacher loss tracking
         'intervention_ablation': [], 'intervention_noise': [],
         'collapse_rate': [], 'lr': []
     }
@@ -465,14 +598,16 @@ def main():
         # Train
         train_losses = run_one_epoch(
             model, train_loader, optimizer, scaler, device, cfg,
-            curriculum, cfg.stage, scheduler, train=True
+            curriculum, cfg.stage, scheduler, train=True,
+            teacher_evaluator=teacher_evaluator
         )
         
         # Validation
         with torch.no_grad():
             val_losses = run_one_epoch(
                 model, val_loader, optimizer, scaler, device, cfg,
-                curriculum, cfg.stage, train=False
+                curriculum, cfg.stage, train=False,
+                teacher_evaluator=teacher_evaluator
             )
         
         # FIX #6 & #9: Intervention tests
@@ -487,9 +622,19 @@ def main():
         print(f"EPOCH {epoch+1} SUMMARY")
         print(f"{'='*80}")
         print(f"Train: Total={train_losses['total']:.4f} | A={train_losses['answer']:.4f} | "
-              f"KL={train_losses['kl']:.4f} | O={train_losses['ortho']:.4f}")
+              f"KL={train_losses['kl']:.4f} | O={train_losses['ortho']:.4f}", end="")
+        if cfg.use_teacher and 'teacher' in train_losses:
+            print(f" | T={train_losses['teacher']:.4f}")
+        else:
+            print()
+        
         print(f"Val:   Total={val_losses['total']:.4f} | A={val_losses['answer']:.4f} | "
-              f"KL={val_losses['kl']:.4f} | O={val_losses['ortho']:.4f}")
+              f"KL={val_losses['kl']:.4f} | O={val_losses['ortho']:.4f}", end="")
+        if cfg.use_teacher and 'teacher' in val_losses:
+            print(f" | T={val_losses['teacher']:.4f}")
+        else:
+            print()
+        
         print(f"LR: {current_lr:.2e}")
         print(f"{'='*80}\n")
         
@@ -503,6 +648,8 @@ def main():
         history['val_kl'].append(val_losses['kl'])
         history['train_ortho'].append(train_losses['ortho'])
         history['val_ortho'].append(val_losses['ortho'])
+        history['train_teacher'].append(train_losses.get('teacher', 0.0))  # NEW
+        history['val_teacher'].append(val_losses.get('teacher', 0.0))      # NEW
         history['lr'].append(current_lr)
         
         if intervention_results:

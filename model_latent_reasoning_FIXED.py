@@ -186,7 +186,8 @@ class CompressedLatentReasoning(nn.Module):
         multimodal_features, 
         attention_mask=None, 
         deterministic=False,
-        stop_gradient=False  # FIX #2: Stop gradient from decoder
+        stop_gradient=False,  # FIX #2: Stop gradient from decoder
+        temperature=1.0  # PROPOSAL: Temperature for stochastic sampling
     ):
         batch_size = multimodal_features.size(0)
         
@@ -214,7 +215,11 @@ class CompressedLatentReasoning(nn.Module):
         if deterministic or not self.training:
             z = mu
         else:
-            z = self.reparameterize(mu, logvar)
+            # PROPOSAL: Stochastic sampling with temperature
+            # Higher temperature = more exploration of reasoning space
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z = mu + temperature * std * eps  # Temperature-scaled sampling
         
         # FIX #2: KL with free bits
         kl_loss = self.compute_kl_with_free_bits(mu, logvar)
@@ -477,16 +482,19 @@ class FixedLatentReasoningVQA(nn.Module):
         # FIX #2: Training curriculum
         stop_gradient_to_latent: bool = False,
         # FIX #8: KL warmup
-        kl_weight: float = 1.0
+        kl_weight: float = 1.0,
+        # PROPOSAL: Stochastic sampling for teacher distillation
+        temperature: float = 1.0  # Temperature for stochastic reasoning sampling
     ):
         """
-        Forward pass with interventions
+        Forward pass with interventions and stochastic sampling
         
         Args:
             ablate_reasoning: Zero out reasoning (test if model depends on it)
             noise_reasoning: Add noise to test robustness
             stop_gradient_to_latent: Prevent decoder from influencing latent
             kl_weight: Curriculum for KL (warmup from 0 → 1)
+            temperature: Temperature for sampling reasoning (>1 = more random, <1 = more deterministic)
         """
         # 1. Encode vision
         visual_outputs = self.vision_encoder(pixel_values, return_dict=True)
@@ -503,11 +511,12 @@ class FixedLatentReasoningVQA(nn.Module):
             fused, attn = fusion_layer(fused, visual_features, self.image_dropout_prob)
             attention_maps.append(attn)
         
-        # 4. FIX #4 & #2: Extract compressed reasoning with free bits
+        # 4. FIX #4 & #2: Extract compressed reasoning with free bits + PROPOSAL temperature
         reasoning_latents, kl_loss, compressed_z, mu, logvar = self.latent_reasoning(
             fused, attention_mask,
             deterministic=deterministic_reasoning,
-            stop_gradient=stop_gradient_to_latent
+            stop_gradient=stop_gradient_to_latent,
+            temperature=temperature  # PROPOSAL: Stochastic sampling
         )
         
         # 5. FIX #5: Apply diversity regularization
@@ -641,6 +650,271 @@ class FixedLatentReasoningVQA(nn.Module):
         ]
         
         return answers
+
+
+# ============================================================================
+# TEACHER EVALUATOR (MISSING! - CRITICAL FOR PROPOSAL!)
+# ============================================================================
+
+class TeacherEvaluator:
+    """
+    Teacher model for online distillation (PROPOSAL Section 6 & 7)
+    
+    Provides answer quality scores to guide reasoning module
+    Supports:
+    - Rule-based (fast baseline)
+    - VLM-based (Qwen2.5-VL-7B-Instruct for semantic understanding)
+    """
+    
+    def __init__(
+        self, 
+        teacher_type: str = 'rule_based', 
+        device: str = 'cuda',
+        tokenizer = None
+    ):
+        self.teacher_type = teacher_type
+        self.device = device
+        self.tokenizer = tokenizer
+        
+        print(f"[Teacher] Initializing {teacher_type} evaluator...")
+        
+        if teacher_type == 'vlm':
+            try:
+                from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+                
+                print("[Teacher] Loading Qwen2.5-VL-7B-Instruct...")
+                self.vlm_model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    "Qwen/Qwen2-VL-7B-Instruct",
+                    torch_dtype=torch.float16,
+                    device_map="auto"
+                )
+                self.vlm_processor = AutoProcessor.from_pretrained(
+                    "Qwen/Qwen2-VL-7B-Instruct"
+                )
+                
+                print("[Teacher] ✅ Qwen2.5-VL loaded successfully")
+                
+            except Exception as e:
+                print(f"[Teacher] ❌ Failed to load VLM: {e}")
+                print("[Teacher] Falling back to rule-based")
+                self.teacher_type = 'rule_based'
+        else:
+            print("[Teacher] ✅ Rule-based evaluator ready")
+    
+    @torch.no_grad()
+    def evaluate_answers(
+        self,
+        predictions: list,
+        ground_truths: list,
+        images: Optional[torch.Tensor] = None,
+        questions: Optional[list] = None
+    ) -> torch.Tensor:
+        """
+        Evaluate answer quality (PROPOSAL: teacher judges answer plausibility)
+        
+        Args:
+            predictions: Model predictions (strings)
+            ground_truths: Ground truth answers (strings)
+            images: Optional image tensors for VLM [B, C, H, W]
+            questions: Optional question texts for VLM
+        
+        Returns:
+            scores: Quality scores [0, 1] for each prediction
+        """
+        if self.teacher_type == 'vlm' and hasattr(self, 'vlm_model'):
+            return self._evaluate_with_vlm(predictions, ground_truths, images, questions)
+        else:
+            return self._evaluate_rule_based(predictions, ground_truths)
+    
+    def _evaluate_rule_based(
+        self, 
+        predictions: list, 
+        ground_truths: list
+    ) -> torch.Tensor:
+        """Rule-based evaluation (fast, simple)"""
+        scores = []
+        
+        for pred, gt in zip(predictions, ground_truths):
+            pred_norm = pred.lower().strip()
+            gt_norm = gt.lower().strip()
+            
+            # Exact match
+            if pred_norm == gt_norm:
+                score = 1.0
+            # Partial match
+            elif gt_norm in pred_norm or pred_norm in gt_norm:
+                score = 0.7
+            # Semantic similarity
+            elif self._semantic_similarity(pred_norm, gt_norm) > 0.5:
+                score = 0.5
+            # Wrong
+            else:
+                score = 0.0
+            
+            scores.append(score)
+        
+        return torch.tensor(scores, dtype=torch.float32, device=self.device)
+    
+    def _evaluate_with_vlm(
+        self,
+        predictions: list,
+        ground_truths: list,
+        images: Optional[torch.Tensor] = None,
+        questions: Optional[list] = None
+    ) -> torch.Tensor:
+        """
+        VLM-based evaluation (Qwen2.5-VL)
+        
+        Uses vision-language model to score answer quality
+        More semantic understanding than rule-based
+        """
+        scores = []
+        
+        for i, (pred, gt) in enumerate(zip(predictions, ground_truths)):
+            # Construct prompt for VLM
+            if images is not None and questions is not None:
+                # Full multimodal evaluation
+                prompt = self._construct_vlm_prompt(
+                    question=questions[i] if i < len(questions) else "",
+                    prediction=pred,
+                    ground_truth=gt
+                )
+                
+                # Prepare inputs
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "image": images[i] if i < len(images) else None
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ]
+                
+                # Process
+                text = self.vlm_processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                
+                image_inputs = None
+                if images is not None and i < len(images):
+                    # Convert tensor to PIL
+                    import torchvision.transforms as T
+                    to_pil = T.ToPILImage()
+                    pil_image = to_pil(images[i].cpu())
+                    image_inputs = [pil_image]
+                
+                inputs = self.vlm_processor(
+                    text=[text],
+                    images=image_inputs,
+                    return_tensors="pt"
+                ).to(self.vlm_model.device)
+                
+                # Generate score
+                outputs = self.vlm_model.generate(
+                    **inputs,
+                    max_new_tokens=10,
+                    temperature=0.1  # Low temp for consistent scoring
+                )
+                
+                # Decode and parse score
+                response = self.vlm_processor.batch_decode(
+                    outputs, skip_special_tokens=True
+                )[0]
+                
+                # Extract score from response
+                score = self._parse_vlm_score(response)
+                
+            else:
+                # Text-only evaluation (fallback)
+                score = self._evaluate_text_only_vlm(pred, gt)
+            
+            scores.append(score)
+        
+        return torch.tensor(scores, dtype=torch.float32, device=self.device)
+    
+    def _construct_vlm_prompt(
+        self, 
+        question: str, 
+        prediction: str, 
+        ground_truth: str
+    ) -> str:
+        """Construct prompt for VLM evaluation"""
+        prompt = f"""You are evaluating the quality of a Vietnamese VQA model's answer.
+
+Question: {question}
+Student Answer: {prediction}
+Ground Truth: {ground_truth}
+
+Rate the student answer quality from 0 to 100:
+- 100: Perfect match (semantically identical to ground truth)
+- 70-90: Correct but different wording
+- 40-70: Partially correct
+- 0-40: Incorrect
+
+Respond with ONLY a number (0-100).
+Score:"""
+        return prompt
+    
+    def _parse_vlm_score(self, response: str) -> float:
+        """Parse VLM response to extract score"""
+        import re
+        
+        # Extract number from response
+        numbers = re.findall(r'\d+', response)
+        
+        if numbers:
+            score = int(numbers[0])
+            # Normalize to [0, 1]
+            return min(max(score / 100.0, 0.0), 1.0)
+        else:
+            # Fallback: parse text
+            response_lower = response.lower()
+            if any(word in response_lower for word in ['perfect', 'correct', 'excellent']):
+                return 0.9
+            elif any(word in response_lower for word in ['good', 'mostly']):
+                return 0.7
+            elif any(word in response_lower for word in ['partial', 'somewhat']):
+                return 0.5
+            else:
+                return 0.2
+    
+    def _evaluate_text_only_vlm(self, pred: str, gt: str) -> float:
+        """Text-only VLM evaluation (without image)"""
+        prompt = f"""Rate answer quality (0-100):
+Ground truth: {gt}
+Prediction: {pred}
+
+Score (number only):"""
+        
+        inputs = self.vlm_processor(
+            text=[prompt],
+            return_tensors="pt"
+        ).to(self.vlm_model.device)
+        
+        outputs = self.vlm_model.generate(**inputs, max_new_tokens=5)
+        response = self.vlm_processor.batch_decode(outputs, skip_special_tokens=True)[0]
+        
+        return self._parse_vlm_score(response)
+    
+    def _semantic_similarity(self, s1: str, s2: str) -> float:
+        """Simple word overlap similarity (for rule-based)"""
+        words1 = set(s1.split())
+        words2 = set(s2.split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        
+        return intersection / union if union > 0 else 0.0
 
 
 # ============================================================================
