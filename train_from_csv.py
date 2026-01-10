@@ -50,9 +50,9 @@ class TrainConfig:
     pin_memory: bool = True
     persistent_workers: bool = True
 
-    base_lr: float = 2e-4               # for fusion/decoder/text
+    base_lr: float = 5e-5               # 🔥 Giảm từ 2e-4 → 5e-5 (safer cho large model)
     vision_lr: float = 1e-5             # smaller to protect ViT
-    weight_decay: float = 0.01
+    weight_decay: float = 0.05          # 🔥 Tăng từ 0.01 → 0.05 (stronger regularization)
     max_grad_norm: float = 1.0
 
     warmup_ratio: float = 0.06          # % of total steps for warmup
@@ -228,12 +228,13 @@ def main():
         bartpho_model_name='vinai/bartpho-syllable',
         num_cross_attn_layers=3,
         num_heads=16,
-        dropout=0.1,
+        dropout=0.3,  # 🔥 Tăng từ 0.1 → 0.3 để chống overfitting
         gradient_checkpointing=True
     ).to(device)
     
-    # Optional: Freeze pretrained weights for faster training
-    # model.freeze_pretrained_weights(unfreeze_encoder_last_n_layers=3)
+    # 🔥 KHUYÊN DÙNG: Freeze pretrained weights để tránh overfitting
+    # Chỉ train ~45M params thay vì 527M, giảm 91% params!
+    model.freeze_pretrained_weights(unfreeze_encoder_last_n_layers=3)
     
     print(f"[INFO] Model initialized successfully")
 
