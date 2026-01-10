@@ -331,11 +331,13 @@ def run_one_epoch(
                     
                     # Generate answer from reasoning latents using beam search/greedy
                     # NOTE: Changed from argmax to generate() for train/inference consistency
-                    answers = model.generate_from_reasoning(
-                        reasoning_latents=sample_out.reasoning_latents,
-                        max_length=10,  # VQA answers are short
-                        num_beams=1  # Greedy for speed (can increase for better quality)
-                    )
+                    # IMPORTANT: Use no_grad to avoid building computation graph for generation
+                    with torch.no_grad():
+                        answers = model.generate_from_reasoning(
+                            reasoning_latents=sample_out.reasoning_latents,
+                            max_length=10,  # VQA answers are short
+                            num_beams=1  # Greedy for speed (can increase for better quality)
+                        )
                     
                     candidate_outputs.append(sample_out)
                     candidate_answers.append(answers)
@@ -504,7 +506,12 @@ def main():
         gradient_checkpointing=True
     )
     
-    model.freeze_pretrained(unfreeze_encoder_layers=cfg.unfreeze_encoder_layers)
+    # FIX: Unfreeze decoder for Stage 2-3 (curriculum learning)
+    unfreeze_decoder = (cfg.stage >= 2)  # Only freeze in Stage 1
+    model.freeze_pretrained(
+        unfreeze_encoder_layers=cfg.unfreeze_encoder_layers,
+        unfreeze_decoder=unfreeze_decoder
+    )
     model = model.to(device)
     
     # Dataset (load before teacher to get tokenizer)

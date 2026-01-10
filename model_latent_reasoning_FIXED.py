@@ -439,7 +439,7 @@ class FixedLatentReasoningVQA(nn.Module):
         
         print("[FIXED MODEL] ✓ Initialization complete")
     
-    def freeze_pretrained(self, unfreeze_encoder_layers: int = 3):
+    def freeze_pretrained(self, unfreeze_encoder_layers: int = 3, unfreeze_decoder: bool = True):
         """Freeze pretrained components"""
         # Freeze vision
         for param in self.vision_encoder.parameters():
@@ -455,20 +455,35 @@ class FixedLatentReasoningVQA(nn.Module):
                 for param in layer.parameters():
                     param.requires_grad = True
         
-        # FIX #8: Freeze decoder initially (curriculum)
-        for param in self.decoder.parameters():
-            param.requires_grad = False
+        # FIX #8: Freeze decoder only in Stage 1 (curriculum)
+        # For Stage 2-3, decoder should be trainable!
+        if unfreeze_decoder:
+            # Unfreeze last 2 layers of decoder for fine-tuning
+            total_decoder_layers = len(self.decoder.layers)
+            for param in self.decoder.parameters():
+                param.requires_grad = False
+            
+            for i, layer in enumerate(self.decoder.layers):
+                if i >= total_decoder_layers - 2:  # Last 2 layers
+                    for param in layer.parameters():
+                        param.requires_grad = True
+        else:
+            # Completely freeze decoder (Stage 1 only)
+            for param in self.decoder.parameters():
+                param.requires_grad = False
         
-        # Trainable: fusion + reasoning + lm_head
+        # Trainable: fusion + reasoning + lm_head + decoder (if unfrozen)
         trainable = (
             sum(p.numel() for p in self.vision_proj.parameters()) +
             sum(p.numel() for p in self.vision_first_fusion.parameters()) +
             sum(p.numel() for p in self.latent_reasoning.parameters()) +
             sum(p.numel() for p in self.lm_head.parameters()) +
-            sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
+            sum(p.numel() for p in self.encoder.parameters() if p.requires_grad) +
+            sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
         )
         
         print(f"[FIXED MODEL] Trainable params: {trainable/1e6:.1f}M")
+        print(f"[FIXED MODEL] Decoder trainable: {unfreeze_decoder}")
     
     def forward(
         self,
