@@ -598,16 +598,19 @@ def main():
         # Train
         train_losses = run_one_epoch(
             model, train_loader, optimizer, scaler, device, cfg,
-            curriculum, cfg.stage, scheduler, train=True,
-            teacher_evaluator=teacher_evaluator
+            curriculum, cfg.stage, 
+            teacher_evaluator=teacher_evaluator,
+            scheduler=scheduler, 
+            train=True
         )
         
         # Validation
         with torch.no_grad():
             val_losses = run_one_epoch(
                 model, val_loader, optimizer, scaler, device, cfg,
-                curriculum, cfg.stage, train=False,
-                teacher_evaluator=teacher_evaluator
+                curriculum, cfg.stage,
+                teacher_evaluator=teacher_evaluator,
+                train=False
             )
         
         # FIX #6 & #9: Intervention tests
