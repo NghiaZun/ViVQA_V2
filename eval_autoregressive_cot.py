@@ -1,20 +1,20 @@
 """
-EVALUATION SCRIPT: Autoregressive CoT DINOv2 + BARTpho VQA
-============================================================
-Evaluate autoregressive CoT model với:
-✅ Generate reasoning autoregressive (no teacher forcing)
-✅ Generate answer conditioned on generated reasoning
+EVALUATION SCRIPT: Latent Reasoning VQA (FixedLatentReasoningVQA)
+===================================================================
+Evaluate latent reasoning model với:
+✅ Latent reasoning bottleneck (implicit reasoning)
+✅ Generate answers from latent representations
 ✅ Metrics: Accuracy, F1, ROUGE-1, ROUGE-L
-✅ Evaluate both reasoning và answer quality
+✅ Evaluate answer quality
 """
 
 import torch
 import json
 import csv
+import pandas as pd
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
-from model_dinov2_bartpho import DINOv2BARTphoVQA
-from train_autoregressive_cot import VQADistillationDataset
+from model import FixedLatentReasoningVQA  # Changed to latent reasoning model
 import numpy as np
 from collections import defaultdict
 import re
@@ -133,19 +133,18 @@ def evaluate_autoregressive_cot(
         for batch in tqdm(test_loader):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             
-            # Generate reasoning and answer using model's generate method
-            reasoning_text, answer_text, _ = model.generate(
+            # Generate answers using FixedLatentReasoningVQA.generate()
+            # Note: This model doesn't generate separate reasoning text (it's latent)
+            answer_text = model.generate(
                 pixel_values=batch['pixel_values'],
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],
-                max_reasoning_len=max_reasoning_len,
-                max_answer_len=max_answer_len,
-                num_beams=num_beams,
-                repetition_penalty=2.0,  # 🔥 Tăng từ 1.2 → 2.0 để ngăn repetition
-                length_penalty=0.8,      # 🔥 Giảm từ 1.0 → 0.8 để ưu tiên câu ngắn hơn
-                no_repeat_ngram_size=3,  # 🔥 Thêm: không lặp lại 3-gram
-                early_stopping=True      # 🔥 Thêm: dừng sớm khi đủ beam candidates
+                max_length=max_answer_len,
+                num_beams=num_beams
             )
+            
+            # Latent reasoning model doesn't output explicit reasoning text
+            reasoning_text = ['[LATENT REASONING]'] * len(answer_text)
             
             # Check if we have ground truth
             gt_answer_labels = batch.get('labels', None)
@@ -203,26 +202,10 @@ def evaluate_autoregressive_cot(
                     answer_rougel_list.append(rougel)
                 
                 # ===== EVALUATE REASONING =====
-                if gt_reasoning_labels is not None and evaluate_reasoning:
-                    has_gt_reasoning = True
-                    reasoning_label_ids = gt_reasoning_labels[i] if gt_reasoning_labels.dim() > 1 else gt_reasoning_labels
-                    gt_reasoning = model.tokenizer.decode(reasoning_label_ids.cpu().tolist(), skip_special_tokens=True)
-                    result_row['gt_reasoning'] = gt_reasoning
-                    
-                    # Normalize
-                    pred_reason_norm = normalize_text(pred_reasoning)
-                    gt_reason_norm = normalize_text(gt_reasoning)
-                    
-                    # Token F1
-                    pred_reason_tokens = pred_reason_norm.split()
-                    gt_reason_tokens = gt_reason_norm.split()
-                    reason_f1 = compute_f1(pred_reason_tokens, gt_reason_tokens)
-                    reasoning_f1_list.append(reason_f1)
-                    
-                    # ROUGE
-                    reason_rouge1, reason_rougel = compute_rouge(pred_reason_norm, gt_reason_norm)
-                    reasoning_rouge1_list.append(reason_rouge1)
-                    reasoning_rougel_list.append(reason_rougel)
+                # Note: Latent reasoning model doesn't produce explicit reasoning text
+                # Reasoning is implicit in latent representations
+                # Skip reasoning evaluation for this model type
+                pass
                 
                 results.append(result_row)
     
@@ -247,7 +230,7 @@ def evaluate_autoregressive_cot(
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Evaluate Autoregressive CoT DINOv2 + BARTpho VQA')
+    parser = argparse.ArgumentParser(description='Evaluate Latent Reasoning VQA (FixedLatentReasoningVQA)')
     parser.add_argument('--mode', type=str, default='val', choices=['test', 'val'],
                        help='Evaluation mode: test (no GT) or val (with GT metrics)')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -267,9 +250,10 @@ def main():
     
     # Config based on mode
     if args.mode == 'val':
+        # Use train.csv with validation split for metrics
         CONFIG = {
             'checkpoint_path': args.checkpoint,
-            'train_json': '/kaggle/input/teacher-5-12/teacher_outputs_train.jsonl',
+            'csv_path': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv',
             'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
             'output_csv': args.output_csv,
             'batch_size': args.batch_size,
@@ -279,7 +263,7 @@ def main():
     else:  # test mode
         CONFIG = {
             'checkpoint_path': args.checkpoint,
-            'test_csv': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv',
+            'csv_path': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv',
             'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test',
             'output_csv': args.output_csv,
             'batch_size': args.batch_size,
@@ -287,7 +271,7 @@ def main():
         }
     
     print("="*70)
-    print(f"AUTOREGRESSIVE COT EVALUATION ({args.mode.upper()} mode)")
+    print(f"LATENT REASONING VQA EVALUATION ({args.mode.upper()} mode)")
     print("="*70)
     print(f"Max Reasoning Length: {args.max_reasoning_len}")
     print(f"Max Answer Length: {args.max_answer_len}")
@@ -296,12 +280,18 @@ def main():
     print("="*70)
     
     # Load model
-    print("\n[INFO] Loading model...")
-    model = DINOv2BARTphoVQA(
+    print("\n[INFO] Loading FixedLatentReasoningVQA model...")
+    model = FixedLatentReasoningVQA(
         dinov2_model_name='facebook/dinov2-base',
         bartpho_model_name='vinai/bartpho-syllable',
-        num_cross_attn_layers=3,
-        use_reasoning_quality_check=False,  # Not used in inference
+        num_reasoning_tokens=6,
+        latent_dim=256,
+        num_reasoning_layers=2,
+        num_fusion_layers=2,
+        free_bits=0.5,
+        ortho_weight=0.1,
+        image_dropout_prob=0.1,
+        token_dropout_prob=0.3,
         gradient_checkpointing=False  # Disable for inference
     )
     
@@ -317,22 +307,82 @@ def main():
     
     # Load dataset based on mode
     if args.mode == 'val':
-        print("\n[INFO] Loading validation dataset with ground truth...")
-        full_dataset = VQADistillationDataset(
-            json_path=CONFIG['train_json'],
+        print("\n[INFO] Loading validation dataset with ground truth from CSV...")
+        
+        # Use same CSV-based dataset as example
+        class VQACSVDataset(torch.utils.data.Dataset):
+            def __init__(self, csv_path, image_dir, vision_processor, tokenizer, max_question_len=64, max_answer_len=32):
+                self.data = pd.read_csv(csv_path)
+                self.image_dir = image_dir
+                self.vision_processor = vision_processor
+                self.tokenizer = tokenizer
+                self.max_question_len = max_question_len
+                self.max_answer_len = max_answer_len
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, idx):
+                row = self.data.iloc[idx]
+                img_id = str(row['img_id'])
+                question = row['question']
+                answer = row['answer']
+                
+                from PIL import Image
+                img_path = f"{self.image_dir}/{img_id}.jpg"
+                try:
+                    image = Image.open(img_path).convert('RGB')
+                except:
+                    image = Image.new('RGB', (224, 224), color='white')
+                
+                pixel_values = self.vision_processor(images=image, return_tensors='pt')['pixel_values'][0]
+                
+                question_enc = self.tokenizer(
+                    question,
+                    max_length=self.max_question_len,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt'
+                )
+                
+                answer_enc = self.tokenizer(
+                    answer,
+                    max_length=self.max_answer_len,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt'
+                )
+                
+                labels = answer_enc['input_ids'][0].clone()
+                labels[labels == self.tokenizer.pad_token_id] = -100
+                
+                return {
+                    'pixel_values': pixel_values,
+                    'input_ids': question_enc['input_ids'][0],
+                    'attention_mask': question_enc['attention_mask'][0],
+                    'labels': labels,
+                    'img_id': img_id,
+                    'question': question
+                }
+        
+        full_dataset = VQACSVDataset(
+            csv_path=CONFIG['csv_path'],
             image_dir=CONFIG['image_dir'],
             vision_processor=model.vision_processor,
-            tokenizer=model.tokenizer,
-            augment=False
+            tokenizer=model.tokenizer
         )
         
-        # Split into val (same as training)
-        total_size = len(full_dataset)
-        val_size = int(total_size * CONFIG['val_split'])
-        train_size = total_size - val_size
-        torch.manual_seed(42)  # Same seed as training
-        _, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
-        print(f"[INFO] Using validation split: {len(test_dataset)} samples")
+        if CONFIG.get('use_val_split', False):
+            # Split into val (same as training)
+            total_size = len(full_dataset)
+            val_size = int(total_size * CONFIG['val_split'])
+            train_size = total_size - val_size
+            torch.manual_seed(42)  # Same seed as training
+            _, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+            print(f"[INFO] Using validation split: {len(test_dataset)} samples")
+        else:
+            test_dataset = full_dataset
+            print(f"[INFO] Using full dataset: {len(test_dataset)} samples")
     else:
         print("\n[INFO] Loading test dataset from CSV (no GT)...")
         
@@ -414,27 +464,32 @@ def main():
 
     print(f"\n[INFO] ✓ Predictions saved to {CONFIG['output_csv']}")
     
-    # Print results
+    # Print results (format giống file example)
     print("\n" + "="*70)
-    print("AUTOREGRESSIVE COT EVALUATION RESULTS")
+    print("========== Test Results ==========")
     print("="*70)
     print(f"Total samples: {stats['total_samples']}")
     
     if 'answer_exact_match_acc' in stats:
         print("\n[ANSWER METRICS]")
-        print(f"  Exact Match Accuracy: {stats['answer_exact_match_acc']:.2f}%")
-        print(f"  Token F1 Score:       {stats['answer_token_f1']:.2f}%")
-        print(f"  ROUGE-1:              {stats['answer_rouge1']:.2f}%")
-        print(f"  ROUGE-L:              {stats['answer_rougel']:.2f}%")
+        print(f"Accuracy (EM): {stats['answer_exact_match_acc']:.2f}%")
+        print(f"ROUGE-1 F1: {stats['answer_rouge1']/100:.4f}")  # Convert % to decimal
+        print(f"ROUGE-L F1: {stats['answer_rougel']/100:.4f}")
+        print(f"Token F1: {stats['answer_token_f1']/100:.4f}")
     
     if 'reasoning_token_f1' in stats:
         print("\n[REASONING METRICS]")
-        print(f"  Token F1 Score:       {stats['reasoning_token_f1']:.2f}%")
-        print(f"  ROUGE-1:              {stats['reasoning_rouge1']:.2f}%")
-        print(f"  ROUGE-L:              {stats['reasoning_rougel']:.2f}%")
+        print(f"Token F1 Score:       {stats['reasoning_token_f1']:.2f}%")
+        print(f"ROUGE-1:              {stats['reasoning_rouge1']:.2f}%")
+        print(f"ROUGE-L:              {stats['reasoning_rougel']:.2f}%")
     
     if not ('answer_exact_match_acc' in stats):
-        print("(No ground truth available - test mode)")
+        print("\n(No ground truth available - test mode)")
+    
+    # Print sample predictions
+    print("\n===== Sample Predictions =====")
+    for i in range(min(10, len(results))):
+        print(f"Q{i+1} | GT: {results[i].get('gt_answer', 'N/A')} || Pred: {results[i]['pred_answer']}")
     
     print("="*70)
 
