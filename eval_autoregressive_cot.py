@@ -15,6 +15,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from model import FixedLatentReasoningVQA  # Changed to latent reasoning model
+from transformers import AutoImageProcessor  # Add this for vision processing
 import numpy as np
 from collections import defaultdict
 import re
@@ -306,6 +307,9 @@ def main():
         print(f"      Best Val Loss: {checkpoint['best_val_loss']:.4f}")
     
     # Load dataset based on mode
+    # Create vision_processor (FixedLatentReasoningVQA doesn't store it)
+    vision_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
+    
     if args.mode == 'val':
         print("\n[INFO] Loading validation dataset with ground truth from CSV...")
         
@@ -368,7 +372,7 @@ def main():
         full_dataset = VQACSVDataset(
             csv_path=CONFIG['csv_path'],
             image_dir=CONFIG['image_dir'],
-            vision_processor=model.vision_processor,
+            vision_processor=vision_processor,
             tokenizer=model.tokenizer
         )
         
@@ -426,9 +430,9 @@ def main():
                 }
         
         test_dataset = VQATestCSVDataset(
-            csv_path=CONFIG['test_csv'],
+            csv_path=CONFIG['csv_path'],
             image_dir=CONFIG['image_dir'],
-            vision_processor=model.vision_processor,
+            vision_processor=vision_processor,
             tokenizer=model.tokenizer
         )
         print(f"[INFO] Loaded {len(test_dataset)} test samples")
