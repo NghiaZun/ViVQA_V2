@@ -31,6 +31,9 @@ from torch.optim import AdamW
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for server environments
 
 
 def get_current_stage(epoch: int, stage1_epochs: int, stage2_epochs: int):
@@ -41,6 +44,154 @@ def get_current_stage(epoch: int, stage1_epochs: int, stage2_epochs: int):
         return 2
     else:
         return 3
+
+
+def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
+    """
+    Plot and save training curves:
+    - Loss curves (train vs val)
+    - Learning rate schedule
+    - Stage transitions marked
+    """
+    epochs = history['epoch']
+    train_loss = history['train_loss']
+    val_loss = history['val_loss']
+    lr = history['lr']
+    stages = history['stage']
+    
+    # Create figure with 2 subplots
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # === Plot 1: Loss Curves ===
+    ax1 = axes[0]
+    ax1.plot(epochs, train_loss, 'b-o', label='Train Loss', linewidth=2, markersize=4, alpha=0.8)
+    ax1.plot(epochs, val_loss, 'r-s', label='Val Loss', linewidth=2, markersize=4, alpha=0.8)
+    
+    # Mark stage transitions
+    stage1_end = stage1_epochs
+    stage2_end = stage1_epochs + stage2_epochs
+    
+    if len(epochs) > stage1_end:
+        ax1.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7, label='Stage 1→2')
+    if len(epochs) > stage2_end:
+        ax1.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7, label='Stage 2→3')
+    
+    # Add stage background colors
+    if len(epochs) > 0:
+        stage1_x = [e for e in epochs if e <= stage1_end]
+        if stage1_x:
+            ax1.axvspan(min(stage1_x), max(stage1_x), alpha=0.1, color='blue', label='Stage 1 (Fusion)')
+        
+        stage2_x = [e for e in epochs if stage1_end < e <= stage2_end]
+        if stage2_x:
+            ax1.axvspan(min(stage2_x), max(stage2_x), alpha=0.1, color='orange', label='Stage 2 (+ Text)')
+        
+        stage3_x = [e for e in epochs if e > stage2_end]
+        if stage3_x:
+            ax1.axvspan(min(stage3_x), max(stage3_x), alpha=0.1, color='green', label='Stage 3 (+ Vision)')
+    
+    ax1.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Loss', fontsize=12, fontweight='bold')
+    ax1.set_title('Training and Validation Loss (3-Stage Training)', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # === Plot 2: Learning Rate Schedule ===
+    ax2 = axes[1]
+    ax2.plot(epochs, lr, 'g-o', linewidth=2, markersize=4, alpha=0.8)
+    
+    # Mark stage transitions
+    if len(epochs) > stage1_end:
+        ax2.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7)
+    if len(epochs) > stage2_end:
+        ax2.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7)
+    
+    # Add stage background colors
+    if len(epochs) > 0:
+        stage1_x = [e for e in epochs if e <= stage1_end]
+        if stage1_x:
+            ax2.axvspan(min(stage1_x), max(stage1_x), alpha=0.1, color='blue')
+        
+        stage2_x = [e for e in epochs if stage1_end < e <= stage2_end]
+        if stage2_x:
+            ax2.axvspan(min(stage2_x), max(stage2_x), alpha=0.1, color='orange')
+        
+        stage3_x = [e for e in epochs if e > stage2_end]
+        if stage3_x:
+            ax2.axvspan(min(stage3_x), max(stage3_x), alpha=0.1, color='green')
+    
+    ax2.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Learning Rate', fontsize=12, fontweight='bold')
+    ax2.set_title('Learning Rate Schedule (Cosine with Stage Transitions)', fontsize=14, fontweight='bold')
+    ax2.set_yscale('log')  # Log scale for better visualization
+    ax2.grid(True, alpha=0.3)
+    
+    # Add annotations for LR changes
+    if len(epochs) > stage1_end and stage1_end < len(lr):
+        ax2.annotate(f'LR×0.5\n{lr[stage1_end]:.2e}', 
+                    xy=(stage1_end, lr[stage1_end]), 
+                    xytext=(stage1_end-2, lr[stage1_end]*2),
+                    arrowprops=dict(arrowstyle='->', color='orange', lw=1.5),
+                    fontsize=9, ha='right')
+    
+    if len(epochs) > stage2_end and stage2_end < len(lr):
+        ax2.annotate(f'LR×0.1\n{lr[stage2_end]:.2e}', 
+                    xy=(stage2_end, lr[stage2_end]), 
+                    xytext=(stage2_end-2, lr[stage2_end]*2),
+                    arrowprops=dict(arrowstyle='->', color='green', lw=1.5),
+                    fontsize=9, ha='right')
+    
+    plt.tight_layout()
+    
+    # Save figure
+    curve_path = os.path.join(save_dir, "training_curves.png")
+    plt.savefig(curve_path, dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved training curves: {curve_path}")
+    plt.close()
+    
+    # === Additional Plot: Loss comparison ===
+    fig2, ax = plt.subplots(1, 1, figsize=(12, 6))
+    
+    # Plot both losses with fill between
+    ax.plot(epochs, train_loss, 'b-o', label='Train Loss', linewidth=2, markersize=4)
+    ax.plot(epochs, val_loss, 'r-s', label='Val Loss', linewidth=2, markersize=4)
+    ax.fill_between(epochs, train_loss, val_loss, alpha=0.2, color='gray', label='Train-Val Gap')
+    
+    # Mark best model
+    if val_loss:
+        best_epoch_idx = val_loss.index(min(val_loss))
+        best_epoch = epochs[best_epoch_idx]
+        best_val = val_loss[best_epoch_idx]
+        ax.scatter([best_epoch], [best_val], color='red', s=200, marker='*', 
+                  edgecolors='black', linewidth=2, zorder=5, label=f'Best Model (Epoch {best_epoch})')
+        ax.annotate(f'Best: {best_val:.4f}', 
+                   xy=(best_epoch, best_val), 
+                   xytext=(best_epoch+1, best_val+0.05),
+                   arrowprops=dict(arrowstyle='->', color='red', lw=2),
+                   fontsize=11, fontweight='bold')
+    
+    # Stage transitions
+    if len(epochs) > stage1_end:
+        ax.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7)
+        ax.text(stage1_end, ax.get_ylim()[1]*0.95, 'Stage 1→2\n(Unfreeze Text)', 
+               ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='orange', alpha=0.3))
+    
+    if len(epochs) > stage2_end:
+        ax.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7)
+        ax.text(stage2_end, ax.get_ylim()[1]*0.95, 'Stage 2→3\n(Unfreeze Vision)', 
+               ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='green', alpha=0.3))
+    
+    ax.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Loss', fontsize=12, fontweight='bold')
+    ax.set_title('Loss Comparison with Best Model Marker', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    loss_compare_path = os.path.join(save_dir, "loss_comparison.png")
+    plt.savefig(loss_compare_path, dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved loss comparison: {loss_compare_path}")
+    plt.close()
 
 
 def run_one_epoch_simple(
@@ -354,7 +505,6 @@ def main():
                 num_warmup_steps=0,  # No warmup for stage transitions
                 num_training_steps=remaining_steps
             )
-            print()
         elif epoch == stage2_end:
             print("\n" + "="*80)
             print("🟢 STAGE 3: Unfreezing Vision Encoder")
@@ -490,6 +640,10 @@ def main():
     df = pd.DataFrame(history)
     csv_path = os.path.join(cfg.save_dir, "training_history.csv")
     df.to_csv(csv_path, index=False)
+    
+    # Plot training curves
+    print("\n[5/6] Generating training curves...")
+    plot_training_curves(history, cfg.save_dir, args.stage1_epochs, args.stage2_epochs)
     
     print("\n" + "="*80)
     print("✅ ALL 3 STAGES COMPLETED!")
