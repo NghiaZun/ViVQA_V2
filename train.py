@@ -25,7 +25,7 @@ import pandas as pd
 import numpy as np
 
 from dataset import VQAGenDataset
-from model_latent_reasoning_FIXED import (
+from model import (
     FixedLatentReasoningVQA,
     TrainingCurriculum,
     TeacherEvaluator

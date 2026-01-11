@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from train_latent_reasoning_FIXED import (
     FixedTrainConfig, set_seed, run_one_epoch, TrainingCurriculum
 )
-from model_latent_reasoning_FIXED import FixedLatentReasoningVQA, TeacherEvaluator
+from model import FixedLatentReasoningVQA, TeacherEvaluator
 from dataset import VQAGenDataset
 from transformers import AutoImageProcessor
 from torch.utils.data import DataLoader, random_split
@@ -66,6 +66,11 @@ def main():
     cfg.max_q_len = 64  # Max question length
     cfg.max_a_len = 10  # Max answer length (VQA answers are short: 1-3 words)
     cfg.learning_rate = cfg.base_lr  # Add learning_rate alias
+    cfg.use_teacher = True  # Enable teacher in Stage 3
+    cfg.teacher_weight = 0.5  # Teacher loss weight
+    cfg.reasoning_temperature = 0.7  # Temperature for stochastic sampling
+    cfg.preference_margin = 0.1  # Margin for ranking loss
+    cfg.use_amp = True  # Enable automatic mixed precision
     
     # Total epochs
     total_epochs = args.stage1_epochs + args.stage2_epochs + args.stage3_epochs

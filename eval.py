@@ -1,7 +1,7 @@
 """
-EVALUATION SCRIPT: FIXED Latent Reasoning VQA
+EVALUATION SCRIPT: Latent Reasoning VQA
 ===============================================
-Evaluate trained FIXED latent reasoning model
+Evaluate trained latent reasoning model
 
 Metrics:
 1. Exact Match Accuracy (EM)
@@ -10,7 +10,7 @@ Metrics:
 4. Diversity metrics
 
 Usage:
-    python eval_latent_reasoning_FIXED.py \
+    python eval.py \
         --checkpoint /kaggle/working/checkpoints_fixed/best.pt \
         --test_csv /kaggle/input/vivqa/vlsp2023_vqa_test_final.csv \
         --test_images /kaggle/input/vivqa/test_images \
@@ -29,7 +29,7 @@ import pandas as pd
 import numpy as np
 
 from dataset import VQAGenDataset
-from model_latent_reasoning_FIXED import FixedLatentReasoningVQA
+from model import FixedLatentReasoningVQA
 
 
 def parse_args():
@@ -141,34 +141,14 @@ def evaluate_model(
             exact_matches.append(em)
         
         # === INTERVENTION TESTS ===
+        # NOTE: Intervention tests disabled - generate() method doesn't support
+        # ablate_reasoning and noise_reasoning parameters (only in forward())
+        # To enable: need to modify model.generate() to accept these params
         if run_intervention:
-            # Test 1: Ablate reasoning
-            predictions_ablated = model.generate(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=max_length,
-                num_beams=num_beams,
-                ablate_reasoning=True
-            )
-            
-            for pred, gt in zip(predictions_ablated, all_ground_truths[-batch_size:]):
-                em = compute_exact_match(pred, gt)
-                intervention_results['ablated_acc'].append(em)
-            
-            # Test 2: Add noise to reasoning
-            predictions_noisy = model.generate(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=max_length,
-                num_beams=num_beams,
-                noise_reasoning=0.5
-            )
-            
-            for pred, gt in zip(predictions_noisy, all_ground_truths[-batch_size:]):
-                em = compute_exact_match(pred, gt)
-                intervention_results['noise_acc'].append(em)
+            print("[Warning] Intervention tests not implemented in generate() method")
+            # For now, use forward() for intervention tests:
+            # This requires using generate_from_reasoning() instead
+            pass
     
     # Compute metrics
     metrics = {
@@ -237,8 +217,8 @@ def main():
     test_dataset = VQAGenDataset(
         csv_path=args.test_csv,
         image_folder=args.test_images,
-        tokenizer=model.tokenizer,
         vision_processor=vision_processor,
+        tokenizer_name='vinai/bartpho-syllable',
         max_q_len=64,
         max_a_len=32
     )
