@@ -680,7 +680,7 @@ class FixedLatentReasoningVQA(nn.Module):
             ortho_loss=ortho_loss,
             total_loss=total_loss,
             diversity_metrics=diversity_metrics,
-            attention_weights=attention_maps[-1] if attention_maps else None
+            attention_weights=None  # Removed attention_maps (not used)
         )
     
     @torch.no_grad()
