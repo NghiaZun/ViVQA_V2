@@ -105,13 +105,78 @@ class VisionFirstFusion(nn.Module):
 # FIX #4: PROPER LATENT DIMENSIONALITY
 # ============================================================================
 
+class PerceiverCrossAttention(nn.Module):
+    """
+    SOTA: Perceiver-style efficient cross-attention
+    
+    Features:
+    - Separate cross-attention (latents <- features) and self-attention (latents <- latents)
+    - Efficient: O(N*M) instead of O(N^2) where M << N
+    - Iterative refinement of latent reasoning
+    """
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        
+        # Cross-attention: queries attend to input features
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.cross_norm1 = nn.LayerNorm(dim)
+        self.cross_norm2 = nn.LayerNorm(dim)
+        
+        # Self-attention: refine latents
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.self_norm1 = nn.LayerNorm(dim)
+        self.self_norm2 = nn.LayerNorm(dim)
+        
+        # Feed-forward
+        self.ff = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, latents, features, key_padding_mask=None):
+        """
+        Args:
+            latents: [B, M, D] - small number of reasoning tokens
+            features: [B, N, D] - large multimodal features
+            key_padding_mask: [B, N] - mask for features (True = ignore)
+        """
+        # Cross-attention: latents attend to features
+        cross_out, _ = self.cross_attn(
+            query=latents, key=features, value=features,
+            key_padding_mask=key_padding_mask
+        )
+        latents = self.cross_norm1(latents + cross_out)
+        
+        # Self-attention: refine latents
+        self_out, _ = self.self_attn(
+            query=latents, key=latents, value=latents
+        )
+        latents = self.self_norm1(latents + self_out)
+        
+        # Feed-forward
+        ff_out = self.ff(latents)
+        latents = self.cross_norm2(latents + ff_out)
+        
+        return latents
+
+
 class CompressedLatentReasoning(nn.Module):
     """
-    FIX #4: Small latent bottleneck
+    FIX #4: Small latent bottleneck with SOTA Perceiver-style cross-attention
     
     - Only 4-8 tokens (not 16!)
     - Only 256 dim (not 1024!)
     - True information bottleneck
+    - Perceiver-style efficient attention
     """
     def __init__(
         self,
@@ -133,14 +198,9 @@ class CompressedLatentReasoning(nn.Module):
             torch.randn(num_tokens, input_dim) * 0.02
         )
         
-        # Cross-attention to extract reasoning
+        # SOTA: Perceiver-style cross-attention layers
         self.cross_attn_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model=input_dim, nhead=num_heads,
-                dim_feedforward=input_dim * 2,  # Smaller FFN
-                dropout=dropout, activation='gelu',
-                batch_first=True, norm_first=True
-            )
+            PerceiverCrossAttention(dim=input_dim, num_heads=num_heads, dropout=dropout)
             for _ in range(num_layers)
         ])
         
@@ -207,11 +267,15 @@ class CompressedLatentReasoning(nn.Module):
         # Expand queries
         queries = self.reasoning_queries.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Cross-attend
+        # SOTA: Perceiver-style iterative cross-attention
+        # Key padding mask: True = ignore (standard PyTorch convention)
+        key_padding_mask = ~attention_mask.bool() if attention_mask is not None else None
+        
         for layer in self.cross_attn_layers:
             queries = layer(
-                tgt=queries, memory=multimodal_features,
-                memory_key_padding_mask=~attention_mask.bool() if attention_mask is not None else None
+                latents=queries, 
+                features=multimodal_features,
+                key_padding_mask=key_padding_mask
             )
         
         # FIX #2: Stop gradient if requested
@@ -539,10 +603,8 @@ class FixedLatentReasoningVQA(nn.Module):
         
         # 3. FIX #3: Vision-first fusion with image dropout
         fused = text_features
-        attention_maps = []
         for fusion_layer in self.vision_first_fusion:
-            fused, attn = fusion_layer(fused, visual_features, self.image_dropout_prob)
-            attention_maps.append(attn)
+            fused = fusion_layer(fused, visual_features, self.image_dropout_prob)
         
         # 4. FIX #4 & #2: Extract compressed reasoning with free bits + PROPOSAL temperature
         reasoning_latents, kl_loss, compressed_z, mu, logvar = self.latent_reasoning(
