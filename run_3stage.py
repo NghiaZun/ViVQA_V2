@@ -13,7 +13,7 @@ Usage:
 import torch
 import os
 from dataclasses import dataclass
-from train_latent_reasoning_FIXED import (
+from train import (
     FixedTrainConfig, set_seed, run_one_epoch, TrainingCurriculum
 )
 from model import FixedLatentReasoningVQA, TeacherEvaluator
