@@ -12,6 +12,7 @@ Usage:
 
 import torch
 import os
+import gc
 from dataclasses import dataclass
 from train import (
     FixedTrainConfig, set_seed, run_one_epoch, TrainingCurriculum
@@ -24,6 +25,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
 
 
 def get_current_stage(epoch: int, stage1_epochs: int, stage2_epochs: int):
@@ -34,6 +39,94 @@ def get_current_stage(epoch: int, stage1_epochs: int, stage2_epochs: int):
         return 2
     else:
         return 3
+
+
+def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
+    """Plot and save training curves with stage transitions"""
+    epochs = history['epoch']
+    train_loss = history['train_loss']
+    val_loss = history['val_loss']
+    kl_loss = history['kl_loss']
+    lr = history['lr']
+    kl_weight = history['kl_weight']
+    
+    fig, axes = plt.subplots(3, 1, figsize=(12, 14))
+    
+    # Plot 1: Total Loss
+    ax1 = axes[0]
+    ax1.plot(epochs, train_loss, 'b-o', label='Train Loss', linewidth=2, markersize=4)
+    ax1.plot(epochs, val_loss, 'r-s', label='Val Loss', linewidth=2, markersize=4)
+    
+    stage1_end = stage1_epochs
+    stage2_end = stage1_epochs + stage2_epochs
+    if len(epochs) > stage1_end:
+        ax1.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7)
+    if len(epochs) > stage2_end:
+        ax1.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7)
+    
+    ax1.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Total Loss', fontsize=12, fontweight='bold')
+    ax1.set_title('Total Loss (Answer + KL + Teacher)', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: KL Loss & Weight
+    ax2 = axes[1]
+    ax2_twin = ax2.twinx()
+    
+    line1 = ax2.plot(epochs, kl_loss, 'purple', linewidth=2, marker='o', markersize=4, label='KL Loss')
+    line2 = ax2_twin.plot(epochs, kl_weight, 'brown', linewidth=2, marker='s', markersize=4, label='KL Weight', linestyle='--')
+    
+    if len(epochs) > stage1_end:
+        ax2.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7)
+    if len(epochs) > stage2_end:
+        ax2.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7)
+    
+    ax2.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('KL Loss', fontsize=12, fontweight='bold', color='purple')
+    ax2_twin.set_ylabel('KL Weight', fontsize=12, fontweight='bold', color='brown')
+    ax2.set_title('KL Loss and Weight Schedule', fontsize=14, fontweight='bold')
+    
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax2.legend(lines, labels, loc='upper left')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Learning Rate
+    ax3 = axes[2]
+    ax3.plot(epochs, lr, 'g-o', linewidth=2, markersize=4)
+    
+    if len(epochs) > stage1_end:
+        ax3.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7)
+    if len(epochs) > stage2_end:
+        ax3.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7)
+    
+    ax3.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax3.set_ylabel('Learning Rate', fontsize=12, fontweight='bold')
+    ax3.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+    ax3.set_yscale('log')
+    ax3.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    curve_path = os.path.join(save_dir, "training_curves.png")
+    plt.savefig(curve_path, dpi=150, bbox_inches='tight')
+    print(f"  ✓ Saved training curves: {curve_path}")
+    plt.close()
+
+
+def log_memory_usage(step_name=""):
+    """Log GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"  💾 {step_name} - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Peak: {max_allocated:.2f}GB")
+
+
+def clear_memory():
+    """Clear GPU memory cache"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def main():
@@ -97,6 +190,14 @@ def main():
     # Setup
     set_seed(42)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Clear memory before starting
+    if torch.cuda.is_available():
+        clear_memory()
+        print(f"\n💾 GPU: {torch.cuda.get_device_name(0)}")
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  Total Memory: {total_memory:.2f}GB")
+        log_memory_usage("Initial")
     
     # Model
     print("[1/6] Loading model...")
@@ -169,9 +270,10 @@ def main():
     # Resume from checkpoint if provided
     start_epoch = 0
     best_val_loss = float('inf')
+    loaded_history = None
     
     if args.resume_from and os.path.exists(args.resume_from):
-        print(f"\n[6/6] Resuming from checkpoint: {args.resume_from}")
+        print(f"\n📂 Loading checkpoint from: {args.resume_from}")
         checkpoint = torch.load(args.resume_from, map_location=device)
         
         # Restore model, optimizer, scheduler
@@ -179,17 +281,38 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
+        # Restore scaler if available
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            print("  ✓ Restored scaler state")
+        
         # Restore training state
-        start_epoch = checkpoint['epoch']
+        start_epoch = checkpoint['epoch']  # This is the NEXT epoch to train
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        loaded_history = checkpoint.get('history', None)
         
-        # Restore curriculum step (calculate based on completed epochs)
-        completed_stage2_epochs = max(0, min(start_epoch - args.stage1_epochs, args.stage2_epochs))
-        curriculum.current_step = completed_stage2_epochs * len(train_loader)
+        # Restore curriculum step (CRITICAL: use saved step, not calculated!)
+        if 'curriculum_step' in checkpoint:
+            curriculum.current_step = checkpoint['curriculum_step']
+            print(f"  ✓ Restored curriculum step: {curriculum.current_step}")
+        else:
+            # Fallback: estimate from epoch (less accurate)
+            completed_stage2_epochs = max(0, min(start_epoch - args.stage1_epochs, args.stage2_epochs))
+            curriculum.current_step = completed_stage2_epochs * len(train_loader)
+            print(f"  ⚠️  Estimated curriculum step: {curriculum.current_step}")
         
-        print(f"  ✅ Resumed from epoch {start_epoch}")
-        print(f"  📊 Best val loss so far: {best_val_loss:.4f}")
-        print(f"  🔄 Curriculum step: {curriculum.current_step}")
+        # Apply correct freezing strategy based on loaded stage
+        loaded_stage = checkpoint.get('stage', 1)
+        if loaded_stage >= 1:
+            model.freeze_pretrained(unfreeze_encoder_layers=3, unfreeze_decoder=True)
+            print(f"  ✓ Applied Stage {loaded_stage} freezing")
+        
+        print(f"  ✓ Checkpoint from completed epoch {start_epoch}")
+        print(f"  ✓ Will resume training from epoch {start_epoch + 1}")
+        print(f"  ✓ Stage: {loaded_stage}")
+        print(f"  ✓ Best val loss: {best_val_loss:.4f}")
+        if loaded_history:
+            print(f"  ✓ Restored training history ({len(loaded_history['epoch'])} epochs)")
         print()
     else:
         print("\n[6/6] Starting fresh training (no checkpoint provided)")
@@ -197,7 +320,19 @@ def main():
     
     # Training loop
     print("\n[5/6] Starting continuous training...")
+    if start_epoch > 0:
+        print(f"  📌 Resuming: Will train epochs {start_epoch + 1} to {total_epochs}")
+        print(f"  📌 (Already completed: epochs 1 to {start_epoch})")
     print("="*80 + "\n")
+    
+    # Initialize or restore history
+    if loaded_history:
+        history = loaded_history
+    else:
+        history = {
+            'epoch': [], 'stage': [], 'train_loss': [], 'val_loss': [],
+            'kl_loss': [], 'teacher_loss': [], 'lr': [], 'kl_weight': []
+        }
     
     for epoch in range(start_epoch, total_epochs):
         # Determine current stage
@@ -234,6 +369,9 @@ def main():
             train=True
         )
         
+        # Clear memory before validation
+        clear_memory()
+        
         # Validation
         with torch.no_grad():
             val_losses = run_one_epoch(
@@ -242,6 +380,9 @@ def main():
                 teacher_evaluator=None,
                 train=False
             )
+        
+        # Clear memory after validation
+        clear_memory()
         
         # Logging
         current_lr = scheduler.get_last_lr()[0]
@@ -254,17 +395,36 @@ def main():
               f"KL: {val_losses['kl']:.4f}")
         print(f"  LR: {current_lr:.6f}, KL weight: {kl_weight:.2f}, Stage: {current_stage}")
         
-        # Prepare checkpoint dict
+        # Log memory every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            log_memory_usage(f"Epoch {epoch+1}")
+        
+        # Update history
+        history['epoch'].append(epoch + 1)
+        history['stage'].append(current_stage)
+        history['train_loss'].append(train_losses['total'])
+        history['val_loss'].append(val_losses['total'])
+        history['kl_loss'].append(train_losses['kl'])
+        history['teacher_loss'].append(train_losses['teacher'])
+        history['lr'].append(current_lr)
+        history['kl_weight'].append(kl_weight)
+        
+        # Prepare checkpoint dict with FULL state
+        # NOTE: 'epoch' stores the COMPLETED epoch number (1-based)
+        # When resuming, we start from this epoch number (next epoch to train)
         os.makedirs(cfg.save_dir, exist_ok=True)
         checkpoint = {
-            'epoch': epoch + 1,
+            'epoch': epoch + 1,  # Completed epoch (1-based, ready for resume)
             'stage': current_stage,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),  # CRITICAL: save scaler
+            'curriculum_step': curriculum.current_step,  # CRITICAL: save curriculum step
             'train_losses': train_losses,
             'val_losses': val_losses,
-            'best_val_loss': best_val_loss,  # Save best_val_loss for resume
+            'best_val_loss': best_val_loss,
+            'history': history,  # Save full history
             'config': cfg.__dict__
         }
         
@@ -342,17 +502,33 @@ def main():
             
             print("="*80 + "\n")
             model.train()
+            
+            # Clear memory after predictions
+            clear_memory()
         
         scheduler.step()
         curriculum.step()
         print()
     
+    # Save final history and plot curves
+    df = pd.DataFrame(history)
+    csv_path = os.path.join(cfg.save_dir, "training_history.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"\n✓ Saved training history: {csv_path}")
+    
+    print("\n[6/6] Generating training curves...")
+    plot_training_curves(history, cfg.save_dir, args.stage1_epochs, args.stage2_epochs)
+    
     print("\n" + "="*80)
     print("✅ ALL 3 STAGES COMPLETED!")
     print("="*80)
+    print(f"\nBest validation loss: {best_val_loss:.4f}")
     print(f"\nCheckpoints saved in: {cfg.save_dir}/")
     print(f"  - best.pt (best validation model - use for inference)")
     print(f"  - last.pt (last epoch checkpoint - use for resume)")
+    print(f"  - training_history.csv (training metrics)")
+    print(f"  - training_curves.png (loss, KL, LR curves)")
+    print(f"\nTo resume: python run_3stage.py ... --resume_from {cfg.save_dir}/last.pt")
     print()
 
 

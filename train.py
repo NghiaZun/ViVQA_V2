@@ -10,6 +10,7 @@ import os
 import json
 import argparse
 import random
+import gc
 from dataclasses import dataclass
 from typing import Optional
 

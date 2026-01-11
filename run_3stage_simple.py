@@ -19,6 +19,7 @@ Usage:
 
 import torch
 import os
+import gc
 from dataclasses import dataclass
 from train import (
     FixedTrainConfig, set_seed
@@ -44,6 +45,21 @@ def get_current_stage(epoch: int, stage1_epochs: int, stage2_epochs: int):
         return 2
     else:
         return 3
+
+
+def log_memory_usage(step_name=""):
+    """Log GPU memory usage"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        print(f"  💾 {step_name} - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Peak: {max_allocated:.2f}GB")
+
+
+def clear_memory():
+    """Clear GPU memory cache"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
@@ -327,6 +343,15 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(cfg.save_dir, exist_ok=True)
     
+    # Clear memory before starting
+    if torch.cuda.is_available():
+        clear_memory()
+        print(f"\n💾 GPU: {torch.cuda.get_device_name(0)}")
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  Total Memory: {total_memory:.2f}GB")
+        log_memory_usage("Initial")
+        print()
+    
     # Model
     print("[1/6] Loading SimpleFusionVQA model...")
     model = SimpleFusionVQA(
@@ -344,7 +369,7 @@ def main():
         checkpoint = torch.load(args.resume_from, map_location='cpu')
         
         model.load_state_dict(checkpoint['model_state_dict'])
-        start_epoch = checkpoint['epoch']
+        start_epoch = checkpoint['epoch']  # This is the NEXT epoch to train
         loaded_stage = checkpoint['stage']
         loaded_history = checkpoint.get('history', None)
         
@@ -352,7 +377,9 @@ def main():
         if 'val_loss' in checkpoint:
             best_val_loss = checkpoint['val_loss']
         
-        print(f"  ✓ Resumed from epoch {start_epoch}, stage {loaded_stage}")
+        print(f"  ✓ Checkpoint from completed epoch {start_epoch}")
+        print(f"  ✓ Will resume training from epoch {start_epoch + 1}")
+        print(f"  ✓ Stage: {loaded_stage}")
         print(f"  ✓ Best val loss: {best_val_loss:.4f}")
         
         # Apply correct freeze strategy based on loaded stage
@@ -468,7 +495,8 @@ def main():
     # Training loop
     print("\n[4/6] Starting continuous training...")
     if start_epoch > 0:
-        print(f"  📌 Resuming from epoch {start_epoch + 1}/{total_epochs}")
+        print(f"  📌 Resuming: Will train epochs {start_epoch + 1} to {total_epochs}")
+        print(f"  📌 (Already completed: epochs 1 to {start_epoch})")
     print("="*80 + "\n")
     
     # Initialize or restore history
@@ -534,12 +562,18 @@ def main():
             train=True
         )
         
+        # Clear memory before validation
+        clear_memory()
+        
         # Validation
         with torch.no_grad():
             val_loss = run_one_epoch_simple(
                 model, val_loader, optimizer, scaler, device, cfg,
                 train=False
             )
+        
+        # Clear memory after validation
+        clear_memory()
         
         # Logging
         current_lr = scheduler.get_last_lr()[0]
@@ -550,6 +584,10 @@ def main():
         print(f"  LR: {current_lr:.6f}")
         print(f"  Stage: {current_stage}")
         
+        # Log memory every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            log_memory_usage(f"Epoch {epoch+1}")
+        
         # Update history
         history['epoch'].append(epoch + 1)
         history['stage'].append(current_stage)
@@ -558,8 +596,10 @@ def main():
         history['lr'].append(current_lr)
         
         # Prepare checkpoint
+        # NOTE: 'epoch' stores the COMPLETED epoch number (1-based)
+        # When resuming, we start from this epoch number (next epoch to train)
         checkpoint = {
-            'epoch': epoch + 1,
+            'epoch': epoch + 1,  # Completed epoch (1-based, ready for resume)
             'stage': current_stage,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -633,6 +673,9 @@ def main():
             
             print("="*80 + "\n")
             model.train()
+            
+            # Clear memory after predictions
+            clear_memory()
         
         print()
     
