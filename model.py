@@ -82,15 +82,13 @@ class VisionFirstFusion(nn.Module):
         
         # Step 1: Vision queries text (vision-grounded text)
         vision_grounded, _ = self.vision_to_text(
-            visual_features, text_features, text_features,
-            need_weights=False
+            visual_features, text_features, text_features
         )
         vision_enhanced = self.norm1(visual_features + vision_grounded)
         
         # Step 2: Text attends to enhanced vision
         text_enhanced, _ = self.text_to_vision(
-            text_features, vision_enhanced, vision_enhanced,
-            need_weights=False
+            text_features, vision_enhanced, vision_enhanced
         )
         
         # Gating
@@ -100,7 +98,7 @@ class VisionFirstFusion(nn.Module):
         fused = gate * text_enhanced + (1 - gate) * text_features
         fused = self.norm2(fused)
         
-        return fused, attn
+        return fused
 
 
 # ============================================================================
@@ -1263,32 +1261,56 @@ class SimpleFusionVQA(nn.Module):
                 'encoder_attention_mask': attention_mask
             })()
     
+    @torch.no_grad()
     def generate(
         self,
         pixel_values,
         input_ids,
         attention_mask,
         max_length=32,
-        num_beams=4,
+        num_beams=1,  # Default greedy for speed
         **kwargs
     ):
-        """Generate answers"""
+        """Generate answers using manual autoregressive decoding"""
+        self.eval()
+        
         # Get fused features
         outputs = self.forward(pixel_values, input_ids, attention_mask, labels=None)
+        encoder_hidden_states = outputs.encoder_hidden_states
+        encoder_attention_mask = outputs.encoder_attention_mask
         
-        # Generate using BARTpho decoder
-        generated_ids = self.decoder.generate(
-            encoder_hidden_states=outputs.encoder_hidden_states,
-            encoder_attention_mask=outputs.encoder_attention_mask,
-            max_length=max_length,
-            num_beams=num_beams,
-            decoder_start_token_id=self.config.decoder_start_token_id,
-            eos_token_id=self.config.eos_token_id,
-            pad_token_id=self.config.pad_token_id,
-            **kwargs
+        batch_size = encoder_hidden_states.size(0)
+        device = encoder_hidden_states.device
+        
+        # Start with BOS token
+        generated_ids = torch.full(
+            (batch_size, 1),
+            self.config.decoder_start_token_id,
+            dtype=torch.long,
+            device=device
         )
         
-        # Decode
+        # Autoregressive generation (greedy only for simplicity)
+        for _ in range(max_length - 1):
+            # Decoder forward
+            decoder_outputs = self.decoder(
+                input_ids=generated_ids,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask
+            )
+            
+            # Get logits for next token
+            logits = self.lm_head(decoder_outputs.last_hidden_state[:, -1, :])
+            next_token = logits.argmax(dim=-1, keepdim=True)
+            
+            # Append
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+            
+            # Stop if all sequences have EOS
+            if (next_token == self.config.eos_token_id).all():
+                break
+        
+        # Decode to strings
         answers = []
         for ids in generated_ids:
             answer = self.tokenizer.decode(ids, skip_special_tokens=True)

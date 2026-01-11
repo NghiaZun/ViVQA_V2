@@ -128,6 +128,8 @@ def main():
     parser.add_argument("--num_vision_layers", type=int, default=3,
                        help="Vision layers to unfreeze in stage 3")
     parser.add_argument("--save_dir", type=str, default="checkpoints_simple_3stage")
+    parser.add_argument("--resume_from", type=str, default=None,
+                       help="Path to checkpoint to resume from (e.g., checkpoints_simple_3stage/last.pt)")
     
     args = parser.parse_args()
     
@@ -153,6 +155,8 @@ def main():
     
     print("="*80)
     print("CONTINUOUS 3-STAGE TRAINING: SimpleFusionVQA (SOTA Fusion)")
+    if args.resume_from:
+        print(f"🔄 RESUME MODE: {args.resume_from}")
     print("="*80)
     print(f"\nArchitecture:")
     print(f"  - DINOv2 vision encoder")
@@ -179,8 +183,53 @@ def main():
         gradient_checkpointing=True
     )
     
-    # Stage 1: Freeze all
-    model.freeze_all_pretrained()
+    # Check if resuming from checkpoint
+    start_epoch = 0
+    loaded_history = None
+    best_val_loss = float('inf')
+    
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"\n📂 Loading checkpoint from: {args.resume_from}")
+        checkpoint = torch.load(args.resume_from, map_location='cpu')
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint['epoch']
+        loaded_stage = checkpoint['stage']
+        loaded_history = checkpoint.get('history', None)
+        
+        # Restore best loss if available
+        if 'val_loss' in checkpoint:
+            best_val_loss = checkpoint['val_loss']
+        
+        print(f"  ✓ Resumed from epoch {start_epoch}, stage {loaded_stage}")
+        print(f"  ✓ Best val loss: {best_val_loss:.4f}")
+        
+        # Apply correct freeze strategy based on loaded stage
+        if loaded_stage == 1:
+            model.freeze_all_pretrained()
+            print("  ✓ Applied Stage 1 freezing (fusion only)")
+        elif loaded_stage == 2:
+            model.freeze_all_pretrained()
+            model.unfreeze_text_components(
+                num_encoder_layers=args.num_encoder_layers,
+                num_decoder_layers=args.num_decoder_layers
+            )
+            print("  ✓ Applied Stage 2 freezing (fusion + text)")
+        elif loaded_stage == 3:
+            model.freeze_all_pretrained()
+            model.unfreeze_text_components(
+                num_encoder_layers=args.num_encoder_layers,
+                num_decoder_layers=args.num_decoder_layers
+            )
+            model.unfreeze_vision_encoder(num_layers=args.num_vision_layers)
+            print("  ✓ Applied Stage 3 freezing (fusion + text + vision)")
+    else:
+        # Fresh training - Stage 1: Freeze all
+        model.freeze_all_pretrained()
+        if args.resume_from:
+            print(f"\n⚠️  Checkpoint not found: {args.resume_from}")
+            print("  Starting fresh training...\n")
+    
     model = model.to(device)
     
     # Dataset
@@ -223,37 +272,68 @@ def main():
     # Optimizer & Scheduler
     print("\n[3/6] Setting up optimizer...")
     
+    # Determine initial learning rate based on resume stage
+    if args.resume_from and os.path.exists(args.resume_from):
+        checkpoint = torch.load(args.resume_from, map_location='cpu')
+        loaded_stage = checkpoint['stage']
+        if loaded_stage == 1:
+            initial_lr = cfg.base_lr
+        elif loaded_stage == 2:
+            initial_lr = cfg.base_lr * 0.5
+        else:  # stage 3
+            initial_lr = cfg.base_lr * 0.1
+        print(f"  Resuming with LR: {initial_lr:.6f} (Stage {loaded_stage})")
+    else:
+        initial_lr = cfg.base_lr
+    
     total_steps = len(train_loader) // cfg.accum_steps * total_epochs
-    warmup_steps = int(total_steps * cfg.warmup_ratio)
+    remaining_steps = len(train_loader) // cfg.accum_steps * (total_epochs - start_epoch)
+    warmup_steps = int(total_steps * cfg.warmup_ratio) if start_epoch == 0 else 0
     
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.base_lr,
+        lr=initial_lr,
         weight_decay=cfg.weight_decay
     )
     
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps
+        num_training_steps=remaining_steps if start_epoch > 0 else total_steps
     )
+    
+    # Restore optimizer and scheduler state if resuming
+    if args.resume_from and os.path.exists(args.resume_from):
+        checkpoint = torch.load(args.resume_from, map_location='cpu')
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("  ✓ Restored optimizer state")
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print("  ✓ Restored scheduler state")
     
     scaler = GradScaler(enabled=cfg.use_amp)
     
     # Training loop
     print("\n[4/6] Starting continuous training...")
+    if start_epoch > 0:
+        print(f"  📌 Resuming from epoch {start_epoch + 1}/{total_epochs}")
     print("="*80 + "\n")
     
-    best_val_loss = float('inf')
-    history = {
-        'epoch': [], 'stage': [], 'train_loss': [], 'val_loss': [], 'lr': []
-    }
+    # Initialize or restore history
+    if loaded_history:
+        history = loaded_history
+        print(f"  ✓ Restored training history ({len(history['epoch'])} epochs)")
+    else:
+        history = {
+            'epoch': [], 'stage': [], 'train_loss': [], 'val_loss': [], 'lr': []
+        }
     
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         # Determine current stage
         current_stage = get_current_stage(epoch, args.stage1_epochs, args.stage2_epochs)
         
-        # Stage transition: Update model freezing
+        # Stage transition: Update model freezing (only if not already at this stage from resume)
         if epoch == stage1_end:
             print("\n" + "="*80)
             print("🟡 STAGE 2: Unfreezing Text Components")
@@ -262,11 +342,17 @@ def main():
                 num_encoder_layers=args.num_encoder_layers,
                 num_decoder_layers=args.num_decoder_layers
             )
-            # Rebuild optimizer with new trainable params
+            # Rebuild optimizer AND scheduler with new trainable params
+            remaining_steps = len(train_loader) // cfg.accum_steps * (total_epochs - epoch)
             optimizer = AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
                 lr=cfg.base_lr * 0.5,  # Lower LR for fine-tuning
                 weight_decay=cfg.weight_decay
+            )
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=0,  # No warmup for stage transitions
+                num_training_steps=remaining_steps
             )
             print()
         elif epoch == stage2_end:
@@ -274,11 +360,17 @@ def main():
             print("🟢 STAGE 3: Unfreezing Vision Encoder")
             print("="*80)
             model.unfreeze_vision_encoder(num_layers=args.num_vision_layers)
-            # Rebuild optimizer with new trainable params
+            # Rebuild optimizer AND scheduler with new trainable params
+            remaining_steps = len(train_loader) // cfg.accum_steps * (total_epochs - epoch)
             optimizer = AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
                 lr=cfg.base_lr * 0.1,  # Even lower LR for vision fine-tuning
                 weight_decay=cfg.weight_decay
+            )
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=0,  # No warmup for stage transitions
+                num_training_steps=remaining_steps
             )
             print()
         
@@ -405,11 +497,13 @@ def main():
     print(f"\nBest validation loss: {best_val_loss:.4f}")
     print(f"\nCheckpoints saved in: {cfg.save_dir}/")
     print(f"  - best.pt (best validation model - use for inference)")
-    print(f"  - last.pt (last epoch checkpoint)")
+    print(f"  - last.pt (last epoch checkpoint - use for resume)")
     print(f"  - training_history.csv (loss curves)")
     print("\nNext steps:")
-    print(f"  1. Evaluate: python eval_autoregressive_cot.py --checkpoint {cfg.save_dir}/best.pt --mode val")
-    print(f"  2. Test: python eval_autoregressive_cot.py --checkpoint {cfg.save_dir}/best.pt --mode test")
+    print(f"  1. Resume training (if interrupted):")
+    print(f"     python run_3stage_simple.py --csv_path ... --image_folder ... --resume_from {cfg.save_dir}/last.pt")
+    print(f"  2. Evaluate: python eval_autoregressive_cot.py --checkpoint {cfg.save_dir}/best.pt --mode val")
+    print(f"  3. Test: python eval_autoregressive_cot.py --checkpoint {cfg.save_dir}/best.pt --mode test")
     print()
 
 
