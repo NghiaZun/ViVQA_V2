@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--num_reasoning_samples", type=int, default=3)
     parser.add_argument("--max_kl_weight", type=float, default=15.0,
                        help="Max KL weight (15.0 with 0.01 factor → effective 0.15)")
+    parser.add_argument("--resume_from", type=str, default=None,
+                       help="Path to checkpoint to resume from (e.g., checkpoints/last.pt)")
     
     args = parser.parse_args()
     
@@ -164,13 +166,40 @@ def main():
         max_kl_weight=args.max_kl_weight  # Tunable KL weight
     )
     
+    # Resume from checkpoint if provided
+    start_epoch = 0
+    best_val_loss = float('inf')
+    
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"\n[6/6] Resuming from checkpoint: {args.resume_from}")
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        
+        # Restore model, optimizer, scheduler
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Restore training state
+        start_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        
+        # Restore curriculum step (calculate based on completed epochs)
+        completed_stage2_epochs = max(0, min(start_epoch - args.stage1_epochs, args.stage2_epochs))
+        curriculum.current_step = completed_stage2_epochs * len(train_loader)
+        
+        print(f"  ✅ Resumed from epoch {start_epoch}")
+        print(f"  📊 Best val loss so far: {best_val_loss:.4f}")
+        print(f"  🔄 Curriculum step: {curriculum.current_step}")
+        print()
+    else:
+        print("\n[6/6] Starting fresh training (no checkpoint provided)")
+        print()
+    
     # Training loop
     print("\n[5/6] Starting continuous training...")
     print("="*80 + "\n")
     
-    best_val_loss = float('inf')
-    
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         # Determine current stage
         current_stage = get_current_stage(epoch, args.stage1_epochs, args.stage2_epochs)
         
@@ -235,6 +264,7 @@ def main():
             'scheduler_state_dict': scheduler.state_dict(),
             'train_losses': train_losses,
             'val_losses': val_losses,
+            'best_val_loss': best_val_loss,  # Save best_val_loss for resume
             'config': cfg.__dict__
         }
         

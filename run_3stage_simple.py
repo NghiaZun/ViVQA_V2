@@ -28,7 +28,7 @@ from dataset import VQAGenDataset
 from transformers import AutoImageProcessor, get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader, random_split
 from torch.optim import AdamW
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 import pandas as pd
 
@@ -67,7 +67,7 @@ def run_one_epoch_simple(
         attention_mask = attention_mask.to(device)
         labels = labels.to(device)
         
-        with autocast(device_type='cuda', enabled=cfg.use_amp):
+        with torch.cuda.amp.autocast(enabled=cfg.use_amp):
             # Simple forward pass
             outputs = model(
                 pixel_values=pixel_values,
