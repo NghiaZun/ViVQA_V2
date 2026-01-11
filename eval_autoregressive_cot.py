@@ -180,6 +180,8 @@ def evaluate_autoregressive_cot(
                     has_gt = True
                     # Decode GT answer from labels tensor
                     answer_label_ids = gt_answer_labels[i] if gt_answer_labels.dim() > 1 else gt_answer_labels
+                    # Filter out -100 (padding mask) before decode
+                    answer_label_ids = answer_label_ids[answer_label_ids != -100]
                     gt_answer = model.tokenizer.decode(answer_label_ids.cpu().tolist(), skip_special_tokens=True)
                     result_row['gt_answer'] = gt_answer
                     
