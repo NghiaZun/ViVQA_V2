@@ -659,30 +659,12 @@ class FixedLatentReasoningVQA(nn.Module):
             reasoning_latents = reasoning_latents + torch.randn_like(reasoning_latents) * noise_reasoning
         
         # FIX #1: Only reasoning to decoder
-        encoder_hidden_states = reasoning_latents
-        
-        # Generate
-        batch_size = pixel_values.size(0)
-        decoder_input_ids = torch.full(
-            (batch_size, 1), self.tokenizer.bos_token_id,
-            dtype=torch.long, device=pixel_values.device
-        )
-        
-        generated_ids = self.decoder.generate(
-            input_ids=decoder_input_ids,
-            encoder_hidden_states=encoder_hidden_states,
+        # Use generate_from_reasoning helper (decoder doesn't have generate method)
+        answers = self.generate_from_reasoning(
+            reasoning_latents=reasoning_latents,
             max_length=max_length,
-            num_beams=num_beams,
-            pad_token_id=self.config.pad_token_id,
-            eos_token_id=self.config.eos_token_id,
-            bos_token_id=self.tokenizer.bos_token_id,
-            use_cache=True
+            num_beams=num_beams
         )
-        
-        answers = [
-            self.tokenizer.decode(ids, skip_special_tokens=True).strip()
-            for ids in generated_ids
-        ]
         
         return answers
     
