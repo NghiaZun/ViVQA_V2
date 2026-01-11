@@ -27,6 +27,7 @@ import numpy as np
 from dataset import VQAGenDataset
 from model import (
     FixedLatentReasoningVQA,
+    SimpleFusionVQA,  # NEW: Simple model without latent reasoning
     TrainingCurriculum,
     TeacherEvaluator
 )
@@ -44,6 +45,9 @@ torch.backends.cudnn.benchmark = True
 @dataclass
 class FixedTrainConfig:
     """Configuration with all fixes"""
+    # Model selection
+    model_type: str = 'latent'  # 'latent' or 'simple'
+    
     # Data
     csv_path: str = "/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv"
     image_folder: str = "/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train"
@@ -52,6 +56,15 @@ class FixedTrainConfig:
     # FIX #7: Dataset filtering
     use_hard_examples_only: bool = False  # Enable after baseline
     hard_example_threshold: float = 0.7  # Filter easy examples
+    
+    # Stage configuration for SimpleFusionVQA
+    # Stage 1: Train fusion only (all encoders frozen)
+    # Stage 2: Unfreeze last N layers of text encoder + decoder
+    # Stage 3: Unfreeze last N layers of vision encoder
+    simple_stage1_num_encoder_layers: int = 0  # Frozen
+    simple_stage2_num_encoder_layers: int = 3  # Unfreeze last 3
+    simple_stage2_num_decoder_layers: int = 3  # Unfreeze last 3
+    simple_stage3_num_vision_layers: int = 3   # Unfreeze last 3
     
     # Training
     stage: int = 1  # 1: Baseline, 2: Warmup, 3: Full
@@ -104,6 +117,8 @@ class FixedTrainConfig:
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--model_type", type=str, choices=['latent', 'simple'], 
+                   help="Model type: 'latent' (with reasoning) or 'simple' (direct fusion)")
     p.add_argument("--csv_path", type=str)
     p.add_argument("--image_folder", type=str)
     p.add_argument("--stage", type=int, choices=[1, 2, 3])
@@ -257,6 +272,8 @@ def run_one_epoch(
     - Generate candidate answers from each reasoning
     - Teacher ranks candidates
     - Train with preference-based loss
+    
+    Supports both LatentReasoningVQA and SimpleFusionVQA models
     """
     if train:
         model.train()
@@ -270,6 +287,9 @@ def run_one_epoch(
     teacher_loss_sum = 0.0
     num_batches = 0
     
+    # Check if model has latent reasoning (for loss tracking)
+    is_latent_model = cfg.model_type == 'latent'
+    
     if train:
         optimizer.zero_grad()
     
@@ -281,23 +301,36 @@ def run_one_epoch(
         attention_mask = attention_mask.to(device)
         labels = labels.to(device)
         
-        # FIX #8: Get curriculum parameters
-        kl_weight = curriculum.get_kl_weight(stage)
-        stop_grad = curriculum.get_stop_gradient(stage)
+        # FIX #8: Get curriculum parameters (only for latent model)
+        if is_latent_model:
+            kl_weight = curriculum.get_kl_weight(stage)
+            stop_grad = curriculum.get_stop_gradient(stage)
+        else:
+            kl_weight = 0.0
+            stop_grad = False
         
         with autocast(device_type='cuda', enabled=cfg.use_amp):
             # Standard forward pass for base loss
-            outputs = model(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                deterministic_reasoning=not train,
-                stop_gradient_to_latent=stop_grad,
-                kl_weight=kl_weight
-            )
-            
-            loss = outputs.total_loss
+            if is_latent_model:
+                outputs = model(
+                    pixel_values=pixel_values,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    deterministic_reasoning=not train,
+                    stop_gradient_to_latent=stop_grad,
+                    kl_weight=kl_weight
+                )
+                loss = outputs.total_loss
+            else:
+                # Simple model - just cross-entropy loss
+                outputs = model(
+                    pixel_values=pixel_values,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                loss = outputs.loss
             
             # ================================================================
             # PROPOSAL SECTION 7: ONLINE REASONING DISTILLATION
@@ -405,20 +438,36 @@ def run_one_epoch(
         
         # Accumulate
         total_loss += loss.item() * cfg.accum_steps if train else loss.item()
-        answer_loss_sum += outputs.answer_loss.item() if outputs.answer_loss is not None else 0
-        kl_loss_sum += outputs.kl_loss.item() if outputs.kl_loss is not None else 0
-        ortho_loss_sum += outputs.ortho_loss.item() if outputs.ortho_loss is not None else 0
+        
+        # Track component losses (handle both model types)
+        if is_latent_model:
+            answer_loss_sum += outputs.answer_loss.item() if outputs.answer_loss is not None else 0
+            kl_loss_sum += outputs.kl_loss.item() if outputs.kl_loss is not None else 0
+            ortho_loss_sum += outputs.ortho_loss.item() if outputs.ortho_loss is not None else 0
+        else:
+            answer_loss_sum += outputs.loss.item()
+            kl_loss_sum += 0.0  # Simple model has no KL
+            ortho_loss_sum += 0.0  # Simple model has no ortho
+        
         teacher_loss_sum += teacher_loss.item() if isinstance(teacher_loss, torch.Tensor) else 0
         num_batches += 1
         
-        pbar.set_postfix({
-            'L': f"{loss.item() * cfg.accum_steps if train else loss.item():.3f}",
-            'A': f"{outputs.answer_loss.item():.3f}",
-            'KL': f"{outputs.kl_loss.item():.3f}",
-            'O': f"{outputs.ortho_loss.item():.3f}",
-            'T': f"{teacher_loss.item():.3f}",
-            'KLw': f"{kl_weight:.2f}"
-        })
+        # Update progress bar (adapt to model type)
+        if is_latent_model:
+            pbar.set_postfix({
+                'L': f"{loss.item() * cfg.accum_steps if train else loss.item():.3f}",
+                'A': f"{outputs.answer_loss.item():.3f}",
+                'KL': f"{outputs.kl_loss.item():.3f}",
+                'O': f"{outputs.ortho_loss.item():.3f}",
+                'T': f"{teacher_loss.item():.3f}",
+                'KLw': f"{kl_weight:.2f}"
+            })
+        else:
+            pbar.set_postfix({
+                'L': f"{loss.item() * cfg.accum_steps if train else loss.item():.3f}",
+                'A': f"{outputs.loss.item():.3f}",
+                'T': f"{teacher_loss.item():.3f}"
+            })
     
     return {
         'total': total_loss / num_batches,
@@ -435,6 +484,8 @@ def main():
     cfg = FixedTrainConfig()
     
     # Override from args
+    if args.model_type:
+        cfg.model_type = args.model_type
     if args.csv_path:
         cfg.csv_path = args.csv_path
     if args.image_folder:
@@ -462,19 +513,27 @@ def main():
     
     # Configure stage
     if cfg.stage == 1:
-        cfg.save_dir = cfg.save_dir + "_stage1_baseline"
+        cfg.save_dir = cfg.save_dir + f"_{cfg.model_type}_stage1_baseline"
         cfg.use_teacher = False  # No teacher in baseline
-        print("\n🔵 STAGE 1: BASELINE (No Reasoning, No Teacher)")
+        print(f"\n🔵 STAGE 1: BASELINE ({cfg.model_type.upper()} model, No Teacher)")
+        if cfg.model_type == 'simple':
+            print("   → Freeze all, train fusion only")
     elif cfg.stage == 2:
-        cfg.save_dir = cfg.save_dir + "_stage2_warmup"
+        cfg.save_dir = cfg.save_dir + f"_{cfg.model_type}_stage2_warmup"
         cfg.use_teacher = False  # No teacher in warmup
-        print("\n🟡 STAGE 2: WARMUP (Reasoning KL Warmup, No Teacher)")
+        print(f"\n🟡 STAGE 2: WARMUP ({cfg.model_type.upper()} model, No Teacher)")
+        if cfg.model_type == 'latent':
+            print("   → Reasoning KL warmup")
+        else:
+            print("   → Unfreeze text encoder + decoder last layers")
     elif cfg.stage == 3:
-        cfg.save_dir = cfg.save_dir + "_stage3_full"
+        cfg.save_dir = cfg.save_dir + f"_{cfg.model_type}_stage3_full"
         # Teacher enabled by default in stage 3 (unless overridden)
         if args.use_teacher is None:
             cfg.use_teacher = True
-        print(f"\n🟢 STAGE 3: FULL (Complete Training + Teacher={cfg.use_teacher})")
+        print(f"\n🟢 STAGE 3: FULL ({cfg.model_type.upper()} model, Teacher={cfg.use_teacher})")
+        if cfg.model_type == 'simple':
+            print("   → Unfreeze vision encoder last layers")
     
     # Setup
     set_seed(42)
@@ -482,36 +541,70 @@ def main():
     os.makedirs(cfg.save_dir, exist_ok=True)
     
     print("="*80)
-    print("FIXED LATENT REASONING VQA - TRAINING")
+    print(f"TRAINING: {cfg.model_type.upper()} MODEL")
     print("="*80)
     print(f"Device: {device}")
     print(f"Stage: {cfg.stage}")
-    print(f"Reasoning: {cfg.num_reasoning_tokens} tokens × {cfg.latent_dim} dim")
-    print(f"Free bits: {cfg.free_bits}")
-    print(f"Ortho weight: {cfg.ortho_weight}")
-    print(f"Image dropout: {cfg.image_dropout_prob}")
+    if cfg.model_type == 'latent':
+        print(f"Reasoning: {cfg.num_reasoning_tokens} tokens × {cfg.latent_dim} dim")
+        print(f"Free bits: {cfg.free_bits}")
+        print(f"Ortho weight: {cfg.ortho_weight}")
+        print(f"Image dropout: {cfg.image_dropout_prob}")
+    else:
+        print(f"Fusion: Simple cross-attention (no bottleneck)")
+        print(f"Stage 1: Freeze all, train fusion")
+        print(f"Stage 2: Unfreeze {cfg.simple_stage2_num_encoder_layers} encoder + {cfg.simple_stage2_num_decoder_layers} decoder layers")
+        print(f"Stage 3: Unfreeze {cfg.simple_stage3_num_vision_layers} vision layers")
     print("="*80 + "\n")
     
     # Model
-    print("[1/6] Initializing FIXED model...")
-    model = FixedLatentReasoningVQA(
-        num_reasoning_tokens=cfg.num_reasoning_tokens,
-        latent_dim=cfg.latent_dim,
-        num_reasoning_layers=cfg.num_reasoning_layers,
-        num_fusion_layers=cfg.num_fusion_layers,
-        free_bits=cfg.free_bits,
-        ortho_weight=cfg.ortho_weight,
-        image_dropout_prob=cfg.image_dropout_prob,
-        token_dropout_prob=cfg.token_dropout_prob,
-        gradient_checkpointing=True
-    )
+    print(f"[1/6] Initializing {cfg.model_type.upper()} model...")
     
-    # FIX: Unfreeze decoder for Stage 2-3 (curriculum learning)
-    unfreeze_decoder = (cfg.stage >= 2)  # Only freeze in Stage 1
-    model.freeze_pretrained(
-        unfreeze_encoder_layers=cfg.unfreeze_encoder_layers,
-        unfreeze_decoder=unfreeze_decoder
-    )
+    if cfg.model_type == 'latent':
+        model = FixedLatentReasoningVQA(
+            num_reasoning_tokens=cfg.num_reasoning_tokens,
+            latent_dim=cfg.latent_dim,
+            num_reasoning_layers=cfg.num_reasoning_layers,
+            num_fusion_layers=cfg.num_fusion_layers,
+            free_bits=cfg.free_bits,
+            ortho_weight=cfg.ortho_weight,
+            image_dropout_prob=cfg.image_dropout_prob,
+            token_dropout_prob=cfg.token_dropout_prob,
+            gradient_checkpointing=True
+        )
+        
+        # FIX: Unfreeze decoder for Stage 2-3 (curriculum learning)
+        unfreeze_decoder = (cfg.stage >= 2)  # Only freeze in Stage 1
+        model.freeze_pretrained(
+            unfreeze_encoder_layers=cfg.unfreeze_encoder_layers,
+            unfreeze_decoder=unfreeze_decoder
+        )
+    else:  # simple model
+        model = SimpleFusionVQA(
+            num_fusion_layers=cfg.num_fusion_layers,
+            gradient_checkpointing=True
+        )
+        
+        # 3-stage curriculum for simple model
+        if cfg.stage == 1:
+            # Stage 1: Freeze all, train fusion only
+            model.freeze_all_pretrained()
+        elif cfg.stage == 2:
+            # Stage 2: Unfreeze text components
+            model.freeze_all_pretrained()  # Start from frozen
+            model.unfreeze_text_components(
+                num_encoder_layers=cfg.simple_stage2_num_encoder_layers,
+                num_decoder_layers=cfg.simple_stage2_num_decoder_layers
+            )
+        elif cfg.stage == 3:
+            # Stage 3: Unfreeze vision + keep text unfrozen
+            model.freeze_all_pretrained()  # Start from frozen
+            model.unfreeze_text_components(
+                num_encoder_layers=cfg.simple_stage2_num_encoder_layers,
+                num_decoder_layers=cfg.simple_stage2_num_decoder_layers
+            )
+            model.unfreeze_vision_encoder(num_layers=cfg.simple_stage3_num_vision_layers)
+    
     model = model.to(device)
     
     # Dataset (load before teacher to get tokenizer)
@@ -632,19 +725,33 @@ def main():
         print(f"\n{'='*80}")
         print(f"EPOCH {epoch+1} SUMMARY")
         print(f"{'='*80}")
-        print(f"Train: Total={train_losses['total']:.4f} | A={train_losses['answer']:.4f} | "
-              f"KL={train_losses['kl']:.4f} | O={train_losses['ortho']:.4f}", end="")
-        if cfg.use_teacher and 'teacher' in train_losses:
-            print(f" | T={train_losses['teacher']:.4f}")
-        else:
-            print()
         
-        print(f"Val:   Total={val_losses['total']:.4f} | A={val_losses['answer']:.4f} | "
-              f"KL={val_losses['kl']:.4f} | O={val_losses['ortho']:.4f}", end="")
-        if cfg.use_teacher and 'teacher' in val_losses:
-            print(f" | T={val_losses['teacher']:.4f}")
-        else:
-            print()
+        if cfg.model_type == 'latent':
+            print(f"Train: Total={train_losses['total']:.4f} | A={train_losses['answer']:.4f} | "
+                  f"KL={train_losses['kl']:.4f} | O={train_losses['ortho']:.4f}", end="")
+            if cfg.use_teacher and 'teacher' in train_losses:
+                print(f" | T={train_losses['teacher']:.4f}")
+            else:
+                print()
+            
+            print(f"Val:   Total={val_losses['total']:.4f} | A={val_losses['answer']:.4f} | "
+                  f"KL={val_losses['kl']:.4f} | O={val_losses['ortho']:.4f}", end="")
+            if cfg.use_teacher and 'teacher' in val_losses:
+                print(f" | T={val_losses['teacher']:.4f}")
+            else:
+                print()
+        else:  # simple model
+            print(f"Train: Total={train_losses['total']:.4f} | Answer={train_losses['answer']:.4f}", end="")
+            if cfg.use_teacher and 'teacher' in train_losses:
+                print(f" | Teacher={train_losses['teacher']:.4f}")
+            else:
+                print()
+            
+            print(f"Val:   Total={val_losses['total']:.4f} | Answer={val_losses['answer']:.4f}", end="")
+            if cfg.use_teacher and 'teacher' in val_losses:
+                print(f" | Teacher={val_losses['teacher']:.4f}")
+            else:
+                print()
         
         print(f"LR: {current_lr:.2e}")
         print(f"{'='*80}\n")

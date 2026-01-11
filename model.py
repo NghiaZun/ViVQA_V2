@@ -1052,6 +1052,249 @@ class TrainingCurriculum:
         self.current_step += 1
 
 
+# ============================================================================
+# SIMPLE FUSION VQA (NO LATENT REASONING) - For baseline comparison
+# ============================================================================
+
+class SimpleFusionVQA(nn.Module):
+    """
+    SOTA Fusion VQA (No Latent Reasoning Bottleneck)
+    
+    Architecture với SOTA fusion techniques:
+    - DINOv2 vision encoder (unfrozen in stage 3)
+    - BARTpho encoder (unfrozen in stage 2)
+    - **Vision-First Gated Fusion** (SOTA technique from VLP papers)
+    - BARTpho decoder (unfrozen in stage 2)
+    
+    Fusion improvements over simple cross-attention:
+    1. Vision-first attention (prevent text shortcut)
+    2. Gating mechanism (adaptive fusion)
+    3. Multi-layer fusion with residual connections
+    4. Layer normalization after each fusion
+    
+    Expected to match/exceed ViT + PhoBERT + ViT5 performance (65-70%)
+    """
+    
+    def __init__(
+        self,
+        dinov2_model_name: str = 'facebook/dinov2-base',
+        bartpho_model_name: str = 'vinai/bartpho-syllable',
+        num_fusion_layers: int = 3,  # Increased from 2
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        image_dropout_prob: float = 0.1,  # Add image dropout for robustness
+        gradient_checkpointing: bool = True
+    ):
+        super().__init__()
+        
+        print("[SimpleFusionVQA] Initializing with SOTA fusion techniques...")
+        
+        # Vision encoder
+        self.vision_encoder = AutoModel.from_pretrained(dinov2_model_name)
+        vision_hidden_dim = self.vision_encoder.config.hidden_size
+        
+        # Language model (BARTpho)
+        bartpho_full = MBartForConditionalGeneration.from_pretrained(bartpho_model_name)
+        bartpho_full.config.use_cache = False
+        
+        self.tokenizer = BartphoTokenizer.from_pretrained(bartpho_model_name)
+        bart_hidden_dim = bartpho_full.config.d_model
+        
+        self.encoder = bartpho_full.model.encoder
+        self.decoder = bartpho_full.model.decoder
+        self.lm_head = bartpho_full.lm_head
+        
+        self.config = self.encoder.config
+        self.config.decoder_start_token_id = self.tokenizer.bos_token_id
+        self.config.pad_token_id = self.tokenizer.pad_token_id
+        self.config.eos_token_id = self.tokenizer.eos_token_id
+        
+        del bartpho_full
+        
+        # Vision projection to match text dimension
+        self.vision_proj = nn.Sequential(
+            nn.Linear(vision_hidden_dim, bart_hidden_dim),
+            nn.LayerNorm(bart_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # SOTA Vision-First Gated Fusion (multi-layer)
+        self.fusion_layers = nn.ModuleList()
+        for _ in range(num_fusion_layers):
+            self.fusion_layers.append(
+                VisionFirstFusion(
+                    hidden_dim=bart_hidden_dim,
+                    num_heads=num_heads,
+                    dropout=dropout
+                )
+            )
+        
+        # Config
+        self.image_dropout_prob = image_dropout_prob
+        
+        # Gradient checkpointing
+        if gradient_checkpointing:
+            self.vision_encoder.gradient_checkpointing_enable()
+            self.encoder.gradient_checkpointing_enable()
+        
+        print("[SimpleFusionVQA] ✓ Initialization complete with SOTA fusion")
+        print(f"  - Vision-first gated fusion: {num_fusion_layers} layers")
+        print(f"  - Multi-head attention: {num_heads} heads")
+        print(f"  - Image dropout: {image_dropout_prob}")
+    
+    def freeze_all_pretrained(self):
+        """Stage 1: Freeze everything except fusion"""
+        for param in self.vision_encoder.parameters():
+            param.requires_grad = False
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+        for param in self.lm_head.parameters():
+            param.requires_grad = False
+        
+        # Only fusion layers trainable
+        trainable = (
+            sum(p.numel() for p in self.vision_proj.parameters()) +
+            sum(p.numel() for p in self.fusion_layers.parameters())
+        )
+        total = sum(p.numel() for p in self.parameters())
+        
+        print(f"[Stage 1] Trainable: {trainable/1e6:.1f}M / {total/1e6:.1f}M ({100*trainable/total:.1f}%)")
+    
+    def unfreeze_text_components(self, num_encoder_layers: int = 3, num_decoder_layers: int = 3):
+        """Stage 2: Unfreeze last N layers of encoder + decoder"""
+        # Unfreeze last N encoder layers
+        total_enc_layers = len(self.encoder.layers)
+        for i, layer in enumerate(self.encoder.layers):
+            if i >= total_enc_layers - num_encoder_layers:
+                for param in layer.parameters():
+                    param.requires_grad = True
+        
+        # Unfreeze last N decoder layers
+        total_dec_layers = len(self.decoder.layers)
+        for i, layer in enumerate(self.decoder.layers):
+            if i >= total_dec_layers - num_decoder_layers:
+                for param in layer.parameters():
+                    param.requires_grad = True
+        
+        # Unfreeze LM head
+        for param in self.lm_head.parameters():
+            param.requires_grad = True
+        
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        
+        print(f"[Stage 2] Unfroze last {num_encoder_layers} encoder + {num_decoder_layers} decoder layers")
+        print(f"[Stage 2] Trainable: {trainable/1e6:.1f}M / {total/1e6:.1f}M ({100*trainable/total:.1f}%)")
+    
+    def unfreeze_vision_encoder(self, num_layers: int = 3):
+        """Stage 3: Unfreeze last N layers of vision encoder"""
+        total_vision_layers = len(self.vision_encoder.encoder.layer)
+        for i, layer in enumerate(self.vision_encoder.encoder.layer):
+            if i >= total_vision_layers - num_layers:
+                for param in layer.parameters():
+                    param.requires_grad = True
+        
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        
+        print(f"[Stage 3] Unfroze last {num_layers} vision encoder layers")
+        print(f"[Stage 3] Trainable: {trainable/1e6:.1f}M / {total/1e6:.1f}M ({100*trainable/total:.1f}%)")
+    
+    def forward(
+        self,
+        pixel_values,
+        input_ids,
+        attention_mask,
+        labels=None
+    ):
+        """Forward pass with SOTA vision-first gated fusion"""
+        batch_size = pixel_values.size(0)
+        
+        # 1. Vision encoding
+        vision_outputs = self.vision_encoder(pixel_values)
+        visual_features = vision_outputs.last_hidden_state  # [B, 257, 768]
+        visual_features = self.vision_proj(visual_features)  # [B, 257, 1024]
+        
+        # 2. Text encoding
+        encoder_outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        text_features = encoder_outputs.last_hidden_state  # [B, L, 1024]
+        
+        # 3. SOTA Vision-First Gated Fusion (multi-layer with residual)
+        fused_features = text_features
+        for fusion_layer in self.fusion_layers:
+            fused_features = fusion_layer(
+                text_features=fused_features,
+                visual_features=visual_features,
+                image_dropout_prob=self.image_dropout_prob if self.training else 0.0
+            )
+        
+        # 4. Decode
+        if labels is not None:
+            # Shift labels for teacher forcing
+            decoder_input_ids = shift_tokens_right(
+                labels, self.config.pad_token_id, self.config.decoder_start_token_id
+            )
+            
+            decoder_outputs = self.decoder(
+                input_ids=decoder_input_ids,
+                encoder_hidden_states=fused_features,
+                encoder_attention_mask=attention_mask
+            )
+            
+            logits = self.lm_head(decoder_outputs.last_hidden_state)
+            
+            # Compute loss
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+            
+            return type('Output', (), {
+                'loss': loss,
+                'logits': logits
+            })()
+        else:
+            # Inference mode
+            return type('Output', (), {
+                'encoder_hidden_states': fused_features,
+                'encoder_attention_mask': attention_mask
+            })()
+    
+    def generate(
+        self,
+        pixel_values,
+        input_ids,
+        attention_mask,
+        max_length=32,
+        num_beams=4,
+        **kwargs
+    ):
+        """Generate answers"""
+        # Get fused features
+        outputs = self.forward(pixel_values, input_ids, attention_mask, labels=None)
+        
+        # Generate using BARTpho decoder
+        generated_ids = self.decoder.generate(
+            encoder_hidden_states=outputs.encoder_hidden_states,
+            encoder_attention_mask=outputs.encoder_attention_mask,
+            max_length=max_length,
+            num_beams=num_beams,
+            decoder_start_token_id=self.config.decoder_start_token_id,
+            eos_token_id=self.config.eos_token_id,
+            pad_token_id=self.config.pad_token_id,
+            **kwargs
+        )
+        
+        # Decode
+        answers = []
+        for ids in generated_ids:
+            answer = self.tokenizer.decode(ids, skip_special_tokens=True)
+            answers.append(answer)
+        
+        return answers
+
+
 if __name__ == '__main__':
     print("="*80)
     print("FIXED LATENT REASONING VQA - ALL CRITICAL ISSUES ADDRESSED")
