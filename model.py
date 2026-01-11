@@ -82,13 +82,15 @@ class VisionFirstFusion(nn.Module):
         
         # Step 1: Vision queries text (vision-grounded text)
         vision_grounded, _ = self.vision_to_text(
-            visual_features, text_features, text_features
+            visual_features, text_features, text_features,
+            need_weights=False
         )
         vision_enhanced = self.norm1(visual_features + vision_grounded)
         
         # Step 2: Text attends to enhanced vision
-        text_enhanced, attn = self.text_to_vision(
-            text_features, vision_enhanced, vision_enhanced
+        text_enhanced, _ = self.text_to_vision(
+            text_features, vision_enhanced, vision_enhanced,
+            need_weights=False
         )
         
         # Gating
