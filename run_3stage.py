@@ -135,7 +135,10 @@ def main():
     parser = argparse.ArgumentParser(description="Run full 3-stage training in one session")
     parser.add_argument("--csv_path", type=str, required=True)
     parser.add_argument("--image_folder", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1,
+                       help="Micro-batch size per GPU (use with gradient_accumulation_steps)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2,
+                       help="Accumulate gradients over N steps (effective_batch = batch_size * N)")
     parser.add_argument("--teacher_type", type=str, default="rule_based", 
                        choices=["rule_based", "vlm"])
     parser.add_argument("--stage1_epochs", type=int, default=5)
@@ -149,11 +152,15 @@ def main():
     
     args = parser.parse_args()
     
+    # Set PyTorch CUDA memory optimization (reduce fragmentation)
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
     # Configuration
     cfg = FixedTrainConfig()
     cfg.csv_path = args.csv_path
     cfg.image_folder = args.image_folder
     cfg.batch_size = args.batch_size
+    cfg.gradient_accumulation_steps = args.gradient_accumulation_steps
     cfg.teacher_type = args.teacher_type
     cfg.num_reasoning_samples = args.num_reasoning_samples
     
@@ -161,6 +168,7 @@ def main():
     cfg.max_q_len = 64  # Max question length
     cfg.max_a_len = 10  # Max answer length (VQA answers are short: 1-3 words)
     cfg.learning_rate = cfg.base_lr  # Add learning_rate alias
+    cfg.accum_steps = cfg.gradient_accumulation_steps  # Map to train.py's expected name
     cfg.use_teacher = True  # Enable teacher in Stage 3
     cfg.teacher_weight = 0.5  # Teacher loss weight
     cfg.reasoning_temperature = 0.7  # Temperature for stochastic sampling
@@ -175,6 +183,10 @@ def main():
     print("="*80)
     print("CONTINUOUS 3-STAGE TRAINING")
     print("="*80)
+    print(f"\nBatch configuration:")
+    print(f"  Micro-batch size: {cfg.batch_size}")
+    print(f"  Gradient accumulation: {cfg.gradient_accumulation_steps} steps")
+    print(f"  Effective batch size: {cfg.batch_size * cfg.gradient_accumulation_steps}")
     print(f"\nStage boundaries:")
     print(f"  Stage 1 (Baseline): Epochs 0-{stage1_end-1}")
     print(f"  Stage 2 (Warmup):   Epochs {stage1_end}-{stage2_end-1}")
@@ -369,6 +381,9 @@ def main():
         print(f"EPOCH {epoch+1}/{total_epochs} (Stage {current_stage})")
         print("="*80)
         
+        # Clear memory before training
+        clear_memory()
+        
         # Train
         train_losses = run_one_epoch(
             model, train_loader, optimizer, scaler, device, cfg,
@@ -380,6 +395,7 @@ def main():
         
         # Clear memory before validation
         clear_memory()
+        gc.collect()  # Force garbage collection
         
         # Validation
         with torch.no_grad():
