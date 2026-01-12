@@ -436,6 +436,10 @@ def run_one_epoch(
                 
                 # FIX #8: Update curriculum
                 curriculum.step()
+                
+                # Clear memory cache every accumulation step to prevent fragmentation
+                if torch.cuda.is_available() and (batch_idx + 1) % (cfg.accum_steps * 10) == 0:
+                    torch.cuda.empty_cache()
         
         # Accumulate
         total_loss += loss.item() * cfg.accum_steps if train else loss.item()

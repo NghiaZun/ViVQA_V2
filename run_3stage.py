@@ -165,8 +165,8 @@ def main():
     cfg.num_reasoning_samples = args.num_reasoning_samples
     
     # Add missing attributes
-    cfg.max_q_len = 64  # Max question length
-    cfg.max_a_len = 10  # Max answer length (VQA answers are short: 1-3 words)
+    cfg.max_q_len = 48  # Reduced from 64 (questions rarely exceed 48 tokens)
+    cfg.max_a_len = 6   # Reduced from 10 (VQA answers: 1-3 words = 2-5 tokens max)
     cfg.learning_rate = cfg.base_lr  # Add learning_rate alias
     cfg.accum_steps = cfg.gradient_accumulation_steps  # Map to train.py's expected name
     cfg.use_teacher = True  # Enable teacher in Stage 3
@@ -225,8 +225,11 @@ def main():
         gradient_checkpointing=True
     )
     
-    # Freeze with decoder unfrozen (will handle per-stage later)
-    model.freeze_pretrained(unfreeze_encoder_layers=3, unfreeze_decoder=True)
+    # Stage 1: Freeze decoder to save memory (only train reasoning + fusion)
+    # Stage 2+: Unfreeze decoder for full training
+    model.freeze_pretrained(unfreeze_encoder_layers=3, unfreeze_decoder=False)
+    print("  ⚠️  Stage 1 strategy: Decoder FROZEN (saves ~30% memory)")
+    print("  ⚠️  Will unfreeze decoder at Stage 2 transition")
     model = model.to(device)
     
     # Dataset
@@ -369,6 +372,9 @@ def main():
             print("🟡 STAGE 2: WARMUP (Reasoning KL Warmup)")
             print("="*80 + "\n")
             curriculum.current_step = 0  # Reset for warmup
+            # CRITICAL: Unfreeze decoder for Stage 2+
+            model.freeze_pretrained(unfreeze_encoder_layers=3, unfreeze_decoder=True)
+            print("  ✅ Decoder UNFROZEN for Stage 2+")
         elif epoch == stage2_end:
             print("\n" + "="*80)
             print("🟢 STAGE 3: FULL (Complete + Teacher)")

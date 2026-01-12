@@ -512,11 +512,14 @@ class FixedLatentReasoningVQA(nn.Module):
         self.latent_dim = latent_dim
         
         # Gradient checkpointing
-        # NOTE: Disabled decoder checkpointing to avoid "decoder_input_ids and decoder_inputs_embeds" conflict
+        # CRITICAL: Must set use_cache=False when using gradient checkpointing
         if gradient_checkpointing:
             self.vision_encoder.gradient_checkpointing_enable()
             self.encoder.gradient_checkpointing_enable()
-            # self.decoder.gradient_checkpointing_enable()  # Disabled - causes conflict
+            # Enable decoder checkpointing (HUGE memory savings!)
+            self.decoder.gradient_checkpointing_enable()
+            # Disable cache to avoid conflicts with checkpointing
+            self.decoder.config.use_cache = False
         
         print("[FIXED MODEL] ✓ Initialization complete")
     
