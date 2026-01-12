@@ -291,10 +291,51 @@ def main():
         print(f"\n📂 Loading checkpoint from: {args.resume_from}")
         checkpoint = torch.load(args.resume_from, map_location=device)
         
-        # Restore model, optimizer, scheduler
+        # CRITICAL: Load model state first
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Get loaded stage to determine freezing strategy
+        loaded_stage = checkpoint.get('stage', 1)
+        start_epoch = checkpoint['epoch']  # This is the NEXT epoch to train
+        
+        # Determine if we should freeze decoder based on resume epoch/stage
+        # Stage 1 (epochs 0 to stage1_end-1): Decoder frozen
+        # Stage 2+ (epochs >= stage1_end): Decoder unfrozen
+        should_freeze_decoder = (start_epoch < args.stage1_epochs)
+        
+        # Apply correct freezing strategy BEFORE loading optimizer
+        if should_freeze_decoder:
+            model.freeze_pretrained(unfreeze_encoder_layers=3, unfreeze_decoder=False)
+            print(f"  ✓ Applied Stage {loaded_stage} freezing: Decoder FROZEN")
+        else:
+            model.freeze_pretrained(unfreeze_encoder_layers=3, unfreeze_decoder=True)
+            print(f"  ✓ Applied Stage {loaded_stage} freezing: Decoder UNFROZEN")
+        
+        # Reinitialize optimizer with current trainable parameters
+        # This is SAFER than loading mismatched optimizer state
+        print("  ⚠️  Reinitializing optimizer with current parameters (avoiding mismatch)")
+        optimizer = AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay
+        )
+        
+        # Try to load optimizer state (may fail if freezing changed)
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("  ✓ Restored optimizer state")
+        except (ValueError, RuntimeError) as e:
+            print(f"  ⚠️  Could not restore optimizer state: {e}")
+            print(f"  ⚠️  Using fresh optimizer (training will continue from current LR)")
+        
+        # Restore scheduler
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs)
+        try:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print("  ✓ Restored scheduler state")
+        except (ValueError, RuntimeError) as e:
+            print(f"  ⚠️  Could not restore scheduler state: {e}")
+            print(f"  ⚠️  Using fresh scheduler")
         
         # Restore scaler if available (handle disabled scaler gracefully)
         if 'scaler_state_dict' in checkpoint:
@@ -311,7 +352,6 @@ def main():
                 print("  ⚠️  Using fresh scaler (training will continue normally)")
         
         # Restore training state
-        start_epoch = checkpoint['epoch']  # This is the NEXT epoch to train
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         loaded_history = checkpoint.get('history', None)
         
@@ -325,12 +365,7 @@ def main():
             curriculum.current_step = completed_stage2_epochs * len(train_loader)
             print(f"  ⚠️  Estimated curriculum step: {curriculum.current_step}")
         
-        # Apply correct freezing strategy based on loaded stage
-        loaded_stage = checkpoint.get('stage', 1)
-        if loaded_stage >= 1:
-            model.freeze_pretrained(unfreeze_encoder_layers=3, unfreeze_decoder=True)
-            print(f"  ✓ Applied Stage {loaded_stage} freezing")
-        
+        # Summary
         print(f"  ✓ Checkpoint from completed epoch {start_epoch}")
         print(f"  ✓ Will resume training from epoch {start_epoch + 1}")
         print(f"  ✓ Stage: {loaded_stage}")
