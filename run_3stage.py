@@ -258,7 +258,7 @@ def main():
     )
     
     scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs)
-    scaler = GradScaler(enabled=cfg.use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=cfg.use_amp)
     
     # Curriculum (warmup over ENTIRE Stage 2, not just 1 epoch!)
     total_stage2_steps = len(train_loader) * args.stage2_epochs
@@ -281,10 +281,19 @@ def main():
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        # Restore scaler if available
+        # Restore scaler if available (handle disabled scaler gracefully)
         if 'scaler_state_dict' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            print("  ✓ Restored scaler state")
+            try:
+                scaler_state = checkpoint['scaler_state_dict']
+                # Check if scaler state is not empty (not from disabled scaler)
+                if scaler_state and '_scale' in scaler_state:
+                    scaler.load_state_dict(scaler_state)
+                    print("  ✓ Restored scaler state")
+                else:
+                    print("  ⚠️  Scaler state empty (from disabled scaler), using fresh scaler")
+            except RuntimeError as e:
+                print(f"  ⚠️  Could not load scaler state: {e}")
+                print("  ⚠️  Using fresh scaler (training will continue normally)")
         
         # Restore training state
         start_epoch = checkpoint['epoch']  # This is the NEXT epoch to train

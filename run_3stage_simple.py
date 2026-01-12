@@ -621,6 +621,19 @@ def main():
         last_path = os.path.join(cfg.save_dir, "last.pt")
         torch.save(checkpoint, last_path)
         
+        # Save training history CSV (every epoch)
+        df = pd.DataFrame(history)
+        csv_path = os.path.join(cfg.save_dir, "training_history.csv")
+        df.to_csv(csv_path, index=False)
+        
+        # Plot training curves (every 5 epochs)
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == total_epochs:
+            try:
+                plot_training_curves(history, cfg.save_dir, args.stage1_epochs, args.stage2_epochs)
+                print(f"  📊 Updated training curves and plots")
+            except Exception as e:
+                print(f"  ⚠️  Failed to plot curves: {e}")
+        
         # Sample predictions every 5 epochs
         if (epoch + 1) % 5 == 0:
             print("\n" + "="*80)
@@ -679,23 +692,19 @@ def main():
         
         print()
     
-    # Save final history
-    df = pd.DataFrame(history)
-    csv_path = os.path.join(cfg.save_dir, "training_history.csv")
-    df.to_csv(csv_path, index=False)
-    
-    # Plot training curves
-    print("\n[5/6] Generating training curves...")
-    plot_training_curves(history, cfg.save_dir, args.stage1_epochs, args.stage2_epochs)
-    
+    # Final summary
     print("\n" + "="*80)
     print("✅ ALL 3 STAGES COMPLETED!")
     print("="*80)
     print(f"\nBest validation loss: {best_val_loss:.4f}")
-    print(f"\nCheckpoints saved in: {cfg.save_dir}/")
-    print(f"  - best.pt (best validation model - use for inference)")
-    print(f"  - last.pt (last epoch checkpoint - use for resume)")
-    print(f"  - training_history.csv (loss curves)")
+    print(f"\nAll files saved in: {cfg.save_dir}/")
+    print(f"  📦 Checkpoints:")
+    print(f"     - best.pt (best validation model - use for inference)")
+    print(f"     - last.pt (last epoch checkpoint - use for resume)")
+    print(f"  📊 Training logs:")
+    print(f"     - training_history.csv (epoch-by-epoch metrics)")
+    print(f"     - training_curves.png (loss & LR plots with stage transitions)")
+    print(f"     - loss_comparison.png (train vs val loss with best model marker)")
     print("\nNext steps:")
     print(f"  1. Resume training (if interrupted):")
     print(f"     python run_3stage_simple.py --csv_path ... --image_folder ... --resume_from {cfg.save_dir}/last.pt")
