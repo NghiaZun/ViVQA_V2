@@ -284,7 +284,10 @@ def main():
     parser.add_argument("--csv_path", type=str, required=True)
     parser.add_argument("--image_folder", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--accum_steps", type=int, default=8)
+    parser.add_argument("--accum_steps", "--accumulation_steps", type=int, default=8, dest="accum_steps",
+                       help="Gradient accumulation steps (default: 8)")
+    parser.add_argument("--learning_rate", "--base_lr", type=float, default=5e-5, dest="base_lr",
+                       help="Base learning rate for Stage 1 (default: 5e-5)")
     parser.add_argument("--stage1_epochs", type=int, default=12,
                        help="Stage 1: Train fusion only (10-15 recommended)")
     parser.add_argument("--stage2_epochs", type=int, default=8,
@@ -316,7 +319,7 @@ def main():
     cfg.save_dir = args.save_dir
     cfg.use_amp = True
     cfg.max_grad_norm = 1.0
-    cfg.base_lr = 5e-5
+    cfg.base_lr = args.base_lr
     cfg.weight_decay = 0.05
     cfg.warmup_ratio = 0.06
     cfg.max_q_len = 64
