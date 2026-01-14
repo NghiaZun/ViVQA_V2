@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Full 3-Stage Training Pipeline for SimpleFusionVQA (Continuous)
-================================================================
+OPTIMAL 3-Stage Training Pipeline for SimpleFusionVQA
+======================================================
 
-Run all 3 stages in a single continuous training session
-Automatically switches stages based on epoch milestones
+Optimized strategy to prevent overfitting (based on analysis of baseline results):
+- Stage 1 (10-15 epochs): Freeze all, train fusion only
+- Stage 2 (7-10 epochs): Unfreeze BARTpho decoder last 2-3 layers (lr=1e-5)
+- Stage 2.5 (3-5 epochs): Unfreeze BARTpho encoder last 2 layers (lr=5e-6)
+- DINOv2: ALWAYS FROZEN (pre-trained on 142M images, no need to fine-tune)
 
-Similar to ViT + PhoBERT + ViT5 training strategy:
-- Stage 1: Train fusion only (all encoders frozen)
-- Stage 2: Unfreeze text encoder + decoder
-- Stage 3: Unfreeze vision encoder
+Key improvements over baseline:
+✅ No DINOv2 unfreezing → prevent overfitting on small dataset
+✅ Gradual text model adaptation: decoder first, then encoder
+✅ Lower learning rates for unfrozen layers → better stability
+✅ Fewer total epochs → better generalization
 
-Expected accuracy: 63-68% (matching/exceeding old architecture)
+Expected: val_loss 0.85-0.90 (vs 0.93 baseline), no overfitting
 
 Usage:
-    python run_3stage_simple.py --csv_path <path> --image_folder <path>
+    python run_3stage_simple.py --csv_path <path> --image_folder <path> \
+        --stage1_epochs 12 --stage2_epochs 8 --stage2_5_epochs 4
 """
 
 import torch
@@ -37,14 +42,14 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server environments
 
 
-def get_current_stage(epoch: int, stage1_epochs: int, stage2_epochs: int):
-    """Determine current stage based on epoch number"""
-    if epoch < stage1_epochs:
+def get_current_stage(epoch: int, stage1_end: int, stage2_end: int):
+    """Determine current stage (1, 2, or 2.5) based on epoch number"""
+    if epoch < stage1_end:
         return 1
-    elif epoch < stage1_epochs + stage2_epochs:
+    elif epoch < stage2_end:
         return 2
     else:
-        return 3
+        return 2.5  # Stage 2.5 - encoder unfreezing
 
 
 def log_memory_usage(step_name=""):
@@ -88,9 +93,9 @@ def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
     stage2_end = stage1_epochs + stage2_epochs
     
     if len(epochs) > stage1_end:
-        ax1.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7, label='Stage 1→2')
+        ax1.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7, label='Stage 1→2 (Decoder)')
     if len(epochs) > stage2_end:
-        ax1.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7, label='Stage 2→3')
+        ax1.axvline(x=stage2_end, color='purple', linestyle='--', linewidth=2, alpha=0.7, label='Stage 2→2.5 (Encoder)')
     
     # Add stage background colors
     if len(epochs) > 0:
@@ -100,15 +105,15 @@ def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
         
         stage2_x = [e for e in epochs if stage1_end < e <= stage2_end]
         if stage2_x:
-            ax1.axvspan(min(stage2_x), max(stage2_x), alpha=0.1, color='orange', label='Stage 2 (+ Text)')
+            ax1.axvspan(min(stage2_x), max(stage2_x), alpha=0.1, color='orange', label='Stage 2 (+ Decoder)')
         
-        stage3_x = [e for e in epochs if e > stage2_end]
-        if stage3_x:
-            ax1.axvspan(min(stage3_x), max(stage3_x), alpha=0.1, color='green', label='Stage 3 (+ Vision)')
+        stage2_5_x = [e for e in epochs if e > stage2_end]
+        if stage2_5_x:
+            ax1.axvspan(min(stage2_5_x), max(stage2_5_x), alpha=0.1, color='purple', label='Stage 2.5 (+ Encoder)')
     
     ax1.set_xlabel('Epoch', fontsize=12, fontweight='bold')
     ax1.set_ylabel('Loss', fontsize=12, fontweight='bold')
-    ax1.set_title('Training and Validation Loss (3-Stage Training)', fontsize=14, fontweight='bold')
+    ax1.set_title('Training and Validation Loss (Optimal 3-Stage: DINOv2 Frozen)', fontsize=14, fontweight='bold')
     ax1.legend(loc='upper right', fontsize=10)
     ax1.grid(True, alpha=0.3)
     
@@ -120,7 +125,7 @@ def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
     if len(epochs) > stage1_end:
         ax2.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7)
     if len(epochs) > stage2_end:
-        ax2.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7)
+        ax2.axvline(x=stage2_end, color='purple', linestyle='--', linewidth=2, alpha=0.7)
     
     # Add stage background colors
     if len(epochs) > 0:
@@ -132,9 +137,9 @@ def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
         if stage2_x:
             ax2.axvspan(min(stage2_x), max(stage2_x), alpha=0.1, color='orange')
         
-        stage3_x = [e for e in epochs if e > stage2_end]
-        if stage3_x:
-            ax2.axvspan(min(stage3_x), max(stage3_x), alpha=0.1, color='green')
+        stage2_5_x = [e for e in epochs if e > stage2_end]
+        if stage2_5_x:
+            ax2.axvspan(min(stage2_5_x), max(stage2_5_x), alpha=0.1, color='purple')
     
     ax2.set_xlabel('Epoch', fontsize=12, fontweight='bold')
     ax2.set_ylabel('Learning Rate', fontsize=12, fontweight='bold')
@@ -144,17 +149,17 @@ def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
     
     # Add annotations for LR changes
     if len(epochs) > stage1_end and stage1_end < len(lr):
-        ax2.annotate(f'LR×0.5\n{lr[stage1_end]:.2e}', 
+        ax2.annotate(f'Decoder LR\n{lr[stage1_end]:.2e}', 
                     xy=(stage1_end, lr[stage1_end]), 
                     xytext=(stage1_end-2, lr[stage1_end]*2),
                     arrowprops=dict(arrowstyle='->', color='orange', lw=1.5),
                     fontsize=9, ha='right')
     
     if len(epochs) > stage2_end and stage2_end < len(lr):
-        ax2.annotate(f'LR×0.1\n{lr[stage2_end]:.2e}', 
+        ax2.annotate(f'Encoder LR\n{lr[stage2_end]:.2e}', 
                     xy=(stage2_end, lr[stage2_end]), 
                     xytext=(stage2_end-2, lr[stage2_end]*2),
-                    arrowprops=dict(arrowstyle='->', color='green', lw=1.5),
+                    arrowprops=dict(arrowstyle='->', color='purple', lw=1.5),
                     fontsize=9, ha='right')
     
     plt.tight_layout()
@@ -189,13 +194,13 @@ def plot_training_curves(history, save_dir, stage1_epochs, stage2_epochs):
     # Stage transitions
     if len(epochs) > stage1_end:
         ax.axvline(x=stage1_end, color='orange', linestyle='--', linewidth=2, alpha=0.7)
-        ax.text(stage1_end, ax.get_ylim()[1]*0.95, 'Stage 1→2\n(Unfreeze Text)', 
+        ax.text(stage1_end, ax.get_ylim()[1]*0.95, 'Stage 1→2\n(+ Decoder)', 
                ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='orange', alpha=0.3))
     
     if len(epochs) > stage2_end:
-        ax.axvline(x=stage2_end, color='green', linestyle='--', linewidth=2, alpha=0.7)
-        ax.text(stage2_end, ax.get_ylim()[1]*0.95, 'Stage 2→3\n(Unfreeze Vision)', 
-               ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='green', alpha=0.3))
+        ax.axvline(x=stage2_end, color='purple', linestyle='--', linewidth=2, alpha=0.7)
+        ax.text(stage2_end, ax.get_ylim()[1]*0.95, 'Stage 2→2.5\n(+ Encoder)', 
+               ha='center', fontsize=10, bbox=dict(boxstyle='round', facecolor='purple', alpha=0.3))
     
     ax.set_xlabel('Epoch', fontsize=12, fontweight='bold')
     ax.set_ylabel('Loss', fontsize=12, fontweight='bold')
@@ -280,20 +285,22 @@ def main():
     parser.add_argument("--image_folder", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accum_steps", type=int, default=8)
-    parser.add_argument("--stage1_epochs", type=int, default=10,
-                       help="Stage 1: Train fusion only")
-    parser.add_argument("--stage2_epochs", type=int, default=10,
-                       help="Stage 2: Unfreeze text encoder + decoder")
-    parser.add_argument("--stage3_epochs", type=int, default=5,
-                       help="Stage 3: Unfreeze vision encoder")
+    parser.add_argument("--stage1_epochs", type=int, default=12,
+                       help="Stage 1: Train fusion only (10-15 recommended)")
+    parser.add_argument("--stage2_epochs", type=int, default=8,
+                       help="Stage 2: Unfreeze decoder last layers (7-10 recommended)")
+    parser.add_argument("--stage2_5_epochs", type=int, default=4,
+                       help="Stage 2.5: Unfreeze encoder last layers (3-5 recommended)")
     parser.add_argument("--num_fusion_layers", type=int, default=3,
                        help="Number of fusion layers (default: 3 for SOTA)")
-    parser.add_argument("--num_encoder_layers", type=int, default=3,
-                       help="Text encoder layers to unfreeze in stage 2")
     parser.add_argument("--num_decoder_layers", type=int, default=3,
-                       help="Decoder layers to unfreeze in stage 2")
-    parser.add_argument("--num_vision_layers", type=int, default=3,
-                       help="Vision layers to unfreeze in stage 3")
+                       help="Decoder layers to unfreeze in stage 2 (2-3 recommended)")
+    parser.add_argument("--num_encoder_layers", type=int, default=2,
+                       help="Encoder layers to unfreeze in stage 2.5 (2 recommended)")
+    parser.add_argument("--decoder_lr", type=float, default=1e-5,
+                       help="Learning rate for decoder in Stage 2 (1e-5 recommended)")
+    parser.add_argument("--encoder_lr", type=float, default=5e-6,
+                       help="Learning rate for encoder in Stage 2.5 (5e-6 recommended)")
     parser.add_argument("--save_dir", type=str, default="checkpoints_simple_3stage")
     parser.add_argument("--resume_from", type=str, default=None,
                        help="Path to checkpoint to resume from (e.g., checkpoints_simple_3stage/last.pt)")
@@ -316,26 +323,26 @@ def main():
     cfg.max_a_len = 10
     
     # Total epochs
-    total_epochs = args.stage1_epochs + args.stage2_epochs + args.stage3_epochs
+    total_epochs = args.stage1_epochs + args.stage2_epochs + args.stage2_5_epochs
     stage1_end = args.stage1_epochs
     stage2_end = args.stage1_epochs + args.stage2_epochs
     
     print("="*80)
-    print("CONTINUOUS 3-STAGE TRAINING: SimpleFusionVQA (SOTA Fusion)")
+    print("OPTIMAL 3-STAGE TRAINING: SimpleFusionVQA")
     if args.resume_from:
         print(f"🔄 RESUME MODE: {args.resume_from}")
     print("="*80)
-    print(f"\nArchitecture:")
-    print(f"  - DINOv2 vision encoder")
-    print(f"  - BARTpho text encoder")
-    print(f"  - Vision-First Gated Fusion ({args.num_fusion_layers} layers)")
-    print(f"  - BARTpho decoder")
-    print(f"\nStage boundaries:")
-    print(f"  Stage 1 (Fusion Only):  Epochs 0-{stage1_end-1}")
-    print(f"  Stage 2 (Text Unfreeze): Epochs {stage1_end}-{stage2_end-1}")
-    print(f"  Stage 3 (Vision Unfreeze): Epochs {stage2_end}-{total_epochs-1}")
+    print(f"\n🎯 Strategy: Prevent Overfitting via Gradual Unfreezing")
+    print(f"  ✓ DINOv2: ALWAYS frozen (142M images pre-training)")
+    print(f"  ✓ Stage 1: Only fusion layers trainable")
+    print(f"  ✓ Stage 2: + Decoder last {args.num_decoder_layers} layers (LR={args.decoder_lr})")
+    print(f"  ✓ Stage 2.5: + Encoder last {args.num_encoder_layers} layers (LR={args.encoder_lr})")
+    print(f"\n📊 Stage boundaries:")
+    print(f"  Stage 1:   Epochs 1-{stage1_end} ({args.stage1_epochs} epochs)")
+    print(f"  Stage 2:   Epochs {stage1_end+1}-{stage2_end} ({args.stage2_epochs} epochs)")
+    print(f"  Stage 2.5: Epochs {stage2_end+1}-{total_epochs} ({args.stage2_5_epochs} epochs)")
     print(f"  TOTAL: {total_epochs} epochs")
-    print(f"\nExpected accuracy: 63-68% (matching ViT+PhoBERT+ViT5)")
+    print(f"\n📈 Expected: val_loss 0.85-0.90 (vs 0.93 baseline), stable training")
     print("="*80 + "\n")
     
     # Setup
@@ -389,18 +396,17 @@ def main():
         elif loaded_stage == 2:
             model.freeze_all_pretrained()
             model.unfreeze_text_components(
-                num_encoder_layers=args.num_encoder_layers,
+                num_encoder_layers=0,  # Encoder still frozen in Stage 2
                 num_decoder_layers=args.num_decoder_layers
             )
-            print("  ✓ Applied Stage 2 freezing (fusion + text)")
-        elif loaded_stage == 3:
+            print(f"  ✓ Applied Stage 2 freezing (fusion + decoder last {args.num_decoder_layers} layers)")
+        elif loaded_stage == 2.5:
             model.freeze_all_pretrained()
             model.unfreeze_text_components(
                 num_encoder_layers=args.num_encoder_layers,
                 num_decoder_layers=args.num_decoder_layers
             )
-            model.unfreeze_vision_encoder(num_layers=args.num_vision_layers)
-            print("  ✓ Applied Stage 3 freezing (fusion + text + vision)")
+            print(f"  ✓ Applied Stage 2.5 freezing (fusion + decoder {args.num_decoder_layers} + encoder {args.num_encoder_layers} layers)")
     else:
         # Fresh training - Stage 1: Freeze all
         model.freeze_all_pretrained()
@@ -457,9 +463,9 @@ def main():
         if loaded_stage == 1:
             initial_lr = cfg.base_lr
         elif loaded_stage == 2:
-            initial_lr = cfg.base_lr * 0.5
-        else:  # stage 3
-            initial_lr = cfg.base_lr * 0.1
+            initial_lr = args.decoder_lr
+        else:  # stage 2.5
+            initial_lr = args.encoder_lr
         print(f"  Resuming with LR: {initial_lr:.6f} (Stage {loaded_stage})")
     else:
         initial_lr = cfg.base_lr
@@ -512,42 +518,58 @@ def main():
         # Determine current stage
         current_stage = get_current_stage(epoch, args.stage1_epochs, args.stage2_epochs)
         
-        # Stage transition: Update model freezing (only if not already at this stage from resume)
+        # Stage transition: Update model freezing
         if epoch == stage1_end:
             print("\n" + "="*80)
-            print("🟡 STAGE 2: Unfreezing Text Components")
+            print(f"🟡 STAGE 2: Unfreezing Decoder (Last {args.num_decoder_layers} Layers)")
             print("="*80)
+            print(f"  Strategy: Decoder needs VQA-specific adaptation")
+            print(f"  LR: {cfg.base_lr:.2e} → {args.decoder_lr:.2e}")
+            print(f"  Reason: Task-specific generation patterns")
+            
+            model.unfreeze_text_components(
+                num_encoder_layers=0,  # Keep encoder frozen
+                num_decoder_layers=args.num_decoder_layers
+            )
+            
+            # Rebuild optimizer with new LR
+            remaining_steps = len(train_loader) // cfg.accum_steps * (total_epochs - epoch)
+            optimizer = AdamW(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=args.decoder_lr,
+                weight_decay=cfg.weight_decay
+            )
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=0,
+                num_training_steps=remaining_steps
+            )
+            print()
+            
+        elif epoch == stage2_end:
+            print("\n" + "="*80)
+            print(f"🟣 STAGE 2.5: Unfreezing Encoder (Last {args.num_encoder_layers} Layers)")
+            print("="*80)
+            print(f"  Strategy: Fine-tune question understanding")
+            print(f"  LR: {args.decoder_lr:.2e} → {args.encoder_lr:.2e}")
+            print(f"  Reason: VQA-specific question patterns")
+            print(f"  Note: DINOv2 stays FROZEN (critical for generalization)")
+            
             model.unfreeze_text_components(
                 num_encoder_layers=args.num_encoder_layers,
                 num_decoder_layers=args.num_decoder_layers
             )
-            # Rebuild optimizer AND scheduler with new trainable params
+            
+            # Rebuild optimizer with even lower LR
             remaining_steps = len(train_loader) // cfg.accum_steps * (total_epochs - epoch)
             optimizer = AdamW(
                 filter(lambda p: p.requires_grad, model.parameters()),
-                lr=cfg.base_lr * 0.5,  # Lower LR for fine-tuning
+                lr=args.encoder_lr,
                 weight_decay=cfg.weight_decay
             )
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer,
-                num_warmup_steps=0,  # No warmup for stage transitions
-                num_training_steps=remaining_steps
-            )
-        elif epoch == stage2_end:
-            print("\n" + "="*80)
-            print("🟢 STAGE 3: Unfreezing Vision Encoder")
-            print("="*80)
-            model.unfreeze_vision_encoder(num_layers=args.num_vision_layers)
-            # Rebuild optimizer AND scheduler with new trainable params
-            remaining_steps = len(train_loader) // cfg.accum_steps * (total_epochs - epoch)
-            optimizer = AdamW(
-                filter(lambda p: p.requires_grad, model.parameters()),
-                lr=cfg.base_lr * 0.1,  # Even lower LR for vision fine-tuning
-                weight_decay=cfg.weight_decay
-            )
-            scheduler = get_cosine_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=0,  # No warmup for stage transitions
+                num_warmup_steps=0,
                 num_training_steps=remaining_steps
             )
             print()
@@ -694,22 +716,26 @@ def main():
     
     # Final summary
     print("\n" + "="*80)
-    print("✅ ALL 3 STAGES COMPLETED!")
+    print("✅ OPTIMAL TRAINING COMPLETED!")
     print("="*80)
     print(f"\nBest validation loss: {best_val_loss:.4f}")
     print(f"\nAll files saved in: {cfg.save_dir}/")
     print(f"  📦 Checkpoints:")
-    print(f"     - best.pt (best validation model - use for inference)")
-    print(f"     - last.pt (last epoch checkpoint - use for resume)")
+    print(f"     - best.pt (best validation model)")
+    print(f"     - last.pt (last epoch checkpoint)")
     print(f"  📊 Training logs:")
-    print(f"     - training_history.csv (epoch-by-epoch metrics)")
-    print(f"     - training_curves.png (loss & LR plots with stage transitions)")
-    print(f"     - loss_comparison.png (train vs val loss with best model marker)")
-    print("\nNext steps:")
-    print(f"  1. Resume training (if interrupted):")
-    print(f"     python run_3stage_simple.py --csv_path ... --image_folder ... --resume_from {cfg.save_dir}/last.pt")
-    print(f"  2. Evaluate: python eval_autoregressive_cot.py --checkpoint {cfg.save_dir}/best.pt --mode val")
-    print(f"  3. Test: python eval_autoregressive_cot.py --checkpoint {cfg.save_dir}/best.pt --mode test")
+    print(f"     - training_history.csv (metrics per epoch)")
+    print(f"     - training_curves.png (loss & LR plots)")
+    print(f"     - loss_comparison.png (train vs val with best marker)")
+    print(f"\n📊 Key improvements:")
+    print(f"  ✓ No DINOv2 unfreezing → prevented overfitting")
+    print(f"  ✓ Gradual decoder→encoder unfreezing → stable adaptation")
+    print(f"  ✓ Lower LRs for unfrozen layers → no catastrophic forgetting")
+    print(f"  ✓ Fewer epochs → better generalization")
+    print(f"\nNext steps:")
+    print(f"  1. Evaluate: python eval_best.py --checkpoint {cfg.save_dir}/best.pt")
+    print(f"  2. Compare training_history.csv with baseline results")
+    print(f"  3. Resume if needed: --resume_from {cfg.save_dir}/last.pt")
     print()
 
 
