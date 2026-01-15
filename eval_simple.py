@@ -347,67 +347,67 @@ def main():
     # Create vision_processor
     vision_processor = AutoImageProcessor.from_pretrained('facebook/dinov2-base')
     
+    # Define dataset class (used by both val and test modes)
+    class VQACSVDataset(torch.utils.data.Dataset):
+        def __init__(self, csv_path, image_dir, vision_processor, tokenizer, max_question_len=64, max_answer_len=32):
+            self.data = pd.read_csv(csv_path)
+            self.image_dir = image_dir
+            self.vision_processor = vision_processor
+            self.tokenizer = tokenizer
+            self.max_question_len = max_question_len
+            self.max_answer_len = max_answer_len
+
+        def __len__(self):
+            return len(self.data)
+
+        def __getitem__(self, idx):
+            row = self.data.iloc[idx]
+            img_id = str(row['img_id'])
+            question = row['question']
+            answer = row['answer']
+            # Get type as is (keep numeric)
+            q_type = str(row.get('type', 'unknown'))
+            
+            from PIL import Image
+            img_path = f"{self.image_dir}/{img_id}.jpg"
+            try:
+                image = Image.open(img_path).convert('RGB')
+            except:
+                image = Image.new('RGB', (224, 224), color='white')
+            
+            pixel_values = self.vision_processor(images=image, return_tensors='pt')['pixel_values'][0]
+            
+            question_enc = self.tokenizer(
+                question,
+                max_length=self.max_question_len,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            
+            answer_enc = self.tokenizer(
+                answer,
+                max_length=self.max_answer_len,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            
+            labels = answer_enc['input_ids'][0].clone()
+            labels[labels == self.tokenizer.pad_token_id] = -100
+            
+            return {
+                'pixel_values': pixel_values,
+                'input_ids': question_enc['input_ids'][0],
+                'attention_mask': question_enc['attention_mask'][0],
+                'labels': labels,
+                'img_id': img_id,
+                'question': question,
+                'type': q_type
+            }
+    
     if args.mode == 'val':
         print("\n[INFO] Loading validation dataset with ground truth from CSV...")
-        
-        # Use same CSV-based dataset as example
-        class VQACSVDataset(torch.utils.data.Dataset):
-            def __init__(self, csv_path, image_dir, vision_processor, tokenizer, max_question_len=64, max_answer_len=32):
-                self.data = pd.read_csv(csv_path)
-                self.image_dir = image_dir
-                self.vision_processor = vision_processor
-                self.tokenizer = tokenizer
-                self.max_question_len = max_question_len
-                self.max_answer_len = max_answer_len
-
-            def __len__(self):
-                return len(self.data)
-
-            def __getitem__(self, idx):
-                row = self.data.iloc[idx]
-                img_id = str(row['img_id'])
-                question = row['question']
-                answer = row['answer']
-                # Get type as is (keep numeric)
-                q_type = str(row.get('type', 'unknown'))
-                
-                from PIL import Image
-                img_path = f"{self.image_dir}/{img_id}.jpg"
-                try:
-                    image = Image.open(img_path).convert('RGB')
-                except:
-                    image = Image.new('RGB', (224, 224), color='white')
-                
-                pixel_values = self.vision_processor(images=image, return_tensors='pt')['pixel_values'][0]
-                
-                question_enc = self.tokenizer(
-                    question,
-                    max_length=self.max_question_len,
-                    padding='max_length',
-                    truncation=True,
-                    return_tensors='pt'
-                )
-                
-                answer_enc = self.tokenizer(
-                    answer,
-                    max_length=self.max_answer_len,
-                    padding='max_length',
-                    truncation=True,
-                    return_tensors='pt'
-                )
-                
-                labels = answer_enc['input_ids'][0].clone()
-                labels[labels == self.tokenizer.pad_token_id] = -100
-                
-                return {
-                    'pixel_values': pixel_values,
-                    'input_ids': question_enc['input_ids'][0],
-                    'attention_mask': question_enc['attention_mask'][0],
-                    'labels': labels,
-                    'img_id': img_id,
-                    'question': question,
-                    'type': q_type
-                }
         
         full_dataset = VQACSVDataset(
             csv_path=CONFIG['csv_path'],
