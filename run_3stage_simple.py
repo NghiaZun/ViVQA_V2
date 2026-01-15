@@ -518,8 +518,8 @@ def main():
         }
     
     for epoch in range(start_epoch, total_epochs):
-        # Determine current stage
-        current_stage = get_current_stage(epoch, args.stage1_epochs, args.stage2_epochs)
+        # Determine current stage (FIX: use boundaries, not durations!)
+        current_stage = get_current_stage(epoch, stage1_end, stage2_end)
         
         # Stage transition: Update model freezing
         if epoch == stage1_end:
