@@ -13,6 +13,10 @@ Usage:
     
     # Test mode (evaluate on test.csv with metrics)
     python eval_simple.py --mode test --checkpoint checkpoints/simple_best.pt --batch_size 8
+    
+    # Custom paths
+    python eval_simple.py --mode test --checkpoint best.pt \
+        --csv_path data/test.csv --image_dir data/test_images
 
 Data Augmentation:
     Errors are saved to errors_simple.csv for:
@@ -271,6 +275,10 @@ def main():
                        help='Evaluation mode: val (train.csv split) or test (test.csv with metrics)')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to checkpoint')
+    parser.add_argument('--csv_path', type=str, default=None,
+                       help='Path to CSV file (overrides default based on mode)')
+    parser.add_argument('--image_dir', type=str, default=None,
+                       help='Path to image directory (overrides default based on mode)')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size')
     parser.add_argument('--output_csv', type=str, default='predictions_simple.csv',
                        help='Output CSV path')
@@ -287,8 +295,8 @@ def main():
         # Use train.csv with validation split for metrics
         CONFIG = {
             'checkpoint_path': args.checkpoint,
-            'csv_path': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv',
-            'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
+            'csv_path': args.csv_path or '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/train.csv',
+            'image_dir': args.image_dir or '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/train',
             'output_csv': args.output_csv,
             'error_csv': args.error_csv,
             'batch_size': args.batch_size,
@@ -298,8 +306,8 @@ def main():
     else:  # test mode
         CONFIG = {
             'checkpoint_path': args.checkpoint,
-            'csv_path': '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv',
-            'image_dir': '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test',
+            'csv_path': args.csv_path or '/kaggle/input/vivqa/ViVQA-main/ViVQA-main/test.csv',
+            'image_dir': args.image_dir or '/kaggle/input/vivqa/drive-download-20220309T020508Z-001/test',
             'output_csv': args.output_csv,
             'error_csv': args.error_csv,
             'batch_size': args.batch_size,
