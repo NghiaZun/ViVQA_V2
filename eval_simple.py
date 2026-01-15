@@ -326,11 +326,10 @@ def main():
     model = SimpleFusionVQA(
         dinov2_model_name='facebook/dinov2-base',
         bartpho_model_name='vinai/bartpho-syllable',
-        vision_embed_dim=768,
-        text_embed_dim=1024,
-        fusion_hidden_dim=512,
-        num_fusion_layers=2,
+        num_fusion_layers=3,
+        num_heads=8,
         dropout=0.1,
+        image_dropout_prob=0.0,  # No dropout during inference
         gradient_checkpointing=False  # Disable for inference
     )
     
