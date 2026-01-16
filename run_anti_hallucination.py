@@ -276,16 +276,16 @@ def run_one_epoch_anti_hallucination(
         contrastive_logits = None
         
         if train:
-            # 1. Image Dropout (30% probability - INCREASED for stronger regularization)
-            if use_image_dropout and torch.rand(1).item() < 0.3:  # 20% → 30%
+            # 1. Image Dropout (20% probability - balanced)
+            if use_image_dropout and torch.rand(1).item() < 0.2:  # Back to 20%
                 pixel_values, _ = apply_image_dropout(pixel_values_orig, dropout_prob=0.5)
                 apply_dropout_this_batch = True
             else:
                 pixel_values = pixel_values_orig
             
-            # 2. Contrastive Learning (5% probability - balanced between effectiveness and memory)
-            # INCREASED from 2% to 5% for better learning signal
-            if use_contrastive and torch.rand(1).item() < 0.05:  # 2% → 5%
+            # 2. Contrastive Learning (3% probability - memory efficient)
+            # Balanced between learning signal and memory usage
+            if use_contrastive and torch.rand(1).item() < 0.03:  # Reduced to 3%
                 shuffled_images, _ = shuffle_images_in_batch(pixel_values_orig)
                 apply_contrastive_this_batch = True
         else:
@@ -544,9 +544,9 @@ def main():
         answer_freq_dict=answer_freq_dict,
         vocab_size=len(model.tokenizer) if answer_freq_dict is not None else None,
         image_dropout_prob=0.2 if args.use_image_dropout else 0.0,
-        contrastive_weight=0.1 if args.use_contrastive else 0.0,  # INCREASED: 0.05 → 0.1
-        dropout_penalty_weight=1.0,  # INCREASED: 0.5 → 1.0 (need stronger penalty!)
-        freq_smoothing=5.0  # REDUCED: 10.0 → 5.0 (stronger freq reweighting)
+        contrastive_weight=0.05 if args.use_contrastive else 0.0,  # Back to 0.05 (was too high)
+        dropout_penalty_weight=0.3,  # REDUCED: 1.0 → 0.3 (gentle penalty)
+        freq_smoothing=5.0  # Not used anymore but kept for compatibility
     )
     print("  ✓ Loss configured")
     
