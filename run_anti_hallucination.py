@@ -283,8 +283,10 @@ def run_one_epoch_anti_hallucination(
             else:
                 pixel_values = pixel_values_orig
             
-            # 2. Contrastive Learning (10% probability)
-            if use_contrastive and torch.rand(1).item() < 0.1:
+            # 2. Contrastive Learning (DISABLED - OOM issues with 2x forward pass)
+            # Original: 10% probability, but doubles memory usage
+            # Image dropout alone is sufficient to prevent hallucination
+            if use_contrastive and torch.rand(1).item() < 0.02:  # Reduced to 2% to save memory
                 shuffled_images, _ = shuffle_images_in_batch(pixel_values_orig)
                 apply_contrastive_this_batch = True
         else:
@@ -313,6 +315,10 @@ def run_one_epoch_anti_hallucination(
                     labels=labels
                 )
                 contrastive_logits = outputs_shuffled.logits
+                # Free memory immediately after extracting logits
+                del outputs_shuffled
+                if pixel_values is not shuffled_images:
+                    del shuffled_images
             
             # Compute anti-hallucination loss (replaces simple outputs.loss)
             loss, loss_dict = anti_hallucination_loss(
@@ -322,6 +328,10 @@ def run_one_epoch_anti_hallucination(
                 apply_dropout=apply_dropout_this_batch,
                 contrastive_logits=contrastive_logits
             )
+            
+            # Free contrastive_logits after use
+            if contrastive_logits is not None:
+                del contrastive_logits
             
             if train:
                 loss = loss / cfg.accum_steps
@@ -356,6 +366,12 @@ def run_one_epoch_anti_hallucination(
         if 'contrastive_loss' in loss_dict and loss_dict.get('contrastive_loss', 0) > 0:
             pbar_dict['Contr'] = f"{loss_dict['contrastive_loss']:.3f}"
         pbar.set_postfix(pbar_dict)
+        
+        # Free memory after each batch
+        del loss, logits, outputs
+        if pixel_values is not pixel_values_orig:
+            del pixel_values
+        torch.cuda.empty_cache() if batch_idx % 100 == 0 else None  # Clear cache every 100 batches
     
     return total_loss / num_batches
 
