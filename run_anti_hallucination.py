@@ -544,11 +544,11 @@ def main():
         answer_freq_dict=answer_freq_dict,
         vocab_size=len(model.tokenizer) if answer_freq_dict is not None else None,
         image_dropout_prob=0.2 if args.use_image_dropout else 0.0,
-        contrastive_weight=0.05 if args.use_contrastive else 0.0,
-        dropout_penalty_weight=0.1,  # REDUCED: 0.3 → 0.1 (very gentle, just a hint)
+        contrastive_weight=0.0,  # DISABLED: Too complex, causes issues
+        dropout_penalty_weight=0.0,  # DISABLED: Causes training instability
         freq_smoothing=5.0  # Not used anymore but kept for compatibility
     )
-    print("  ✓ Loss configured")
+    print("  ✓ Loss configured (SIMPLIFIED: only image dropout active)")
     
     # Test hallucination rate (optional)
     if args.test_hallucination:

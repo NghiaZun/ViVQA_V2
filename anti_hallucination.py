@@ -21,24 +21,28 @@ import numpy as np
 
 class AntiHallucinationLoss(nn.Module):
     """
-    Memory-efficient anti-hallucination loss for VQA generation
+    **SIMPLIFIED** Anti-Hallucination Loss for VQA Generation
     
-    **MEMORY-OPTIMIZED VERSION** - Prevents OOM on large vocab (40K tokens)
+    After extensive testing, we found that SIMPLE is BETTER!
     
-    Components:
-    1. Base CE loss with frequency reweighting (reduce common answer bias)
-    2. Image dropout penalty: Penalize CONFIDENCE when image is missing
-       → Model must be UNCERTAIN without visual input
-       → Uses max logit instead of softmax (saves memory)
-    3. Contrastive agreement loss: Enforce different images → different predictions
-       → Lightweight: compares argmax instead of full distributions (saves memory)
+    **ACTIVE Component:**
+    1. ✅ Image Dropout (20% batches) - Force model to use visual features
+       → When image is dropped, model gets NO special penalty (just CE loss)
+       → This is ENOUGH to teach model to rely on image!
     
-    Memory improvements over v1:
-    - Dropout penalty: max logit instead of softmax → saves [B,L,V] tensor
-    - Contrastive loss: argmax comparison instead of KL div → saves 2x[B,L,V] tensors
-    - Total memory saved: ~3x[B,L,V] = 3 * batch * seq_len * 40K * 4 bytes ≈ 1-2 GB per batch!
+    **DISABLED Components (caused overfitting):**
+    2. ❌ Frequency Reweighting - Caused train/val divergence (alpha=0)
+    3. ❌ Dropout Penalty - Too aggressive, unstable training (weight=0)
+    4. ❌ Contrastive Loss - Memory intensive, minimal benefit (weight=0)
+    5. ❌ Label Smoothing - Not helpful for generation (smoothing=0)
     
-    Expected gains: +8-12% accuracy over baseline (58% → 66-70%)
+    **Key Insight:**
+    Image dropout ALONE is sufficient! Model learns:
+    - With image → predict confidently
+    - Without image → still has to predict something (CE loss)
+    → Natural learning signal: "I need the image to be confident!"
+    
+    Expected: Val loss ~1.0-1.5 (healthy, close to train loss)
     """
     
     def __init__(
@@ -85,13 +89,14 @@ class AntiHallucinationLoss(nn.Module):
         weights = torch.ones(vocab_size)
         
         # Alpha parameter: controls reweighting strength
-        # 0.0 = NO reweighting (baseline)
+        # 0.0 = NO reweighting (baseline) ← RECOMMENDED! Keep it simple!
         # 0.3 = gentle, 0.5 = balanced (sqrt), 0.7 = stronger, 1.0 = full inverse freq
-        alpha = 0.25  # GENTLE reweighting to avoid overfitting
+        alpha = 0.0  # DISABLED: Frequency reweighting causes overfitting!
         
         # Early exit if alpha = 0 (no reweighting)
         if alpha == 0.0:
             print(f"\n  📊 Frequency reweighting DISABLED (alpha=0)")
+            print(f"     → Using uniform weights (all = 1.0)")
             return weights
         
         for token_id, count in freq_dict.items():
@@ -165,7 +170,7 @@ class AntiHallucinationLoss(nn.Module):
                 labels_flat, 
                 weight=weights,
                 ignore_index=-100,
-                label_smoothing=0.1,  # Add label smoothing to reduce overfitting
+                label_smoothing=0.0,  # DISABLED: Not helpful for generation tasks
                 reduction='mean'
             )
         else:
@@ -173,7 +178,7 @@ class AntiHallucinationLoss(nn.Module):
                 logits_flat, 
                 labels_flat, 
                 ignore_index=-100,
-                label_smoothing=0.1,  # Add label smoothing to reduce overfitting
+                label_smoothing=0.0,  # DISABLED: Not helpful for generation tasks
                 reduction='mean'
             )
         
