@@ -85,9 +85,14 @@ class AntiHallucinationLoss(nn.Module):
         weights = torch.ones(vocab_size)
         
         # Alpha parameter: controls reweighting strength
-        # 0.3 = gentle (prevent overfitting on rare tokens)
-        # 0.5 = balanced (sqrt), 0.7 = stronger, 1.0 = full inverse freq (too aggressive)
-        alpha = 0.3  # REDUCED: 0.5 → 0.3 to reduce overfitting
+        # 0.0 = NO reweighting (baseline)
+        # 0.3 = gentle, 0.5 = balanced (sqrt), 0.7 = stronger, 1.0 = full inverse freq
+        alpha = 0.25  # GENTLE reweighting to avoid overfitting
+        
+        # Early exit if alpha = 0 (no reweighting)
+        if alpha == 0.0:
+            print(f"\n  📊 Frequency reweighting DISABLED (alpha=0)")
+            return weights
         
         for token_id, count in freq_dict.items():
             # Frequency of this token
@@ -97,16 +102,24 @@ class AntiHallucinationLoss(nn.Module):
             # Inverse frequency: common tokens get LOW weight, rare tokens get HIGH weight
             weights[token_id] = (freq_smoothed) ** (-alpha)
         
-        # Normalize to mean = 1.0 (so average token has weight 1.0)
-        weights = weights / weights.mean()
+        # CRITICAL FIX: Normalize ONLY on answer tokens, not entire vocab!
+        # Otherwise 40K vocab with only 420 answer tokens will dilute the normalization
+        answer_token_ids = list(freq_dict.keys())
+        answer_weights_only = weights[answer_token_ids]
+        mean_answer_weight = answer_weights_only.mean()
+        
+        # Scale so that ANSWER tokens have mean = 1.0
+        weights[answer_token_ids] = weights[answer_token_ids] / mean_answer_weight
+        # Non-answer tokens keep weight = 1.0
         
         # Diagnostic: show weight distribution
-        weighted_tokens = [(tid, w.item()) for tid, w in enumerate(weights) if tid in freq_dict]
+        weighted_tokens = [(tid, weights[tid].item()) for tid in answer_token_ids]
         weighted_tokens.sort(key=lambda x: freq_dict[x[0]], reverse=True)  # Sort by frequency
         print(f"\n  📊 Frequency reweighting stats:")
         print(f"     Alpha: {alpha:.2f}")
+        print(f"     Answer tokens: {len(answer_token_ids)} / {vocab_size}")
         print(f"     Most common token weight: {weighted_tokens[0][1]:.3f} (should be < 1.0)")
-        print(f"     Median weight: {weights[list(freq_dict.keys())].median():.3f}")
+        print(f"     Median weight: {weights[answer_token_ids].median():.3f}")
         print(f"     Rarest token weight: {weighted_tokens[-1][1]:.3f} (should be > 1.0)")
         
         return weights
