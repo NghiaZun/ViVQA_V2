@@ -1144,15 +1144,16 @@ class SimpleFusionVQA(nn.Module):
         self,
         dinov2_model_name: str = 'facebook/dinov2-base',
         bartpho_model_name: str = 'vinai/bartpho-syllable',
-        num_fusion_layers: int = 3,  # Increased from 2
+        num_fusion_layers: int = 6,  # Increased from 3 for better capacity
         num_heads: int = 8,
-        dropout: float = 0.1,
-        image_dropout_prob: float = 0.1,  # Add image dropout for robustness
+        dropout: float = 0.3,  # Increased from 0.1 for stronger regularization
+        image_dropout_prob: float = 0.15,  # Increased for robustness
         gradient_checkpointing: bool = True
     ):
         super().__init__()
         
         print("[SimpleFusionVQA] Initializing with SOTA fusion techniques...")
+        print(f"  [Anti-Overfit] Fusion layers: {num_fusion_layers}, Dropout: {dropout}")
         
         # Vision encoder
         self.vision_encoder = AutoModel.from_pretrained(dinov2_model_name)

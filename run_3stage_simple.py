@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-OPTIMAL 3-Stage Training Pipeline for SimpleFusionVQA
-======================================================
+CONSERVATIVE 3-Stage Training Pipeline for SimpleFusionVQA (Anti-Overfit)
+==========================================================================
 
-Optimized strategy to prevent overfitting (based on analysis of baseline results):
-- Stage 1 (10-15 epochs): Freeze all, train fusion only
-- Stage 2 (7-10 epochs): Unfreeze BARTpho decoder last 2-3 layers (lr=1e-5)
-- Stage 2.5 (3-5 epochs): Unfreeze BARTpho encoder last 2 layers (lr=5e-6)
-- DINOv2: ALWAYS FROZEN (pre-trained on 142M images, no need to fine-tune)
+Strategy optimized for 11K samples to prevent overfitting:
+- Stage 1 (15 epochs): Freeze all, train fusion only (6 layers, dropout 0.3)
+- Stage 2 (OPTIONAL, 5 epochs): Unfreeze decoder LAST 1 layer (lr=5e-6)
+- DINOv2 + BARTpho Encoder: ALWAYS FROZEN
+- NO Stage 2.5 → avoid overfitting on encoder
 
-Key improvements over baseline:
-✅ No DINOv2 unfreezing → prevent overfitting on small dataset
-✅ Gradual text model adaptation: decoder first, then encoder
-✅ Lower learning rates for unfrozen layers → better stability
-✅ Fewer total epochs → better generalization
+Key anti-overfit measures:
+✅ 6 fusion layers (more capacity without unfreezing)
+✅ High dropout (0.3) + image dropout (0.15)
+✅ Only unfreeze 1 decoder layer (minimal risk)
+✅ Very low LR for decoder (5e-6)
+✅ Aggressive early stopping (patience=3)
+✅ Label smoothing (0.1)
 
-Expected: val_loss 0.85-0.90 (vs 0.93 baseline), no overfitting
+Expected: val_loss ~0.95-1.00, accuracy 35-40% (better than 30.76%)
 
 Usage:
+    # Stage 1 only (safest)
     python run_3stage_simple.py --csv_path <path> --image_folder <path> \
-        --stage1_epochs 12 --stage2_epochs 8 --stage2_5_epochs 4
+        --stage1_epochs 15 --stage2_epochs 0
+    
+    # Stage 1 + conservative Stage 2
+    python run_3stage_simple.py --csv_path <path> --image_folder <path> \
+        --stage1_epochs 15 --stage2_epochs 5 --num_decoder_layers 1
 """
 
 import torch
@@ -288,22 +295,28 @@ def main():
                        help="Gradient accumulation steps (default: 8)")
     parser.add_argument("--learning_rate", "--base_lr", type=float, default=5e-5, dest="base_lr",
                        help="Base learning rate for Stage 1 (default: 5e-5)")
-    parser.add_argument("--stage1_epochs", type=int, default=12,
-                       help="Stage 1: Train fusion only (10-15 recommended)")
-    parser.add_argument("--stage2_epochs", type=int, default=8,
-                       help="Stage 2: Unfreeze decoder last layers (7-10 recommended)")
-    parser.add_argument("--stage2_5_epochs", type=int, default=4,
-                       help="Stage 2.5: Unfreeze encoder last layers (3-5 recommended)")
-    parser.add_argument("--num_fusion_layers", type=int, default=3,
-                       help="Number of fusion layers (default: 3 for SOTA)")
-    parser.add_argument("--num_decoder_layers", type=int, default=3,
-                       help="Decoder layers to unfreeze in stage 2 (2-3 recommended)")
-    parser.add_argument("--num_encoder_layers", type=int, default=2,
-                       help="Encoder layers to unfreeze in stage 2.5 (2 recommended)")
-    parser.add_argument("--decoder_lr", type=float, default=1e-5,
-                       help="Learning rate for decoder in Stage 2 (1e-5 recommended)")
-    parser.add_argument("--encoder_lr", type=float, default=5e-6,
-                       help="Learning rate for encoder in Stage 2.5 (5e-6 recommended)")
+    parser.add_argument("--stage1_epochs", type=int, default=15,
+                       help="Stage 1: Train fusion only (CONSERVATIVE: 15-20 epochs)")
+    parser.add_argument("--stage2_epochs", type=int, default=5,
+                       help="Stage 2: Unfreeze decoder (CONSERVATIVE: 0-5 epochs, 0=disable)")
+    parser.add_argument("--stage2_5_epochs", type=int, default=0,
+                       help="Stage 2.5: DISABLED by default to prevent overfitting")
+    parser.add_argument("--num_fusion_layers", type=int, default=6,
+                       help="Number of fusion layers (default: 6 for anti-overfit)")
+    parser.add_argument("--num_decoder_layers", type=int, default=1,
+                       help="Decoder layers to unfreeze (CONSERVATIVE: 1 layer only)")
+    parser.add_argument("--num_encoder_layers", type=int, default=0,
+                       help="Encoder layers (ALWAYS 0 to prevent overfitting)")
+    parser.add_argument("--decoder_lr", type=float, default=5e-6,
+                       help="Learning rate for decoder (CONSERVATIVE: 5e-6)")
+    parser.add_argument("--encoder_lr", type=float, default=0,
+                       help="Encoder LR (ALWAYS 0, encoder stays frozen)")
+    parser.add_argument("--dropout", type=float, default=0.3,
+                       help="Dropout rate for fusion layers (default: 0.3)")
+    parser.add_argument("--label_smoothing", type=float, default=0.1,
+                       help="Label smoothing for regularization (default: 0.1)")
+    parser.add_argument("--early_stopping_patience", type=int, default=3,
+                       help="Early stopping patience (default: 3)")
     parser.add_argument("--save_dir", type=str, default="checkpoints_simple_3stage")
     parser.add_argument("--resume_from", type=str, default=None,
                        help="Path to checkpoint to resume from (e.g., checkpoints_simple_3stage/last.pt)")
@@ -320,7 +333,7 @@ def main():
     cfg.use_amp = True
     cfg.max_grad_norm = 1.0
     cfg.base_lr = args.base_lr
-    cfg.weight_decay = 0.05
+    cfg.weight_decay = 0.08  # Increased from 0.05 for stronger regularization
     cfg.warmup_ratio = 0.06
     cfg.max_q_len = 64
     cfg.max_a_len = 10
@@ -331,21 +344,29 @@ def main():
     stage2_end = args.stage1_epochs + args.stage2_epochs
     
     print("="*80)
-    print("OPTIMAL 3-STAGE TRAINING: SimpleFusionVQA")
+    print("CONSERVATIVE ANTI-OVERFIT TRAINING: SimpleFusionVQA")
     if args.resume_from:
         print(f"🔄 RESUME MODE: {args.resume_from}")
     print("="*80)
-    print(f"\n🎯 Strategy: Prevent Overfitting via Gradual Unfreezing")
+    print(f"\n🎯 Strategy: Maximum Regularization for 11K Samples")
     print(f"  ✓ DINOv2: ALWAYS frozen (142M images pre-training)")
-    print(f"  ✓ Stage 1: Only fusion layers trainable")
-    print(f"  ✓ Stage 2: + Decoder last {args.num_decoder_layers} layers (LR={args.decoder_lr})")
-    print(f"  ✓ Stage 2.5: + Encoder last {args.num_encoder_layers} layers (LR={args.encoder_lr})")
+    print(f"  ✓ BARTpho Encoder: ALWAYS frozen (prevent overfitting)")
+    print(f"  ✓ Fusion: {args.num_fusion_layers} layers with dropout={args.dropout}")
+    if args.stage2_epochs > 0:
+        print(f"  ✓ Stage 2: Decoder last {args.num_decoder_layers} layer only (LR={args.decoder_lr})")
+    else:
+        print(f"  ✓ Stage 2: DISABLED (fusion only training)")
+    print(f"\n📊 Regularization:")
+    print(f"  - Dropout: {args.dropout} (high)")
+    print(f"  - Weight decay: {cfg.weight_decay} (strong L2)")
+    print(f"  - Label smoothing: {args.label_smoothing}")
+    print(f"  - Early stopping: patience={args.early_stopping_patience}")
     print(f"\n📊 Stage boundaries:")
     print(f"  Stage 1:   Epochs 1-{stage1_end} ({args.stage1_epochs} epochs)")
-    print(f"  Stage 2:   Epochs {stage1_end+1}-{stage2_end} ({args.stage2_epochs} epochs)")
-    print(f"  Stage 2.5: Epochs {stage2_end+1}-{total_epochs} ({args.stage2_5_epochs} epochs)")
+    if args.stage2_epochs > 0:
+        print(f"  Stage 2:   Epochs {stage1_end+1}-{stage2_end} ({args.stage2_epochs} epochs)")
     print(f"  TOTAL: {total_epochs} epochs")
-    print(f"\n📈 Expected: val_loss 0.85-0.90 (vs 0.93 baseline), stable training")
+    print(f"\n📈 Expected: val_loss ~0.95-1.00, accuracy 35-40% (vs 30.76% baseline)")
     print("="*80 + "\n")
     
     # Setup
@@ -366,6 +387,8 @@ def main():
     print("[1/6] Loading SimpleFusionVQA model...")
     model = SimpleFusionVQA(
         num_fusion_layers=args.num_fusion_layers,
+        dropout=args.dropout,
+        image_dropout_prob=0.15,  # Fixed higher dropout for robustness
         gradient_checkpointing=True
     )
     

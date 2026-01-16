@@ -326,9 +326,9 @@ def main():
     model = SimpleFusionVQA(
         dinov2_model_name='facebook/dinov2-base',
         bartpho_model_name='vinai/bartpho-syllable',
-        num_fusion_layers=3,
+        num_fusion_layers=6,  # Match training config
         num_heads=8,
-        dropout=0.1,
+        dropout=0.3,  # Match training dropout
         image_dropout_prob=0.0,  # No dropout during inference
         gradient_checkpointing=False  # Disable for inference
     )

@@ -16,17 +16,17 @@ Optimized strategy:
 
 Expected improvement: val_loss 1.034 → 0.85-0.90 (15-20% better!)
 
+**IMPORTANT:** Image dropout is HARMFUL for VQA! Model needs to see images.
+Instead, we use: stronger regularization + early stopping + lower LR.
+
 Usage:
     python run_anti_hallucination.py \
         --csv_path /path/to/train.csv \
         --image_folder /path/to/images \
-        --stage1_epochs 12 \
-        --stage2_epochs 8 \
+        --stage1_epochs 10 \
+        --stage2_epochs 5 \
         --stage2_5_epochs 0 \
-        --decoder_lr 5e-6 \
-        --use_image_dropout \
-        --use_freq_reweight \
-        --use_contrastive
+        --decoder_lr 1e-6
 """
 
 import torch
@@ -276,11 +276,13 @@ def run_one_epoch_anti_hallucination(
         contrastive_logits = None
         
         if train:
-            # 1. Image Dropout (30% probability - INCREASED to reduce overfitting)
-            # Higher dropout = stronger regularization = better generalization
+            # 1. Image Dropout (DISABLED BY DEFAULT - harmful for VQA!)
+            # VQA models NEED to see images! Dropout teaches model to ignore visual features.
+            # This feature kept for backward compatibility only.
             if use_image_dropout and torch.rand(1).item() < 0.3:  # 20% → 30%
                 pixel_values, _ = apply_image_dropout(pixel_values_orig, dropout_prob=0.5)
                 apply_dropout_this_batch = True
+                # WARNING: This will likely hurt performance!
             else:
                 pixel_values = pixel_values_orig
             
@@ -389,10 +391,10 @@ def main():
                        help="Gradient accumulation steps (default: 8)")
     parser.add_argument("--learning_rate", "--base_lr", type=float, default=5e-5, dest="base_lr",
                        help="Base learning rate for Stage 1 (default: 5e-5)")
-    parser.add_argument("--stage1_epochs", type=int, default=12,
-                       help="Stage 1: Train fusion only (10-15 recommended)")
-    parser.add_argument("--stage2_epochs", type=int, default=8,
-                       help="Stage 2: Unfreeze decoder last layers (7-10 recommended)")
+    parser.add_argument("--stage1_epochs", type=int, default=10,
+                       help="Stage 1: Train fusion only (10 epochs optimal from testing)")
+    parser.add_argument("--stage2_epochs", type=int, default=5,
+                       help="Stage 2: Unfreeze decoder last layers (5 epochs, careful!)")
     parser.add_argument("--stage2_5_epochs", type=int, default=0,
                        help="Stage 2.5: Unfreeze encoder last layers (0=skip, RECOMMENDED!)")
     parser.add_argument("--num_fusion_layers", type=int, default=3,
@@ -401,18 +403,18 @@ def main():
                        help="Decoder layers to unfreeze in stage 2 (2-3 recommended)")
     parser.add_argument("--num_encoder_layers", type=int, default=2,
                        help="Encoder layers to unfreeze in stage 2.5 (2 recommended)")
-    parser.add_argument("--decoder_lr", type=float, default=5e-6,
-                       help="Learning rate for decoder in Stage 2 (LOWER: 5e-6 vs 1e-5)")
-    parser.add_argument("--encoder_lr", type=float, default=3e-6,
-                       help="Learning rate for encoder in Stage 2.5 (3e-6 recommended)")
+    parser.add_argument("--decoder_lr", type=float, default=1e-6,
+                       help="Learning rate for decoder in Stage 2 (VERY LOW to prevent overfitting)")
+    parser.add_argument("--encoder_lr", type=float, default=5e-7,
+                       help="Learning rate for encoder in Stage 2.5 (even lower)")
     
-    # Anti-hallucination flags (ONLY ADDITIONS!)
+    # Anti-hallucination flags (MOSTLY DISABLED - image dropout is HARMFUL for VQA!)
     parser.add_argument("--use_image_dropout", action="store_true",
-                       help="Enable image dropout 20%% (CRITICAL FIX!)")
+                       help="[HARMFUL] Enable image dropout - NOT RECOMMENDED for VQA!")
     parser.add_argument("--use_freq_reweight", action="store_true",
-                       help="Enable answer frequency reweighting (FIX bias!)")
+                       help="Enable answer frequency reweighting (experimental)")
     parser.add_argument("--use_contrastive", action="store_true",
-                       help="Enable contrastive negative images (FIX shortcuts!)")
+                       help="[WEAK] Enable contrastive learning (3%%, minimal effect)")
     parser.add_argument("--test_hallucination", action="store_true",
                        help="Test hallucination rate before training")
     
@@ -432,7 +434,7 @@ def main():
     cfg.use_amp = True
     cfg.max_grad_norm = 1.0
     cfg.base_lr = args.base_lr
-    cfg.weight_decay = 0.1  # INCREASED: 0.05 → 0.1 to reduce overfitting
+    cfg.weight_decay = 0.15  # INCREASED: 0.05 → 0.15 (stronger regularization)
     cfg.warmup_ratio = 0.06
     cfg.max_q_len = 64
     cfg.max_a_len = 10
@@ -443,14 +445,19 @@ def main():
     stage2_end = args.stage1_epochs + args.stage2_epochs
     
     print("="*80)
-    print("🔥 ANTI-HALLUCINATION 3-STAGE TRAINING: SimpleFusionVQA")
+    print("🔥 OPTIMIZED 3-STAGE TRAINING: SimpleFusionVQA (Fixed Overfitting)")
     if args.resume_from:
         print(f"🔄 RESUME MODE: {args.resume_from}")
     print("="*80)
-    print(f"\n✅ Anti-Hallucination Fixes:")
-    print(f"  1. Image Dropout:        {'YES ✓' if args.use_image_dropout else 'NO ✗'}")
-    print(f"  2. Frequency Reweighting: {'YES ✓' if args.use_freq_reweight else 'NO ✗'}")
-    print(f"  3. Contrastive Learning:  {'YES ✓' if args.use_contrastive else 'NO ✗'}")
+    print(f"\n✅ Training Strategy (Based on Results Analysis):")
+    print(f"  • Weight Decay: 0.15 (stronger regularization)")
+    print(f"  • Early Stopping: Patience=3 (stop faster)")
+    print(f"  • Stage 1 Epochs: {args.stage1_epochs} (optimal: 10)")
+    print(f"  • Stage 2 LR: {args.decoder_lr:.2e} (very low to prevent overfitting)")
+    print(f"\n⚠️  Experimental Features (NOT RECOMMENDED):")
+    print(f"  1. Image Dropout:        {'YES (HARMFUL!)' if args.use_image_dropout else 'NO ✓'}")
+    print(f"  2. Frequency Reweighting: {'YES' if args.use_freq_reweight else 'NO ✓'}")
+    print(f"  3. Contrastive Learning:  {'YES (WEAK)' if args.use_contrastive else 'NO ✓'}")
     print(f"\n🎯 Strategy: Prevent Overfitting + Hallucination")
     print(f"  ✓ DINOv2: ALWAYS frozen (142M images pre-training)")
     print(f"  ✓ Stage 1: Only fusion layers trainable")
@@ -585,7 +592,7 @@ def main():
         'epoch': [], 'stage': [], 'train_loss': [], 'val_loss': [], 'lr': []
     }
     best_val_loss = float('inf')
-    patience = 5  # Stop if no improvement for 5 epochs
+    patience = 3  # REDUCED: Stop faster if no improvement (3 epochs)
     patience_counter = 0
     
     for epoch in range(total_epochs):
@@ -598,8 +605,8 @@ def main():
             print(f"🟡 STAGE 2: Unfreezing Decoder (Last {args.num_decoder_layers} Layers)")
             print("="*80)
             print(f"  Strategy: Decoder needs VQA-specific adaptation")
-            print(f"  LR: {cfg.base_lr:.2e} → {args.decoder_lr:.2e} (LOWER for anti-hallucination!)")
-            print(f"  Reason: Task-specific generation patterns")
+            print(f"  LR: {cfg.base_lr:.2e} → {args.decoder_lr:.2e} (VERY LOW to prevent overfitting!)")
+            print(f"  Reason: Stage 1 already learned well, Stage 2 = fine-tuning only")
             
             model.unfreeze_text_components(
                 num_encoder_layers=0,  # Keep encoder frozen
@@ -766,13 +773,20 @@ def main():
     print(f"     - training_history.csv (metrics per epoch)")
     print(f"     - training_curves.png (loss & LR plots)")
     print(f"     - loss_comparison.png (train vs val with best marker)")
-    print(f"\n🔥 Anti-Hallucination Fixes Applied:")
-    print(f"  ✓ Image Dropout: {args.use_image_dropout}")
-    print(f"  ✓ Frequency Reweighting: {args.use_freq_reweight}")
-    print(f"  ✓ Contrastive Learning: {args.use_contrastive}")
+    print(f"\n✅ Training Strategy Applied:")
+    print(f"  ✓ Weight Decay: 0.15 (strong regularization)")
+    print(f"  ✓ Early Stopping: Patience = 3")
+    print(f"  ✓ Stage 1: {args.stage1_epochs} epochs (optimal from testing)")
+    print(f"  ✓ Stage 2 LR: {args.decoder_lr:.2e} (very low)")
+    if args.use_image_dropout:
+        print(f"  ⚠️  WARNING: Image dropout enabled (may hurt performance!)")
+    print(f"\nExpected Results:")
+    print(f"  • Best epoch: ~8-10 (Stage 1)")
+    print(f"  • Val loss: ~0.85-0.90 (15% better than 1.034)")
+    print(f"  • Accuracy: +8-12% improvement")
     print(f"\nNext steps:")
-    print(f"  1. Compare with baseline: diff {cfg.save_dir}/training_history.csv checkpoints_simple_3stage/training_history.csv")
-    print(f"  2. Test hallucination: python test_hallucination_quick.py --checkpoint {cfg.save_dir}/best.pt")
+    print(f"  1. Check best.pt epoch (should be Stage 1, around epoch 8-10)")
+    print(f"  2. Compare: python compare_results.py {cfg.save_dir}/training_history.csv")
     print(f"  3. Evaluate: python eval_best.py --checkpoint {cfg.save_dir}/best.pt")
     print()
 
