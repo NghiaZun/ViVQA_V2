@@ -32,6 +32,7 @@ class AntiHallucinationLoss(nn.Module):
     def __init__(
         self,
         answer_freq_dict: dict = None,
+        vocab_size: int = None,
         image_dropout_prob: float = 0.2,
         contrastive_weight: float = 0.1,
         dropout_penalty_weight: float = 2.0,
@@ -45,22 +46,29 @@ class AntiHallucinationLoss(nn.Module):
         
         # Build frequency weights
         if answer_freq_dict is not None:
-            self.answer_weights = self._build_freq_weights(answer_freq_dict)
+            if vocab_size is None:
+                raise ValueError("vocab_size must be provided when using frequency reweighting!")
+            self.answer_weights = self._build_freq_weights(answer_freq_dict, vocab_size)
         else:
             self.answer_weights = None
     
-    def _build_freq_weights(self, freq_dict: dict) -> torch.Tensor:
+    def _build_freq_weights(self, freq_dict: dict, vocab_size: int) -> torch.Tensor:
         """
         Build inverse frequency weights for answers
         
         Formula: w(a) = 1 / log(freq(a) + c)
         - Common answers get lower weight (harder to learn)
         - Rare answers get higher weight (easier to learn)
+        
+        Args:
+            freq_dict: {token_id: count} from training data
+            vocab_size: Full vocabulary size (e.g., 40030 for BARTpho)
         """
         total = sum(freq_dict.values())
-        vocab_size = max(freq_dict.keys()) + 1
         
+        # Create weights for FULL vocab (not just tokens in training data!)
         weights = torch.ones(vocab_size)
+        
         for token_id, count in freq_dict.items():
             freq = count / total
             # Inverse log frequency weighting

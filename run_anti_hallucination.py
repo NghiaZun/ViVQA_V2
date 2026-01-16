@@ -527,6 +527,7 @@ def main():
     print("\n[4/7] Setting up anti-hallucination loss...")
     anti_hallucination_loss = AntiHallucinationLoss(
         answer_freq_dict=answer_freq_dict,
+        vocab_size=len(model.tokenizer) if answer_freq_dict is not None else None,
         image_dropout_prob=0.2 if args.use_image_dropout else 0.0,
         contrastive_weight=0.1 if args.use_contrastive else 0.0,
         dropout_penalty_weight=2.0,
