@@ -85,8 +85,9 @@ class AntiHallucinationLoss(nn.Module):
         weights = torch.ones(vocab_size)
         
         # Alpha parameter: controls reweighting strength
+        # 0.3 = gentle (prevent overfitting on rare tokens)
         # 0.5 = balanced (sqrt), 0.7 = stronger, 1.0 = full inverse freq (too aggressive)
-        alpha = 0.5
+        alpha = 0.3  # REDUCED: 0.5 → 0.3 to reduce overfitting
         
         for token_id, count in freq_dict.items():
             # Frequency of this token
@@ -151,6 +152,7 @@ class AntiHallucinationLoss(nn.Module):
                 labels_flat, 
                 weight=weights,
                 ignore_index=-100,
+                label_smoothing=0.1,  # Add label smoothing to reduce overfitting
                 reduction='mean'
             )
         else:
@@ -158,6 +160,7 @@ class AntiHallucinationLoss(nn.Module):
                 logits_flat, 
                 labels_flat, 
                 ignore_index=-100,
+                label_smoothing=0.1,  # Add label smoothing to reduce overfitting
                 reduction='mean'
             )
         

@@ -544,8 +544,8 @@ def main():
         answer_freq_dict=answer_freq_dict,
         vocab_size=len(model.tokenizer) if answer_freq_dict is not None else None,
         image_dropout_prob=0.2 if args.use_image_dropout else 0.0,
-        contrastive_weight=0.05 if args.use_contrastive else 0.0,  # Back to 0.05 (was too high)
-        dropout_penalty_weight=0.3,  # REDUCED: 1.0 → 0.3 (gentle penalty)
+        contrastive_weight=0.05 if args.use_contrastive else 0.0,
+        dropout_penalty_weight=0.1,  # REDUCED: 0.3 → 0.1 (very gentle, just a hint)
         freq_smoothing=5.0  # Not used anymore but kept for compatibility
     )
     print("  ✓ Loss configured")
