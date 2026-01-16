@@ -276,8 +276,9 @@ def run_one_epoch_anti_hallucination(
         contrastive_logits = None
         
         if train:
-            # 1. Image Dropout (20% probability - balanced)
-            if use_image_dropout and torch.rand(1).item() < 0.2:  # Back to 20%
+            # 1. Image Dropout (30% probability - INCREASED to reduce overfitting)
+            # Higher dropout = stronger regularization = better generalization
+            if use_image_dropout and torch.rand(1).item() < 0.3:  # 20% → 30%
                 pixel_values, _ = apply_image_dropout(pixel_values_orig, dropout_prob=0.5)
                 apply_dropout_this_batch = True
             else:
@@ -431,7 +432,7 @@ def main():
     cfg.use_amp = True
     cfg.max_grad_norm = 1.0
     cfg.base_lr = args.base_lr
-    cfg.weight_decay = 0.05
+    cfg.weight_decay = 0.1  # INCREASED: 0.05 → 0.1 to reduce overfitting
     cfg.warmup_ratio = 0.06
     cfg.max_q_len = 64
     cfg.max_a_len = 10
@@ -584,6 +585,8 @@ def main():
         'epoch': [], 'stage': [], 'train_loss': [], 'val_loss': [], 'lr': []
     }
     best_val_loss = float('inf')
+    patience = 5  # Stop if no improvement for 5 epochs
+    patience_counter = 0
     
     for epoch in range(total_epochs):
         # Determine current stage (FIX: use boundaries!)
@@ -716,9 +719,20 @@ def main():
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            patience_counter = 0  # Reset patience
             best_path = os.path.join(cfg.save_dir, "best.pt")
             torch.save(checkpoint, best_path)
             print(f"  ✅ New best model saved! (val_loss: {best_val_loss:.4f})")
+        else:
+            patience_counter += 1
+            print(f"  ⚠️  No improvement for {patience_counter}/{patience} epochs")
+            
+            # Early stopping
+            if patience_counter >= patience:
+                print(f"\n🛑 EARLY STOPPING! No improvement for {patience} epochs.")
+                print(f"   Best val loss: {best_val_loss:.4f}")
+                print(f"   Stopping at epoch {epoch+1}/{total_epochs}")
+                break
         
         # Save last checkpoint
         last_path = os.path.join(cfg.save_dir, "last.pt")
