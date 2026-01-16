@@ -142,6 +142,11 @@ class AntiHallucinationLoss(nn.Module):
         loss_dict = {'base_loss': base_loss.item()}
         total_loss = base_loss
         
+        # Safety check: ensure base_loss is valid
+        if torch.isnan(base_loss) or torch.isinf(base_loss):
+            print(f"⚠️  WARNING: base_loss is {base_loss.item()}, skipping batch!")
+            return torch.tensor(0.0, device=device, requires_grad=True), loss_dict
+        
         # ====================================================================
         # 2. IMAGE DROPOUT PENALTY (REFACTORED - PENALIZE CONFIDENCE!)
         # ====================================================================
@@ -164,8 +169,9 @@ class AntiHallucinationLoss(nn.Module):
                 confidence_per_sample = (max_probs * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-8)  # [B]
                 
                 # Penalize HIGH confidence on dropped images
-                # Threshold: 0.7 (if model >70% confident without image → BAD!)
-                confidence_threshold = 0.6
+                # Threshold: 0.5 (if model >50% confident without image → BAD!)
+                # Lower threshold at training start when model is uncertain
+                confidence_threshold = 0.5
                 confidence_penalty = F.relu(confidence_per_sample - confidence_threshold) * dropped_mask
                 confidence_penalty = confidence_penalty.mean() * self.dropout_penalty_weight
                 
@@ -181,9 +187,14 @@ class AntiHallucinationLoss(nn.Module):
         # → Different images MUST produce different distributions!
         
         if contrastive_logits is not None and self.training:
-            # Compute probability distributions
+            # Compute probability distributions with numerical stability
             P_original = F.softmax(logits, dim=-1)           # [B, L, V] - with correct image
             P_shuffled = F.softmax(contrastive_logits, dim=-1)  # [B, L, V] - with shuffled image
+            
+            # Add epsilon to avoid log(0) → -inf
+            eps = 1e-8
+            P_original = P_original.clamp(min=eps)
+            P_shuffled = P_shuffled.clamp(min=eps)
             
             # KL Divergence: KL(P_shuffled || P_original)
             # Measures how different the two distributions are
@@ -191,13 +202,17 @@ class AntiHallucinationLoss(nn.Module):
             kl_div = F.kl_div(
                 P_shuffled.log(),
                 P_original,
-                reduction='none'
+                reduction='none',
+                log_target=False  # P_original is already a probability
             ).sum(dim=-1)  # [B, L]
             
             # Only compute on valid tokens (not padding)
             valid_mask = (labels != -100).float()  # [B, L]
             kl_per_sample = (kl_div * valid_mask).sum(dim=1) / (valid_mask.sum(dim=1) + 1e-8)  # [B]
             kl_mean = kl_per_sample.mean()
+            
+            # Clip KL to avoid extreme values
+            kl_mean = kl_mean.clamp(min=0.0, max=10.0)
             
             # Penalize if KL is TOO SMALL (distributions too similar → model not using image!)
             # Margin: expect at least 0.5 nats difference between distributions
@@ -207,6 +222,13 @@ class AntiHallucinationLoss(nn.Module):
             total_loss = total_loss + self.contrastive_weight * contrastive_loss
             loss_dict['contrastive_loss'] = contrastive_loss.item()
             loss_dict['kl_divergence'] = kl_mean.item()  # Monitor actual KL value
+        
+        # Final safety check
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print(f"⚠️  WARNING: total_loss is {total_loss.item()}")
+            print(f"   Loss components: {loss_dict}")
+            # Return base_loss only as fallback
+            return base_loss, {'base_loss': base_loss.item(), 'fallback': True}
         
         return total_loss, loss_dict
 
