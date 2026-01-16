@@ -244,7 +244,8 @@ def compute_answer_frequency(dataset, tokenizer, max_length: int = 32):
         if hasattr(dataset, 'answers'):
             answer = dataset.answers[i]
         elif hasattr(dataset, 'data'):
-            answer = dataset.data[i]['answer']
+            # FIX: dataset.data is a pandas DataFrame, use .iloc[i]
+            answer = dataset.data.iloc[i]['answer']
         else:
             continue
         
